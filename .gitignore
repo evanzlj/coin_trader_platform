@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Data files (large, machine-generated)
+history_data_manager/data/
+replay_materials/
+replay_report/
+screenshots/
+
+# Research output
+history_data_manager/per_signal_v2.csv
+history_data_manager/aonly_research_summary_20260608.md
+
+# OS
+.DS_Store

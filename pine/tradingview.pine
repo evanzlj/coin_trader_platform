@@ -1,0 +1,627 @@
+//@version=6
+indicator("MTF v3.4-final Reaction Radar + Execution Overlay 2 NR Alerts + QRC192", overlay=true, max_labels_count=300, max_lines_count=300)
+
+// =====================
+// Profile
+// =====================
+profile = input.string("Auto", "Symbol Profile", options=["Auto", "BTC", "ETH", "SOL", "BNB", "Custom"])
+
+showWeeklyBg = input.bool(true, "显示周线方向背景")
+show4HLevels = input.bool(true, "显示4H结构位")
+showLabels = input.bool(true, "显示状态标签")
+showPanel = input.bool(true, "显示状态面板")
+showExecution = input.bool(true, "显示 Entry / SL / TP")
+showOnlyLatest = input.bool(true, "只显示最近一组执行线")
+showA = input.bool(true, "显示 A 普通观察")
+showCONF = input.bool(false, "显示 CONF（二次确认）")
+showExpired = input.bool(false, "显示 Expired / Noise")
+compactLabels = input.bool(false, "简洁标签模式")
+nightWatchMode = input.bool(false, "夜间值守模式")
+
+// =====================
+// Core Params
+// =====================
+weeklyFastLen = input.int(20, "周线快线 MA", minval=1)
+weeklySlowLen = input.int(50, "周线慢线 MA", minval=1)
+
+pivotLen4H = input.int(3, "4H结构摆点长度", minval=1)
+alertStructLookback4H = input.int(20, "报警用4H结构回看K数 Non-Repaint", minval=5, maxval=100)
+maLen15m = input.int(20, "15m确认MA", minval=1)
+atrLen = input.int(14, "ATR长度", minval=1)
+
+zonePct = input.float(1.5, "结构位有效范围 %", minval=0.3, maxval=5.0, step=0.1)
+
+useVolume = input.bool(true, "启用量能确认")
+volLen = input.int(20, "量能均值长度", minval=1)
+volMult = input.float(1.0, "原始信号量能倍数", step=0.1)
+
+strictLongWithWeekly = input.bool(false, "做多必须顺周线")
+strictShortWithWeekly = input.bool(false, "做空必须顺周线")
+
+swingLookback = input.int(6, "15m摆点回看K数", minval=2)
+slAtrMult = input.float(0.3, "SL ATR缓冲", step=0.1)
+reversalPct = input.float(0.3, "反转确认最小幅度 %", minval=0.1, maxval=2.0, step=0.1)
+minRR = input.float(2.0, "最小 TP2/R", minval=1.0, maxval=5.0, step=0.1)
+
+// =====================
+// v3.4 State Params
+// =====================
+extremePosLong = input.float(0.10, "A+ Long position <= ", minval=0.01, maxval=0.50, step=0.01)
+extremePosShort = input.float(0.90, "A+ Short position >= ", minval=0.50, maxval=0.99, step=0.01)
+wickBodyThreshold = input.float(1.0, "A+ wick/body 阈值", minval=0.1, maxval=5.0, step=0.1)
+volumeRatioThreshold = input.float(1.5, "A+ volume ratio 阈值", minval=0.5, maxval=5.0, step=0.1)
+
+confirmWindowBars = input.int(48, "确认窗口 bars", minval=1, maxval=200)
+confirmBufferAtr = input.float(0.1, "确认突破 ATR buffer", minval=0.0, maxval=2.0, step=0.05)
+
+aPlusTp1RR = input.float(0.5, "A+ TP1 RR", minval=0.1, maxval=5.0, step=0.1)
+aPlusTp2RR = input.float(1.0, "A+ TP2 RR", minval=0.1, maxval=8.0, step=0.1)
+bTp1RR = input.float(0.7, "CONF TP1 RR", minval=0.1, maxval=5.0, step=0.1)
+bTp2RR = input.float(1.2, "CONF TP2 RR", minval=0.1, maxval=8.0, step=0.1)
+
+lineLen = input.int(25, "执行线长度", minval=5, maxval=200)
+
+// =====================
+// QRC192 Params
+// 说明：QRC = Quantile Regression-like Channel。
+// 每根 K 都用过去 192 根 bar 预计算一组趋势分位通道。
+// 当出现 A / A+ 信号时，冻结当时这组 QRC192，并向右延伸。
+// 15m 图上 192 根约等于 48h。
+// =====================
+showSignalQRC = input.bool(true, "显示最近 A/A+ QRC192 冻结线")
+showLiveQRC192 = input.bool(false, "显示实时 QRC192 预计算线")
+qrcSignalSource = input.string("Visual", "QRC 信号来源", options=["Visual", "NR Alert"])
+qrcShowA = input.bool(true, "QRC 包含 A")
+qrcShowAPlus = input.bool(true, "QRC 包含 A+")
+qrcLookbackBars = input.int(192, "QRC192 回看 bars（15m=48h）", minval=50, maxval=500)
+qrcUpperPct = input.float(90.0, "QRC 上分位 %", minval=50.0, maxval=99.0, step=1.0)
+qrcLowerPct = input.float(10.0, "QRC 下分位 %", minval=1.0, maxval=50.0, step=1.0)
+qrcUseWicks = input.bool(true, "QRC 使用 high/low 残差")
+qrcShowMid = input.bool(true, "QRC 显示中轴")
+qrcFillChannel = input.bool(true, "QRC 填充通道")
+qrcLineWidth = input.int(2, "QRC 线宽", minval=1, maxval=4)
+
+// =====================
+// Helpers
+// =====================
+f_price(x) =>
+    str.tostring(x, format.mintick)
+
+f_side(isLong) =>
+    isLong ? "LONG" : "SHORT"
+
+f_tp(isLong, entry, sl, rr) =>
+    risk = math.abs(entry - sl)
+    isLong ? entry + risk * rr : entry - risk * rr
+
+f_label_y(isLong) =>
+    isLong ? low : high
+
+f_label_style(isLong) =>
+    isLong ? label.style_label_up : label.style_label_down
+
+// =====================
+// QRC192 Helpers
+// Quantile Regression-like Channel:
+// 1) 每根 K 用过去 N 根预计算线性中轴
+// 2) 用 high/low 或 close 对中轴的残差分位数生成上下通道
+// 3) A/A+ 信号出现后，冻结当时的预计算结果，并 extend.right
+// =====================
+f_qrc_calc(len, upperPct, lowerPct, useWicks) =>
+    float sumX = 0.0
+    float sumY = 0.0
+    float sumXX = 0.0
+    float sumXY = 0.0
+
+    for i = 0 to len - 1
+        x = float(len - 1 - i)
+        y = hlc3[i]
+        sumX += x
+        sumY += y
+        sumXX += x * x
+        sumXY += x * y
+
+    n = float(len)
+    denom = n * sumXX - sumX * sumX
+    slope = denom != 0.0 ? (n * sumXY - sumX * sumY) / denom : 0.0
+    intercept = (sumY - slope * sumX) / n
+
+    upperRes = array.new_float()
+    lowerRes = array.new_float()
+
+    for i = 0 to len - 1
+        x = float(len - 1 - i)
+        basis = intercept + slope * x
+        upperY = useWicks ? high[i] : close[i]
+        lowerY = useWicks ? low[i] : close[i]
+        array.push(upperRes, upperY - basis)
+        array.push(lowerRes, lowerY - basis)
+
+    upperOffset = array.percentile_linear_interpolation(upperRes, upperPct)
+    lowerOffset = array.percentile_linear_interpolation(lowerRes, lowerPct)
+
+    midStart = intercept
+    midEnd = intercept + slope * float(len - 1)
+    upperStart = midStart + upperOffset
+    upperEnd = midEnd + upperOffset
+    lowerStart = midStart + lowerOffset
+    lowerEnd = midEnd + lowerOffset
+
+    [upperStart, upperEnd, midStart, midEnd, lowerStart, lowerEnd]
+
+// QRC persistent drawing objects
+var line qrcUpperLine = na
+var line qrcMidLine = na
+var line qrcLowerLine = na
+var linefill qrcFill = na
+var label qrcLabel = na
+
+f_clear_qrc() =>
+    line.delete(qrcUpperLine)
+    line.delete(qrcMidLine)
+    line.delete(qrcLowerLine)
+    linefill.delete(qrcFill)
+    label.delete(qrcLabel)
+
+// =====================
+// Weekly Context
+// =====================
+wClose = request.security(syminfo.tickerid, "W", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+wMA20 = request.security(syminfo.tickerid, "W", ta.sma(close, weeklyFastLen)[1], barmerge.gaps_off, barmerge.lookahead_off)
+wMA50 = request.security(syminfo.tickerid, "W", ta.sma(close, weeklySlowLen)[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+weeklyBull = wClose > wMA20 and wMA20 > wMA50
+weeklyBear = wClose < wMA20 and wMA20 < wMA50
+weeklyNeutral = not weeklyBull and not weeklyBear
+
+bgcolor(showWeeklyBg ? weeklyBull ? color.new(color.green, 90) : weeklyBear ? color.new(color.red, 90) : color.new(color.gray, 93) : na)
+
+// =====================
+// 4H Structure - Visual / Pivot Version
+// 注意：这部分用于视觉展示，pivot 天然有确认延迟/可重绘风险，不用于 A/A+ 报警。
+// =====================
+h4PivotHigh = request.security(syminfo.tickerid, "240", ta.pivothigh(high, pivotLen4H, pivotLen4H), barmerge.gaps_on, barmerge.lookahead_off)
+h4PivotLow = request.security(syminfo.tickerid, "240", ta.pivotlow(low, pivotLen4H, pivotLen4H), barmerge.gaps_on, barmerge.lookahead_off)
+
+var float last4HResistance = na
+var float last4HSupport = na
+
+if not na(h4PivotHigh)
+    last4HResistance := h4PivotHigh
+
+if not na(h4PivotLow)
+    last4HSupport := h4PivotLow
+
+plot(show4HLevels ? last4HResistance : na, "4H Resistance Visual", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+plot(show4HLevels ? last4HSupport : na, "4H Support Visual", color=color.new(color.green, 0), linewidth=2, style=plot.style_linebr)
+
+// =====================
+// 4H Structure - Non-Repaint Alert Version
+// 这部分用于 A/A+ 报警：只使用已完成的上一根 4H 数据，不用 pivot。
+// =====================
+alert4HResistance = request.security(syminfo.tickerid, "240", ta.highest(high, alertStructLookback4H)[1], barmerge.gaps_off, barmerge.lookahead_off)
+alert4HSupport = request.security(syminfo.tickerid, "240", ta.lowest(low, alertStructLookback4H)[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+// =====================
+// 15m Context
+// =====================
+ma15 = ta.sma(close, maLen15m)
+atrNow = ta.atr(atrLen)
+avgVol = ta.sma(volume, volLen)
+volumeRatio = avgVol > 0 ? volume / avgVol : 0.0
+volOk = not useVolume or volumeRatio > volMult
+
+plot(ma15, "15m MA20", color=color.new(color.orange, 0), linewidth=1)
+
+nearSupport = not na(last4HSupport) and math.abs(close - last4HSupport) / close * 100 <= zonePct
+nearResistance = not na(last4HResistance) and math.abs(close - last4HResistance) / close * 100 <= zonePct and not nearSupport
+
+reclaimLongCross = ta.crossover(close, ma15)
+reclaimShortCross = ta.crossunder(close, ma15)
+reclaimLong = reclaimLongCross or (close > ma15 and close > open)
+reclaimShort = reclaimShortCross or (close < ma15 and close < open)
+
+reversalLong = (close - close[1]) / close[1] * 100 >= reversalPct
+reversalShort = (close[1] - close) / close[1] * 100 >= reversalPct
+
+signalLongRaw = nearSupport and reclaimLong and reversalLong and volOk
+signalShortRaw = nearResistance and reclaimShort and reversalShort and volOk
+
+allowLongByWeekly = strictLongWithWeekly ? weeklyBull : true
+allowShortByWeekly = strictShortWithWeekly ? weeklyBear : true
+
+// =====================
+// Structure Position - Visual / Pivot Version
+// =====================
+structureWidth = not na(last4HSupport) and not na(last4HResistance) ? last4HResistance - last4HSupport : na
+positionInStructure = not na(structureWidth) and structureWidth > 0 ? (close - last4HSupport) / structureWidth : na
+
+// =====================
+// Wick / Body
+// =====================
+body = math.abs(close - open)
+safeBody = body > syminfo.mintick ? body : syminfo.mintick
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+upperWickBody = upperWick / safeBody
+lowerWickBody = lowerWick / safeBody
+
+strongLongReject = lowerWickBody > wickBodyThreshold or reclaimLongCross or volumeRatio > volumeRatioThreshold
+strongShortReject = upperWickBody > wickBodyThreshold or reclaimShortCross or volumeRatio > volumeRatioThreshold
+
+longExtreme = not na(positionInStructure) and positionInStructure <= extremePosLong
+shortExtreme = not na(positionInStructure) and positionInStructure >= extremePosShort
+
+// =====================
+// Original Trade Levels - Visual / Pivot Version
+// =====================
+recentSwingLow = ta.lowest(low, swingLookback)
+recentSwingHigh = ta.highest(high, swingLookback)
+slBuffer = atrNow * slAtrMult
+
+longEntry = close
+longSLRaw = math.min(recentSwingLow, nz(last4HSupport, recentSwingLow))
+longSL = longSLRaw - slBuffer
+longRisk = longEntry - longSL
+longTP2Base = not na(last4HResistance) and last4HResistance > longEntry ? last4HResistance : longEntry + longRisk * 2.0
+longRR2 = longRisk > 0 ? (longTP2Base - longEntry) / longRisk : 0.0
+
+shortEntry = close
+shortSLRaw = math.max(recentSwingHigh, nz(last4HResistance, recentSwingHigh))
+shortSL = shortSLRaw + slBuffer
+shortRisk = shortSL - shortEntry
+shortTP2Base = not na(last4HSupport) and last4HSupport < shortEntry ? last4HSupport : shortEntry - shortRisk * 2.0
+shortRR2 = shortRisk > 0 ? (shortEntry - shortTP2Base) / shortRisk : 0.0
+
+rrOkLong = longRR2 >= minRR
+rrOkShort = shortRR2 >= minRR
+
+signalLong = allowLongByWeekly and signalLongRaw and rrOkLong and longRisk > 0
+signalShort = allowShortByWeekly and signalShortRaw and rrOkShort and shortRisk > 0
+
+isAPlusLong = signalLong and longExtreme and strongLongReject
+isAPlusShort = signalShort and shortExtreme and strongShortReject
+
+isALong = signalLong and not isAPlusLong
+isAShort = signalShort and not isAPlusShort
+
+newSignal = signalLong or signalShort
+newSignalLong = signalLong
+newSignalAPlus = isAPlusLong or isAPlusShort
+
+// =====================
+// Non-Repaint Alert Signals for A / A+
+// =====================
+alertNearSupport = not na(alert4HSupport) and math.abs(close - alert4HSupport) / close * 100 <= zonePct
+alertNearResistance = not na(alert4HResistance) and math.abs(close - alert4HResistance) / close * 100 <= zonePct and not alertNearSupport
+
+alertStructureWidth = not na(alert4HSupport) and not na(alert4HResistance) ? alert4HResistance - alert4HSupport : na
+alertPositionInStructure = not na(alertStructureWidth) and alertStructureWidth > 0 ? (close - alert4HSupport) / alertStructureWidth : na
+
+alertLongExtreme = not na(alertPositionInStructure) and alertPositionInStructure <= extremePosLong
+alertShortExtreme = not na(alertPositionInStructure) and alertPositionInStructure >= extremePosShort
+
+alertLongSLRaw = math.min(recentSwingLow, nz(alert4HSupport, recentSwingLow))
+alertLongSL = alertLongSLRaw - slBuffer
+alertLongRisk = close - alertLongSL
+alertLongTP2Base = not na(alert4HResistance) and alert4HResistance > close ? alert4HResistance : close + alertLongRisk * 2.0
+alertLongRR2 = alertLongRisk > 0 ? (alertLongTP2Base - close) / alertLongRisk : 0.0
+
+alertShortSLRaw = math.max(recentSwingHigh, nz(alert4HResistance, recentSwingHigh))
+alertShortSL = alertShortSLRaw + slBuffer
+alertShortRisk = alertShortSL - close
+alertShortTP2Base = not na(alert4HSupport) and alert4HSupport < close ? alert4HSupport : close - alertShortRisk * 2.0
+alertShortRR2 = alertShortRisk > 0 ? (close - alertShortTP2Base) / alertShortRisk : 0.0
+
+alertLongRaw = alertNearSupport and reclaimLong and reversalLong and volOk
+alertShortRaw = alertNearResistance and reclaimShort and reversalShort and volOk
+
+alertLong = barstate.isconfirmed and allowLongByWeekly and alertLongRaw and alertLongRR2 >= minRR and alertLongRisk > 0
+alertShort = barstate.isconfirmed and allowShortByWeekly and alertShortRaw and alertShortRR2 >= minRR and alertShortRisk > 0
+
+alertAPlusLong = alertLong and alertLongExtreme and strongLongReject
+alertAPlusShort = alertShort and alertShortExtreme and strongShortReject
+
+alertALong = alertLong and not alertAPlusLong
+alertAShort = alertShort and not alertAPlusShort
+
+alertAPlus = alertAPlusLong or alertAPlusShort
+alertA = alertALong or alertAShort
+
+// =====================
+// QRC192 Precompute + Signal Freeze Draw
+// 每根 K 都预计算 QRC192。
+// 出现 A/A+ 时，不再现场回看 96 根，而是冻结当前这组 QRC192，
+// 从 QRC192 窗口起点画到信号点，并向右延伸。
+// Visual：跟随图上 A/A+ 标签逻辑。
+// NR Alert：跟随不重绘报警逻辑。
+// =====================
+qrcReady = bar_index >= qrcLookbackBars
+float qrcPreUpperStart = na
+float qrcPreUpperEnd = na
+float qrcPreMidStart = na
+float qrcPreMidEnd = na
+float qrcPreLowerStart = na
+float qrcPreLowerEnd = na
+
+if qrcReady
+    [qrcTmpUS, qrcTmpUE, qrcTmpMS, qrcTmpME, qrcTmpLS, qrcTmpLE] = f_qrc_calc(qrcLookbackBars, qrcUpperPct, qrcLowerPct, qrcUseWicks)
+    qrcPreUpperStart := qrcTmpUS
+    qrcPreUpperEnd := qrcTmpUE
+    qrcPreMidStart := qrcTmpMS
+    qrcPreMidEnd := qrcTmpME
+    qrcPreLowerStart := qrcTmpLS
+    qrcPreLowerEnd := qrcTmpLE
+
+// 实时预计算线：显示当前 bar 对应的 QRC192 终点值。
+// 这个不是冻结线，只是用来观察通道如何逐 bar 演化。
+plot(showLiveQRC192 and qrcReady ? qrcPreUpperEnd : na, "Live QRC192 Upper", color=color.new(color.fuchsia, 70), linewidth=1)
+plot(showLiveQRC192 and qrcReady and qrcShowMid ? qrcPreMidEnd : na, "Live QRC192 Mid", color=color.new(color.white, 75), linewidth=1)
+plot(showLiveQRC192 and qrcReady ? qrcPreLowerEnd : na, "Live QRC192 Lower", color=color.new(color.fuchsia, 70), linewidth=1)
+
+qrcVisualAPlus = newSignalAPlus
+qrcVisualA = newSignal and not newSignalAPlus
+
+qrcNRAPlus = alertAPlus
+qrcNRA = alertA
+
+qrcUseVisual = qrcSignalSource == "Visual"
+
+qrcTriggerAPlus = qrcUseVisual ? qrcVisualAPlus : qrcNRAPlus
+qrcTriggerA = qrcUseVisual ? qrcVisualA : qrcNRA
+qrcTrigger = showSignalQRC and barstate.isconfirmed and qrcReady and ((qrcShowAPlus and qrcTriggerAPlus) or (qrcShowA and qrcTriggerA))
+
+if qrcTrigger
+    f_clear_qrc()
+
+    qrcStartBar = bar_index - qrcLookbackBars + 1
+    qrcEndBar = bar_index
+
+    isQrcAPlus = qrcTriggerAPlus
+    qrcMainColor = isQrcAPlus ? color.new(color.fuchsia, 0) : color.new(color.blue, 0)
+    qrcBandColor = isQrcAPlus ? color.new(color.fuchsia, 82) : color.new(color.blue, 86)
+    qrcMidColor = color.new(color.white, 25)
+
+    qrcUpperLine := line.new(qrcStartBar, qrcPreUpperStart, qrcEndBar, qrcPreUpperEnd, color=qrcMainColor, width=qrcLineWidth, extend=extend.right)
+    qrcLowerLine := line.new(qrcStartBar, qrcPreLowerStart, qrcEndBar, qrcPreLowerEnd, color=qrcMainColor, width=qrcLineWidth, extend=extend.right)
+
+    if qrcShowMid
+        qrcMidLine := line.new(qrcStartBar, qrcPreMidStart, qrcEndBar, qrcPreMidEnd, color=qrcMidColor, width=1, style=line.style_dashed, extend=extend.right)
+
+    if qrcFillChannel
+        qrcFill := linefill.new(qrcUpperLine, qrcLowerLine, qrcBandColor)
+
+    qrcText = (isQrcAPlus ? "A+ QRC192" : "A QRC192") + "\nprecomputed → frozen → extend"
+    qrcLabel := label.new(qrcEndBar, qrcPreUpperEnd, qrcText, color=color.new(qrcMainColor, 15), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+// =====================
+// Persistent State
+// =====================
+var bool pendingActive = false
+var bool pendingLong = false
+var bool pendingAPlus = false
+var int pendingBar = na
+var float pendingHigh = na
+var float pendingLow = na
+var float pendingEntry = na
+var float pendingSL = na
+var float pendingTP1 = na
+var float pendingTP2 = na
+var string currentState = "None"
+
+var line entryLine = na
+var line slLine = na
+var line tp1Line = na
+var line tp2Line = na
+var label setupLabel = na
+var label entryLbl = na
+var label slLbl = na
+var label tp1Lbl = na
+var label tp2Lbl = na
+
+f_clear_execution() =>
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    label.delete(entryLbl)
+    label.delete(slLbl)
+    label.delete(tp1Lbl)
+    label.delete(tp2Lbl)
+
+f_clear_setup_label() =>
+    label.delete(setupLabel)
+
+// =====================
+// Draw Execution Overlay
+// =====================
+f_draw_execution(entry, sl, tp1, tp2) =>
+    line.new(bar_index, entry, bar_index + lineLen, entry, color=color.new(color.yellow, 0), width=2)
+    line.new(bar_index, sl, bar_index + lineLen, sl, color=color.new(color.red, 0), width=2, style=line.style_dashed)
+    line.new(bar_index, tp1, bar_index + lineLen, tp1, color=color.new(color.aqua, 0), width=1, style=line.style_dashed)
+    line.new(bar_index, tp2, bar_index + lineLen, tp2, color=color.new(color.green, 0), width=1, style=line.style_dashed)
+
+f_draw_level_labels(entry, sl, tp1, tp2) =>
+    risk = math.abs(entry - sl)
+    rr1 = risk > 0 ? math.abs(tp1 - entry) / risk : 0.0
+    rr2 = risk > 0 ? math.abs(tp2 - entry) / risk : 0.0
+    label.new(bar_index + lineLen, entry, "Entry " + f_price(entry), color=color.new(color.yellow, 40), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + lineLen, sl, "SL " + f_price(sl), color=color.new(color.red, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + lineLen, tp1, "TP1 " + f_price(tp1) + " (" + str.tostring(rr1, "#.#") + "R)", color=color.new(color.aqua, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + lineLen, tp2, "TP2 " + f_price(tp2) + " (" + str.tostring(rr2, "#.#") + "R)", color=color.new(color.green, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+f_setup_text(prefix, isLong, entry, sl, tp1, tp2) =>
+    compactLabels ? prefix + " " + f_side(isLong) : prefix + " " + f_side(isLong) + "\nEntry " + f_price(entry) + "\nSL " + f_price(sl) + "\nTP1 " + f_price(tp1) + "\nTP2 " + f_price(tp2)
+
+// =====================
+// New Pending Signal - Visual / Pivot Version
+// 这部分继续负责图上标签和执行线，方便看盘。
+// =====================
+if newSignal
+    pendingActive := true
+    pendingLong := newSignalLong
+    pendingAPlus := newSignalAPlus
+    pendingBar := bar_index
+    pendingHigh := high
+    pendingLow := low
+    pendingEntry := newSignalLong ? longEntry : shortEntry
+    pendingSL := newSignalLong ? longSL : shortSL
+
+    rr1 = newSignalAPlus ? aPlusTp1RR : bTp1RR
+    rr2 = newSignalAPlus ? aPlusTp2RR : bTp2RR
+    pendingTP1 := f_tp(newSignalLong, pendingEntry, pendingSL, rr1)
+    pendingTP2 := f_tp(newSignalLong, pendingEntry, pendingSL, rr2)
+
+    currentState := newSignalAPlus ? "A+ Pending" : "A Pending"
+
+    if showOnlyLatest
+        f_clear_execution()
+        f_clear_setup_label()
+
+    prefix = newSignalAPlus ? "A+" : "A"
+    shouldShowSignalLabel = showLabels and (newSignalAPlus or showA)
+    labelColor = newSignalAPlus ? color.new(color.blue, 0) : color.new(color.blue, 55)
+
+    if shouldShowSignalLabel
+        setupLabel := label.new(bar_index, f_label_y(newSignalLong), f_setup_text(prefix, newSignalLong, pendingEntry, pendingSL, pendingTP1, pendingTP2), color=labelColor, textcolor=color.white, style=f_label_style(newSignalLong), size=size.small)
+
+    if showExecution and newSignalAPlus
+        entryLine := line.new(bar_index, pendingEntry, bar_index + lineLen, pendingEntry, color=color.new(color.yellow, 0), width=2)
+        slLine := line.new(bar_index, pendingSL, bar_index + lineLen, pendingSL, color=color.new(color.red, 0), width=2, style=line.style_dashed)
+        tp1Line := line.new(bar_index, pendingTP1, bar_index + lineLen, pendingTP1, color=color.new(color.aqua, 0), width=1, style=line.style_dashed)
+        tp2Line := line.new(bar_index, pendingTP2, bar_index + lineLen, pendingTP2, color=color.new(color.green, 0), width=1, style=line.style_dashed)
+
+        risk = math.abs(pendingEntry - pendingSL)
+        rrVal1 = risk > 0 ? math.abs(pendingTP1 - pendingEntry) / risk : 0.0
+        rrVal2 = risk > 0 ? math.abs(pendingTP2 - pendingEntry) / risk : 0.0
+
+        entryLbl := label.new(bar_index + lineLen, pendingEntry, "Entry " + f_price(pendingEntry), color=color.new(color.yellow, 40), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        slLbl := label.new(bar_index + lineLen, pendingSL, "SL " + f_price(pendingSL), color=color.new(color.red, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp1Lbl := label.new(bar_index + lineLen, pendingTP1, "TP1 " + f_price(pendingTP1) + " (" + str.tostring(rrVal1, "#.#") + "R)", color=color.new(color.aqua, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp2Lbl := label.new(bar_index + lineLen, pendingTP2, "TP2 " + f_price(pendingTP2) + " (" + str.tostring(rrVal2, "#.#") + "R)", color=color.new(color.green, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+// =====================
+// Non-Repaint A / A+ Alerts
+// 报警只走这部分，不走 pivot 视觉信号。
+// =====================
+if alertAPlus
+    alert("MTF_V34_NR|event=A_PLUS|side=" + (alertAPlusLong ? "long" : "short") + "|ticker=" + syminfo.ticker + "|entry=" + f_price(close) + "|sl=" + f_price(alertAPlusLong ? alertLongSL : alertShortSL) + "|tp1=" + f_price(f_tp(alertAPlusLong, close, alertAPlusLong ? alertLongSL : alertShortSL, aPlusTp1RR)) + "|tp2=" + f_price(f_tp(alertAPlusLong, close, alertAPlusLong ? alertLongSL : alertShortSL, aPlusTp2RR)), alert.freq_once_per_bar_close)
+
+if alertA
+    alert("MTF_V34_NR|event=A|side=" + (alertALong ? "long" : "short") + "|ticker=" + syminfo.ticker + "|entry=" + f_price(close) + "|sl=" + f_price(alertALong ? alertLongSL : alertShortSL), alert.freq_once_per_bar_close)
+
+// =====================
+// Pending State Transition
+// =====================
+canCheckPending = pendingActive and bar_index > pendingBar
+
+confirmLong = canCheckPending and pendingLong and barstate.isconfirmed and close >= pendingHigh + atrNow * confirmBufferAtr
+confirmShort = canCheckPending and not pendingLong and barstate.isconfirmed and close <= pendingLow - atrNow * confirmBufferAtr
+invalidLong = canCheckPending and pendingLong and low <= pendingSL
+invalidShort = canCheckPending and not pendingLong and high >= pendingSL
+expired = canCheckPending and bar_index - pendingBar > confirmWindowBars
+
+confirmed = confirmLong or confirmShort
+invalidated = invalidLong or invalidShort
+
+if pendingActive and confirmed
+    confEntry = close
+    confSL = pendingSL
+    confTP1 = f_tp(pendingLong, confEntry, confSL, bTp1RR)
+    confTP2 = f_tp(pendingLong, confEntry, confSL, bTp2RR)
+    currentState := "Confirmed"
+
+    if showCONF and showOnlyLatest
+        f_clear_execution()
+        f_clear_setup_label()
+
+    if showLabels and showCONF
+        setupLabel := label.new(bar_index, f_label_y(pendingLong), f_setup_text("CONF", pendingLong, confEntry, confSL, confTP1, confTP2), color=color.new(color.orange, 0), textcolor=color.white, style=f_label_style(pendingLong), size=size.small)
+
+    if showExecution and showCONF
+        entryLine := line.new(bar_index, confEntry, bar_index + lineLen, confEntry, color=color.new(color.yellow, 0), width=2)
+        slLine := line.new(bar_index, confSL, bar_index + lineLen, confSL, color=color.new(color.red, 0), width=2, style=line.style_dashed)
+        tp1Line := line.new(bar_index, confTP1, bar_index + lineLen, confTP1, color=color.new(color.aqua, 0), width=1, style=line.style_dashed)
+        tp2Line := line.new(bar_index, confTP2, bar_index + lineLen, confTP2, color=color.new(color.green, 0), width=1, style=line.style_dashed)
+
+        risk = math.abs(confEntry - confSL)
+        rrVal1 = risk > 0 ? math.abs(confTP1 - confEntry) / risk : 0.0
+        rrVal2 = risk > 0 ? math.abs(confTP2 - confEntry) / risk : 0.0
+
+        entryLbl := label.new(bar_index + lineLen, confEntry, "Entry " + f_price(confEntry), color=color.new(color.yellow, 40), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        slLbl := label.new(bar_index + lineLen, confSL, "SL " + f_price(confSL), color=color.new(color.red, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp1Lbl := label.new(bar_index + lineLen, confTP1, "TP1 " + f_price(confTP1) + " (" + str.tostring(rrVal1, "#.#") + "R)", color=color.new(color.aqua, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp2Lbl := label.new(bar_index + lineLen, confTP2, "TP2 " + f_price(confTP2) + " (" + str.tostring(rrVal2, "#.#") + "R)", color=color.new(color.green, 55), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    alert("MTF_V34|event=CONF|side=" + (pendingLong ? "long" : "short") + "|ticker=" + syminfo.ticker + "|entry=" + f_price(confEntry) + "|sl=" + f_price(confSL) + "|tp1=" + f_price(confTP1) + "|tp2=" + f_price(confTP2), alert.freq_once_per_bar_close)
+    pendingActive := false
+
+// if pendingActive and invalidated
+//     currentState := "Invalidated"
+//
+//     if showLabels
+//         label.new(bar_index, f_label_y(not pendingLong), "FAIL " + f_side(pendingLong) + "\nInvalidated", color=color.new(color.gray, 0), textcolor=color.white, style=f_label_style(not pendingLong), size=size.small)
+//
+//     alert("MTF_V34|event=FAIL|side=" + (pendingLong ? "long" : "short") + "|ticker=" + syminfo.ticker, alert.freq_once_per_bar_close)
+//     pendingActive := false
+
+if pendingActive and expired
+    currentState := "Expired"
+
+    if showExpired and showLabels
+        label.new(bar_index, close, "EXP " + f_side(pendingLong), color=color.new(color.gray, 75), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    pendingActive := false
+
+// =====================
+// Alert Conditions
+// =====================
+alertcondition(alertAPlus, "MTF v3.4 NR A+ Reaction", "MTF v3.4 NR A+ Reaction")
+alertcondition(alertA, "MTF v3.4 NR A Reaction", "MTF v3.4 NR A Reaction")
+alertcondition(confirmed, "MTF v3.4 CONF", "MTF v3.4 CONF")
+alertcondition(invalidated, "MTF v3.4 FAIL", "MTF v3.4 FAIL")
+
+// =====================
+// Panel
+// =====================
+var table panel = table.new(position.top_right, 2, 11, border_width=1)
+
+profileDisplay = profile == "Auto" ? "Auto/" + syminfo.ticker : profile
+weeklyText = weeklyBull ? "Bull" : weeklyBear ? "Bear" : "Neutral"
+
+stateBg = currentState == "Confirmed" ? color.rgb(180, 100, 20) : currentState == "A+ Pending" ? color.rgb(35, 80, 170) : currentState == "A Pending" ? color.rgb(50, 80, 120) : currentState == "Invalidated" ? color.rgb(95, 95, 95) : currentState == "Expired" ? color.rgb(70, 70, 70) : color.rgb(45, 45, 45)
+
+if barstate.islast and showPanel
+    table.cell(panel, 0, 0, "MTF v3.4", text_color=color.white, bgcolor=color.rgb(28, 32, 40))
+    table.cell(panel, 1, 0, profileDisplay, text_color=color.white, bgcolor=color.rgb(28, 32, 40))
+
+    table.cell(panel, 0, 1, "Weekly", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 1, weeklyText, text_color=color.white, bgcolor=weeklyBull ? color.rgb(24, 92, 52) : weeklyBear ? color.rgb(120, 36, 36) : color.rgb(120, 92, 28))
+
+    table.cell(panel, 0, 2, "4H Support", text_color=color.white, bgcolor=color.rgb(30, 110, 60))
+    table.cell(panel, 1, 2, na(last4HSupport) ? "—" : f_price(last4HSupport), text_color=color.white, bgcolor=color.rgb(30, 110, 60))
+
+    table.cell(panel, 0, 3, "4H Resist", text_color=color.white, bgcolor=color.rgb(130, 40, 40))
+    table.cell(panel, 1, 3, na(last4HResistance) ? "—" : f_price(last4HResistance), text_color=color.white, bgcolor=color.rgb(130, 40, 40))
+
+    table.cell(panel, 0, 4, "Position", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 4, na(positionInStructure) ? "—" : str.tostring(positionInStructure, "#.##"), text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+
+    table.cell(panel, 0, 5, "State", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 5, currentState, text_color=color.white, bgcolor=stateBg)
+
+    table.cell(panel, 0, 6, "Near Sup/Res", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 6, nearSupport ? "Support" : nearResistance ? "Resistance" : "No", text_color=color.white, bgcolor=nearSupport ? color.rgb(30, 110, 60) : nearResistance ? color.rgb(130, 40, 40) : color.rgb(70, 70, 70))
+
+    table.cell(panel, 0, 7, "Vol Ratio", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 7, str.tostring(volumeRatio, "#.##"), text_color=color.white, bgcolor=volumeRatio > volumeRatioThreshold ? color.rgb(24, 92, 52) : color.rgb(70, 70, 70))
+
+    table.cell(panel, 0, 8, "Pending", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 8, pendingActive ? f_side(pendingLong) : "—", text_color=color.white, bgcolor=pendingActive ? color.rgb(70, 70, 120) : color.rgb(70, 70, 70))
+
+    table.cell(panel, 0, 9, "Entry", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 9, na(pendingEntry) ? "—" : f_price(pendingEntry), text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+
+    table.cell(panel, 0, 10, "SL", text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+    table.cell(panel, 1, 10, na(pendingSL) ? "—" : f_price(pendingSL), text_color=color.white, bgcolor=color.rgb(38, 43, 54))
+
