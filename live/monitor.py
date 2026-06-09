@@ -283,9 +283,12 @@ async def main() -> None:
     if not dedup:
         logger.warning("starting with empty dedup state — signals may repeat")
 
-    # Build generator with full history for buffer warmup
-    logger.info("loading history for buffer warmup...")
-    init_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS)
+    # Build generator with trimmed history for buffer warmup:
+    #   - weekly MA50 needs 50 weeks → start 56 weeks ago (buffer)
+    #   - 4H structure lookback 20 bars → covered within that window
+    warmup_start = (pd.Timestamp.utcnow() - pd.Timedelta(weeks=56)).strftime("%Y-%m-%d")
+    logger.info("loading history for buffer warmup (from %s)...", warmup_start)
+    init_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS, start=warmup_start)
     gen = SignalGenerator(feed=init_feed, symbols=SYMBOLS)
     gen.load_dedup_state(dedup)
 
