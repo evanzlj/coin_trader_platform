@@ -177,13 +177,15 @@ def write_signal_pending(sig: SignalEvent) -> Path:
     }
     (pkg_dir / "signal.json").write_text(json.dumps(signal_data, indent=2))
 
-    # prompt — load data frames then build
+    # prompt — same format as generate_replay_materials.py
     try:
         df15m, df4h, df_flow = _load_frames(sig)
         bundle = build_prompt(sig, df15m, df4h, df_flow)
-        # system.txt for reference; prompt.txt (user text) is what openclaw sends
-        (pkg_dir / "system.txt").write_text(bundle.system_text)
-        (pkg_dir / "prompt.txt").write_text(bundle.user_text)
+        with open(pkg_dir / "prompt.txt", "w") as f:
+            f.write("=== SYSTEM ===\n")
+            f.write(bundle.system_text)
+            f.write("\n\n=== USER TEXT ===\n")
+            f.write(bundle.user_text)
     except Exception as e:
         logger.warning("prompt generation failed for %s: %s", pkg_name, e)
         (pkg_dir / "prompt.txt").write_text(f"[prompt generation error: {e}]")
