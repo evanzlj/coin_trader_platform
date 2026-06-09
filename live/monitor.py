@@ -39,7 +39,7 @@ from realtime_data_pull.feed import ReplayFeed
 from signal_generator.generator import SignalGenerator
 from signal_generator.events import SignalEvent
 from draw_kline import render
-from prompt_generator.builder import build_prompt   # noqa: adjust if path differs
+from prompt_generator.builder import build_prompt
 from live.fetch_delta import fetch_delta, FetchError, GapError
 
 logging.basicConfig(
@@ -121,6 +121,31 @@ def update_heartbeat() -> None:
     HEARTBEAT_FILE.write_text(pd.Timestamp.utcnow().isoformat())
 
 
+# ── Data loaders for prompt builder ──────────────────────────────────────────
+
+def _load_df(path: Path, t0: pd.Timestamp,
+             lookback_hours: int) -> pd.DataFrame:
+    """Load a CSV and return rows up to and including t0 within lookback window."""
+    df = pd.read_csv(path, parse_dates=["open_time", "close_time"])
+    for col in ("open_time", "close_time"):
+        if df[col].dt.tz is None:
+            df[col] = df[col].dt.tz_localize("UTC")
+        else:
+            df[col] = df[col].dt.tz_convert("UTC")
+    cutoff = t0 - pd.Timedelta(hours=lookback_hours)
+    return df[(df["open_time"] >= cutoff) & (df["open_time"] <= t0)].reset_index(drop=True)
+
+
+def _load_frames(sig: SignalEvent) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load df15m, df4h, df_flow for one signal."""
+    slug = sig.symbol.replace("/", "").lower()
+    t0   = sig.bar_time
+    df15m  = _load_df(DATA_DIR / "ohlcv"      / f"{slug}_15m.csv", t0, lookback_hours=14*24)
+    df4h   = _load_df(DATA_DIR / "ohlcv"      / f"{slug}_4h.csv",  t0, lookback_hours=90*24)
+    df_flow = _load_df(DATA_DIR / "taker_flow" / f"{slug}_15m.csv", t0, lookback_hours=14*24)
+    return df15m, df4h, df_flow
+
+
 # ── Signal package writer ─────────────────────────────────────────────────────
 
 def write_signal_pending(sig: SignalEvent) -> Path:
@@ -152,10 +177,13 @@ def write_signal_pending(sig: SignalEvent) -> Path:
     }
     (pkg_dir / "signal.json").write_text(json.dumps(signal_data, indent=2))
 
-    # prompt.txt
+    # prompt — load data frames then build
     try:
-        prompt = build_prompt(sig)
-        (pkg_dir / "prompt.txt").write_text(prompt)
+        df15m, df4h, df_flow = _load_frames(sig)
+        bundle = build_prompt(sig, df15m, df4h, df_flow)
+        # system.txt for reference; prompt.txt (user text) is what openclaw sends
+        (pkg_dir / "system.txt").write_text(bundle.system_text)
+        (pkg_dir / "prompt.txt").write_text(bundle.user_text)
     except Exception as e:
         logger.warning("prompt generation failed for %s: %s", pkg_name, e)
         (pkg_dir / "prompt.txt").write_text(f"[prompt generation error: {e}]")
