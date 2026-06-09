@@ -46,6 +46,8 @@ _SYSTEM_APLUS = (
     "     continuation path requires explicit post-T0 retest logic."
     "   LATE_EXTENSION → trend-following requires a retest/hold or failed-retest;"
     "     if no clean retest level exists, rank CHOP_WAIT or AMBIGUOUS_WAIT higher."
+    "     Any retest/hold or failed-retest logic must be expressed using T0-known chart-visible levels only;"
+    "     do not use future-created levels in activation_rule."
     "   AMBIGUOUS → avoid over-ranking directional paths; CHOP_WAIT or AMBIGUOUS_WAIT is often appropriate."
 )
 
@@ -58,6 +60,10 @@ _SYSTEM_AONLY = (
     " A-only is a structural watch trigger around 4H structure, not a long/short signal."
     " Treat it as a structural watch point."
     " Do not assume direction from the A-only label."
+    " * The first top-level field in your JSON response must be watch_summary."
+    " * Always consider both mean-reversion and continuation paths."
+    "   For support-side A-only: consider long reaction (level holds / reclaim) and short continuation (level breaks) paths."
+    "   For resistance-side A-only: consider short rejection (level holds / fade) and long breakout (level clears) paths."
 )
 
 _SYSTEM_COMMON = """\
@@ -65,13 +71,8 @@ _SYSTEM_COMMON = """\
  * The chart is cut off at T0. Do not infer future candles, hidden dates, filenames, or historical memory.
  * Use only visible structure and provided signal facts: the attached 15m and 4H charts, visible K-line structure, visible QRC192/MA20/structure overlays, volume, and taker-flow.
  * Structural price levels are intentionally omitted from Signal details. Infer structural levels from the attached charts instead of from text.
- * For A+ outputs: the first top-level field in the JSON response must be a_plus_impulse_assessment. For A-only outputs: the first top-level field must be watch_summary.
  * Inside watch_summary, price_vs_level must be filled from the visible chart context. If it is not visually clear, use "unknown".
  * Anchor zones to visible structure: chart-visible 4H pivots/ranges, QRC, MA20, T0 area, and prior visible swings. Do not invent volatility bands.
- * Always consider both impulse validation and impulse failure paths. Do not assign priority from support/resistance context alone.
-   For support-side A+: compare downside acceptance, failed-breakdown reclaim, support reaction after reclaim, and late-extension no-trade.
-   For resistance-side A+: compare upside acceptance, failed-breakout rejection, retest-hold continuation, and late-extension no-trade.
-   For A-only: support-side signals consider long reaction and short failure paths; resistance-side signals consider short rejection and long failure paths.
  * Rank honestly. The plausibility field is a STRICT enum: high, medium, low, ruled_out. Do not output medium_high, medium_low, valid_stand_aside, or free-form plausibility.
  * Only output detailed playbook objects for plausible high/medium paths, plus CHOP_WAIT if it is high/medium. Put low/ruled_out paths in omitted_low_scenarios.
  * scenario_priority_order must list emitted playbook hypotheses in rank order and be justified by structure / price action / volume / taker-flow facts.
@@ -90,6 +91,7 @@ _SYSTEM_COMMON = """\
  * primary_touch.side MUST be exactly "high" or "low"; examples like high_touches_or_breaks are invalid.
  * all close-cross dir fields must be exactly "above" or "below".
  * direction_if_activated must match the hypothesis: bullish paths use long, bearish paths use short, CHOP/AMBIGUOUS use no_trade.
+ * trade_side_if_confirmed must match the hypothesis: bullish paths use conditional_long, bearish paths use conditional_short, CHOP/AMBIGUOUS use no_trade.
  * activation_rule is PRICE-ONLY. Do not put flow or imbalance, bar counts, within_bars, or non-price conditions inside it.
  * If the visible T0 area is already beyond a candidate primary_touch level, do not use that already-satisfied level as primary_touch unless the reason explicitly says "post-T0 retest required".
  * If signal_structure_context is near_resistance and price_vs_level is above_resistance, treat it as breakout acceptance vs failed-breakout watch, not automatic long.
@@ -197,7 +199,8 @@ For low/ruled_out/no_trade playbooks use this reduced plan:
     "structural_objective_anchors": []
 }
 
-For A+ signals only, include this field before watch_summary (omit entirely for A-only):
+Respond with this compact JSON schema.
+The first top-level field MUST be a_plus_impulse_assessment:
 {
   "a_plus_impulse_assessment": {
     "impulse_phase": "EARLY_ACCEPTANCE | LATE_EXTENSION | CLIMAX_TRAP | AMBIGUOUS",
@@ -207,11 +210,7 @@ For A+ signals only, include this field before watch_summary (omit entirely for 
     "cvd_price_relationship": "confirming | diverging | mixed | unknown",
     "post_T0_flow_filter_note": "",
     "classification_reason": ""
-  }
-}
-
-Respond with this compact JSON schema:
-{
+  },
   "watch_summary": {
     "symbol": "{symbol}",
     "signal_type": "{signal_type}",
@@ -238,7 +237,7 @@ Respond with this compact JSON schema:
     {
       "name": "",
       "hypothesis": "",
-      "trade_side_if_confirmed": "conditional_long",
+      "trade_side_if_confirmed": "conditional_long | conditional_short | no_trade",
       "plausibility": "high",
       "why_this_path": "",
       "activation_condition": "",
