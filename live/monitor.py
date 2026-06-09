@@ -310,7 +310,14 @@ async def main() -> None:
             if new_last and new_last != last_bar_time:
                 last_bar_time = new_last
 
+                now = pd.Timestamp.utcnow()
                 for sig in signals:
+                    # Recency filter: discard signals older than 2 bars (30 min)
+                    age = (now - sig.bar_time).total_seconds() / 60
+                    if age > 30:
+                        logger.info("stale signal skipped (%d min old): %s %s",
+                                    int(age), sig.symbol, sig.grade)
+                        continue
                     passes, reason = _passes_filter(sig)
                     if not passes:
                         logger.info("filtered out %s %s: %s", sig.symbol, sig.grade, reason)
