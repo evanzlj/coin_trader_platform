@@ -37,6 +37,8 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
+import pandas as pd
+
 from .params import SignalParams, SYMBOL_PARAMS
 from .events import SignalEvent, StateEvent
 from .signal_logic import evaluate
@@ -101,8 +103,11 @@ class SignalGenerator:
             for sym in symbols
         }
 
-        # Dedup: tracks bar_count when last signal fired per symbol
-        self._last_signal_bar: dict[str, int] = {sym: -9999 for sym in symbols}
+        # Dedup: tracks bar open_time when last signal fired per symbol (timestamp-based,
+        # survives restarts; None = never fired)
+        self._last_signal_time: dict[str, Optional[pd.Timestamp]] = {
+            sym: None for sym in symbols
+        }
 
         # Register with feed
         feed.add_bar_handler(self._on_bar)
@@ -138,6 +143,23 @@ class SignalGenerator:
         # Flow data stored for context; not used in core A/A+ logic
         pass
 
+    # ── Dedup state persistence ───────────────────────────────────────────────
+
+    def get_dedup_state(self) -> dict:
+        """Serialize dedup state to a JSON-safe dict (timestamps as ISO strings)."""
+        return {
+            sym: t.isoformat() if t is not None else None
+            for sym, t in self._last_signal_time.items()
+        }
+
+    def load_dedup_state(self, state: dict) -> None:
+        """Load dedup state from a previously saved dict."""
+        for sym, val in state.items():
+            if sym in self._last_signal_time:
+                self._last_signal_time[sym] = (
+                    pd.Timestamp(val, tz="UTC") if val is not None else None
+                )
+
     # ── Core: evaluate signal on closed 15m bar ───────────────────────────────
 
     async def _process_15m(self, symbol: str, bar: Bar) -> None:
@@ -164,8 +186,11 @@ class SignalGenerator:
                     await h(state_evt)
 
         # ── Evaluate new signal ───────────────────────────────────────────────
-        bars_since_last = sm._bar_count - self._last_signal_bar[symbol]
-        in_dedup_window = bars_since_last < p.window_dedup
+        last_t = self._last_signal_time[symbol]
+        dedup_window = pd.Timedelta(minutes=15 * p.window_dedup)
+        in_dedup_window = (
+            last_t is not None and (bar.open_time - last_t) < dedup_window
+        )
 
         if not in_dedup_window:
             sig = evaluate(
@@ -186,7 +211,7 @@ class SignalGenerator:
                 params      = p,
             )
             if sig is not None:
-                self._last_signal_bar[symbol] = sm._bar_count
+                self._last_signal_time[symbol] = bar.open_time
                 sm.on_signal(sig, bar_high=bar.high, bar_low=bar.low, atr=atr_val or 0.0)
                 logger.info("%s", sig)
                 for h in self._signal_handlers:
