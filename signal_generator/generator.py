@@ -34,7 +34,9 @@ Usage (real-time):
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import pandas as pd
@@ -65,7 +67,7 @@ class SignalGenerator:
 
     def __init__(
         self,
-        feed,                          # RealtimeFeed | ReplayFeed
+        feed,                          # RealtimeFeed | ReplayFeed | None
         symbols: list[str],            # "BTC/USDT" display names
         params: "Optional[SignalParams | dict[str, SignalParams]]" = None,
     ) -> None:
@@ -109,9 +111,10 @@ class SignalGenerator:
             sym: None for sym in symbols
         }
 
-        # Register with feed
-        feed.add_bar_handler(self._on_bar)
-        feed.add_flow_handler(self._on_flow)
+        # Register with feed (None when loading from persisted buffer state)
+        if feed is not None:
+            feed.add_bar_handler(self._on_bar)
+            feed.add_flow_handler(self._on_flow)
 
     # ── Handler registration ─────────────────────────────────────────────────
 
@@ -159,6 +162,95 @@ class SignalGenerator:
                 self._last_signal_time[sym] = (
                     pd.Timestamp(val, tz="UTC") if val is not None else None
                 )
+
+    # ── Buffer state persistence ──────────────────────────────────────────────
+
+    def save_buffer_state(self, state_dir: Path) -> None:
+        """
+        Serialize all BarBuffers to parquet files in state_dir.
+        One file per (symbol, timeframe): buf_{slug}_{tf}.parquet
+        Also saves state machine bar counts and a saved_at timestamp.
+        """
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        for (sym, tf), buf in self._bufs.items():
+            bars = list(buf._bars)
+            if not bars:
+                continue
+            slug = sym.replace("/", "").lower()
+            rows = [{
+                "symbol":    b.symbol,
+                "timeframe": b.timeframe,
+                "open_time": b.open_time,
+                "close_time": b.close_time,
+                "open":      b.open,
+                "high":      b.high,
+                "low":       b.low,
+                "close":     b.close,
+                "volume":    b.volume,
+                "is_closed": b.is_closed,
+            } for b in bars]
+            df = pd.DataFrame(rows)
+            df["open_time"]  = pd.to_datetime(df["open_time"],  utc=True)
+            df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
+            df.to_parquet(state_dir / f"buf_{slug}_{tf}.parquet", index=False)
+
+        sm_counts = {sym: self._sm[sym]._bar_count for sym in self.symbols}
+        with open(state_dir / "sm_bar_counts.json", "w") as f:
+            json.dump(sm_counts, f)
+
+        (state_dir / "saved_at.txt").write_text(pd.Timestamp.utcnow().isoformat())
+        logger.info("buffer state saved → %s (%d symbol×tf buffers)", state_dir,
+                    sum(1 for buf in self._bufs.values() if buf._bars))
+
+    def load_buffer_state(self, state_dir: Path) -> "Optional[pd.Timestamp]":
+        """
+        Load BarBuffers from parquet files in state_dir via BarBuffer.seed().
+        Returns the saved_at timestamp if successful, else None.
+        """
+        if not state_dir.exists():
+            return None
+
+        loaded = 0
+        for (sym, tf), buf in self._bufs.items():
+            slug = sym.replace("/", "").lower()
+            path = state_dir / f"buf_{slug}_{tf}.parquet"
+            if not path.exists():
+                continue
+            df = pd.read_parquet(path)
+            bars = [
+                Bar(
+                    symbol    = row.symbol,
+                    timeframe = row.timeframe,
+                    open_time = pd.Timestamp(row.open_time).tz_convert("UTC"),
+                    close_time= pd.Timestamp(row.close_time).tz_convert("UTC"),
+                    open      = float(row.open),
+                    high      = float(row.high),
+                    low       = float(row.low),
+                    close     = float(row.close),
+                    volume    = float(row.volume),
+                    is_closed = bool(row.is_closed),
+                )
+                for row in df.itertuples(index=False)
+            ]
+            buf.seed(bars)
+            loaded += 1
+
+        sm_path = state_dir / "sm_bar_counts.json"
+        if sm_path.exists():
+            with open(sm_path) as f:
+                counts = json.load(f)
+            for sym, count in counts.items():
+                if sym in self._sm:
+                    self._sm[sym]._bar_count = int(count)
+
+        sat_path = state_dir / "saved_at.txt"
+        if loaded == 0 or not sat_path.exists():
+            return None
+
+        saved_at = pd.Timestamp(sat_path.read_text().strip(), tz="UTC")
+        logger.info("buffer state loaded from %s (saved_at=%s)", state_dir, saved_at)
+        return saved_at
 
     # ── Core: evaluate signal on closed 15m bar ───────────────────────────────
 

@@ -3,7 +3,7 @@
 Pull BTC/ETH/BNB/SOL OHLCV + taker_flow data from evan@btc-ml
 and save to ./data/{ohlcv,taker_flow}/<symbol>_<tf>.csv
 
-Date range: 2023-01-01 → 2026-06-08 (inclusive)
+Date range: 2020-01-01 → 2026-06-09 (inclusive)
 """
 
 import argparse
@@ -19,7 +19,7 @@ REMOTE_TMP = "/tmp/history_export"
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 TIMEFRAMES = ["15m", "1h", "4h"]
 
-START = "2023-01-01T00:00:00+00:00"
+START = "2020-01-01T00:00:00+00:00"
 END = "2026-06-09T00:00:00+00:00"  # exclusive upper bound → captures up to Jun 8 23:xx
 
 LOCAL_DATA = Path(__file__).parent / "data"

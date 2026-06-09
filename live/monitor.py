@@ -51,11 +51,12 @@ logger = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-DATA_DIR        = ROOT / "history_data_manager" / "data"
-DEDUP_STATE     = ROOT / "live" / "state" / "dedup_state.json"
-HEARTBEAT_FILE  = ROOT / "live" / "heartbeat" / "monitor_last_run.txt"
-SIGNAL_PENDING  = ROOT / "signal_pending"
-CHARTS_DIR      = ROOT / "live" / "charts"
+DATA_DIR         = ROOT / "history_data_manager" / "data"
+DEDUP_STATE      = ROOT / "live" / "state" / "dedup_state.json"
+BUFFER_STATE_DIR = ROOT / "live" / "state" / "buffer"
+HEARTBEAT_FILE   = ROOT / "live" / "heartbeat" / "monitor_last_run.txt"
+SIGNAL_PENDING   = ROOT / "signal_pending"
+CHARTS_DIR       = ROOT / "live" / "charts"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 
@@ -95,23 +96,24 @@ def _passes_filter(sig: SignalEvent) -> tuple[bool, str]:
 
 # ── Dedup state I/O ───────────────────────────────────────────────────────────
 
-def load_dedup_state() -> dict:
+def load_dedup_state() -> tuple[dict, str | None]:
+    """Returns (dedup_dict, buffer_saved_at_str | None)."""
     if not DEDUP_STATE.exists():
         logger.warning("dedup_state.json not found — run warmup_replay.py first")
-        return {}
+        return {}, None
     with open(DEDUP_STATE) as f:
         data = json.load(f)
-    return data.get("dedup", {})
+    return data.get("dedup", {}), data.get("buffer_saved_at")
 
 
-def save_dedup_state(gen: SignalGenerator) -> None:
+def save_dedup_state(gen: SignalGenerator, buffer_saved_at: str | None = None) -> None:
     state = gen.get_dedup_state()
     DEDUP_STATE.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"saved_at": pd.Timestamp.utcnow().isoformat(), "dedup": state}
+    if buffer_saved_at is not None:
+        payload["buffer_saved_at"] = buffer_saved_at
     with open(DEDUP_STATE, "w") as f:
-        json.dump(
-            {"saved_at": pd.Timestamp.utcnow().isoformat(), "dedup": state},
-            f, indent=2,
-        )
+        json.dump(payload, f, indent=2)
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
@@ -278,27 +280,52 @@ async def run_cycle(gen: SignalGenerator, last_bar_time: pd.Timestamp | None,
 async def main() -> None:
     SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
 
-    # Load dedup state
-    dedup = load_dedup_state()
+    dedup, buffer_saved_at_str = load_dedup_state()
     if not dedup:
         logger.warning("starting with empty dedup state — signals may repeat")
 
-    # Build generator with trimmed history for buffer warmup:
-    #   - weekly MA50 needs 50 weeks → start 56 weeks ago (buffer)
-    #   - 4H structure lookback 20 bars → covered within that window
-    warmup_start = (pd.Timestamp.utcnow() - pd.Timedelta(weeks=56)).strftime("%Y-%m-%d")
-    logger.info("loading history for buffer warmup (from %s)...", warmup_start)
-    init_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS, start=warmup_start)
-    gen = SignalGenerator(feed=init_feed, symbols=SYMBOLS)
-    gen.load_dedup_state(dedup)
+    # ── Try to restore persisted buffer state (fast path) ────────────────────
+    # warmup_replay.py writes buffer state after a full 2020-present replay.
+    # On restart we just load those BarBuffers and replay only the gap
+    # (buffer_saved_at → now), which is minutes to hours, not years.
 
-    # Suppress signal events during initial warmup
-    dummy_signals: list = []
-    @gen.on_signal
-    async def _dummy(evt): dummy_signals.append(evt)
-    await init_feed.start()
-    gen._signal_handlers.remove(_dummy)
-    logger.info("buffer warmup complete (suppressed %d historical signals)", len(dummy_signals))
+    gen = SignalGenerator(feed=None, symbols=SYMBOLS)
+    saved_at = gen.load_buffer_state(BUFFER_STATE_DIR)
+
+    if saved_at is not None:
+        gen.load_dedup_state(dedup)
+        incr_start = (saved_at + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("buffer state loaded — incremental warmup from %s ...", incr_start)
+
+        incr_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS, start=incr_start)
+        incr_feed.add_bar_handler(gen._on_bar)
+        incr_feed.add_flow_handler(gen._on_flow)
+
+        suppressed: list = []
+        @gen.on_signal
+        async def _dummy_incr(evt): suppressed.append(evt)
+        await incr_feed.start()
+        gen._signal_handlers.remove(_dummy_incr)
+        logger.info("incremental warmup complete (suppressed %d signals)", len(suppressed))
+
+    else:
+        # ── Fallback: 56-week internal warmup (pre-warmup_replay baseline) ──
+        warmup_start = (pd.Timestamp.utcnow() - pd.Timedelta(weeks=56)).strftime("%Y-%m-%d")
+        logger.warning(
+            "no persisted buffer state found — falling back to 56-week warmup from %s",
+            warmup_start,
+        )
+        init_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS, start=warmup_start)
+        # Re-create gen with this feed since we need it registered at construction
+        gen = SignalGenerator(feed=init_feed, symbols=SYMBOLS)
+        gen.load_dedup_state(dedup)
+
+        dummy_signals: list = []
+        @gen.on_signal
+        async def _dummy(evt): dummy_signals.append(evt)
+        await init_feed.start()
+        gen._signal_handlers.remove(_dummy)
+        logger.info("buffer warmup complete (suppressed %d historical signals)", len(dummy_signals))
 
     last_bar_time = get_latest_bar_time()
     logger.info("monitor started — last bar: %s", last_bar_time)
@@ -312,6 +339,10 @@ async def main() -> None:
 
                 now = pd.Timestamp.utcnow()
                 for sig in signals:
+                    # Grade filter: A+ not yet live — remove when A+ execution is ready
+                    if sig.grade == "A+":
+                        logger.info("A+ signal held (not live): %s %s", sig.symbol, sig.bar_time)
+                        continue
                     # Recency filter: discard signals older than 2 bars (30 min)
                     age = (now - sig.bar_time).total_seconds() / 60
                     if age > 30:
@@ -324,7 +355,7 @@ async def main() -> None:
                         continue
                     write_signal_pending(sig)
 
-                save_dedup_state(gen)
+                save_dedup_state(gen, buffer_saved_at=buffer_saved_at_str)
 
             update_heartbeat()
 
