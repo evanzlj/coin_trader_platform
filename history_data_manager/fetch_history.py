@@ -3,7 +3,7 @@
 Pull BTC/ETH/BNB/SOL OHLCV + taker_flow data from evan@btc-ml
 and save to ./data/{ohlcv,taker_flow}/<symbol>_<tf>.csv
 
-Date range: 2025-01-01 → 2026-06-05 (inclusive)
+Date range: 2023-01-01 → 2026-06-08 (inclusive)
 """
 
 import argparse
@@ -20,7 +20,7 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 TIMEFRAMES = ["15m", "1h", "4h"]
 
 START = "2023-01-01T00:00:00+00:00"
-END = "2026-06-06T00:00:00+00:00"  # exclusive upper bound → captures up to Jun 5 23:xx
+END = "2026-06-09T00:00:00+00:00"  # exclusive upper bound → captures up to Jun 8 23:xx
 
 LOCAL_DATA = Path(__file__).parent / "data"
 
@@ -108,15 +108,32 @@ def export_remote(dataset: str) -> None:
 
 
 def rsync_from_remote(dataset: str) -> None:
+    """Transfer remote directory via ssh+tar (no rsync required — works on Windows)."""
+    import io
+    import tarfile
+
     local_dir = LOCAL_DATA / dataset
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    src = f"{REMOTE_HOST}:{REMOTE_TMP}/{dataset}/"
-    dst = str(local_dir) + "/"
-    cmd = f"rsync -avz --progress {src} {dst}"
-    print(f"[rsync] {src} → {dst}")
-    result = run(cmd)
-    print(result.stdout.strip())
+    remote_dir = f"{REMOTE_TMP}/{dataset}"
+    print(f"[transfer] {REMOTE_HOST}:{remote_dir}/ → {local_dir}/")
+
+    result = subprocess.run(
+        ["ssh", REMOTE_HOST, f"tar -czf - -C {remote_dir} ."],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr.decode(), file=sys.stderr)
+        raise RuntimeError("ssh+tar transfer failed")
+
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            fname = Path(member.name).name
+            f = tar.extractfile(member)
+            (local_dir / fname).write_bytes(f.read())
+            print(f"  ↓ {fname}")
 
 
 def main() -> None:
