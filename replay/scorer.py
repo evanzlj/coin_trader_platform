@@ -12,8 +12,8 @@ Scoring logic (from prompt contract):
        → whichever triggers first wins; same bar → cancels wins
   3. ACTIVATED  (race to outcome)
        objective: any objective level touched (bar.low <= level or bar.high >= level)
-       invalidation_after_activation: dir="above" → close > level
-                                      dir="below" → close < level
+       invalidation_after_activation: dir="above" → bar.high >= level (touch-based)
+                                      dir="below" → bar.low  <= level (touch-based)
        → same bar → invalidation wins
 """
 from __future__ import annotations
@@ -207,7 +207,8 @@ def score_playbook(
                 r_dist = abs(activation_price - inv_level) if inv_level is not None else None
 
         elif state == "WAITING_FOR_TP1":
-            invalidated = inv_level is not None and _close_crosses(cl, inv_level, inv_dir)
+            inv_side    = "low" if inv_dir == "below" else "high"
+            invalidated = inv_level is not None and _touch(hi, lo, inv_level, inv_side)
             tp1_hit     = tp1_level is not None and _obj_touch(hi, lo, tp1_level)
 
             if invalidated:
@@ -258,7 +259,8 @@ def score_playbook(
                 tp1_ts = ts
 
         elif state == "WAITING_FOR_TP2":
-            invalidated = inv_level is not None and _close_crosses(cl, inv_level, inv_dir)
+            inv_side    = "low" if inv_dir == "below" else "high"
+            invalidated = inv_level is not None and _touch(hi, lo, inv_level, inv_side)
             tp2_hit     = tp2_level is not None and _obj_touch(hi, lo, tp2_level)
 
             if invalidated:
