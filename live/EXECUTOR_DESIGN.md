@@ -853,3 +853,21 @@ btc-ml（新加坡）:
 
 - 交易 `keys_live.json` / `keys_testnet.json` 放 **btc-ml 本地**（executor 在那跑），gitignored。
 - btc-ml 已有的采集 key 是只读行情；下单是另一套有交易权限的 key，互不影响。
+
+### 20.5 单 repo 双机（不拆项目）
+
+一个 `coin_trader_platform` repo，两台机器都 clone 同一个，各跑各的进程、各装各的依赖：
+
+| 机器 | 跑的进程 | 装的依赖 |
+|------|---------|---------|
+| 中国 Windows | monitor / openclaw / warmup_replay / fetch_delta / watchdog | playwright、绘图、pandas… → `requirements-windows.txt` |
+| btc-ml 新加坡 | executor（读旁边 `ai_crypto_analyst` 的 DB 取行情） | 交易所官方 SDK、pandas… → `requirements-executor.txt` |
+
+**为什么不拆两个 repo**：`replay/scorer.py`（状态机）、state.json schema、数据口径这三样，executor
+与 monitor/研究**必须逐字一致**——同一 repo 里是同一份文件，天然不漂；拆开必然漂移（已被 Win/Mac
+分叉坑过一次）。
+
+- 代码在 repo ≠ 要装它的依赖：btc-ml 不 import playwright/draw_kline，就不装它们。
+- 共享核心改一处，两机 `git pull` 同步，单线不分叉。
+- 运行时产物（state/keys/charts/logs）已 gitignore，各机本地各管各的。
+- `requirements-*.txt` 分组文件在开工写 executor 时一并建。
