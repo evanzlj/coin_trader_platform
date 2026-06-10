@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Live openclaw — signal_pending/ → ChatGPT → vlm_response.json
+Live openclaw — signal_pending/ → ChatGPT → vlm_response.json → signal_active/
 
 Polls signal_pending/ for packages with .ready but no vlm_response.json.
 For each: checks signal freshness, uploads prompt + charts to ChatGPT,
-extracts JSON, and saves vlm_response.json.
+extracts JSON, applies post-VLM playbook filter, writes state.json,
+and moves the package to signal_active/ for the executor to pick up.
 
 Usage:
     python3 live/live_openclaw.py
@@ -37,8 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SIGNAL_PENDING = ROOT / "signal_pending"
-CDP_URL        = "http://127.0.0.1:18800"
+SIGNAL_PENDING  = ROOT / "signal_pending"
+SIGNAL_ACTIVE   = ROOT / "signal_active"
+CDP_URL         = "http://127.0.0.1:18800"
 TIMEOUT        = 360      # per-signal wait timeout (seconds)
 MAX_RETRIES    = 1
 PROMPT_VERSION = "v1.0"
@@ -391,6 +393,177 @@ async def process_one(page, pkg_dir: Path, retry_budget: int) -> dict:
     return {"dir": dir_name, "status": "error", "error": "max_retries"}
 
 
+# ── Post-VLM filter + signal_active/ move ────────────────────────────────────
+
+def _r_dist_pct(activation_rule: dict) -> float | None:
+    """Return r_dist (%) = abs(activation_price - invalidation_level) / activation_price."""
+    act = activation_rule.get("activates_if_close_crosses", {})
+    inv = activation_rule.get("invalidation_after_activation", {})
+    act_level = act.get("level")
+    inv_level = inv.get("level")
+    if act_level is None or inv_level is None or act_level == 0:
+        return None
+    return abs(act_level - inv_level) / act_level * 100
+
+
+def _tp1_dist_pct(activation_rule: dict) -> float | None:
+    """Return TP1 distance (%) from activation price."""
+    act = activation_rule.get("activates_if_close_crosses", {})
+    act_level = act.get("level")
+    objectives = activation_rule.get("objectives", [])
+    tp1_levels = [o.get("level") for o in objectives if o.get("level") is not None]
+    if not tp1_levels or act_level is None or act_level == 0:
+        return None
+    return abs(tp1_levels[0] - act_level) / act_level * 100
+
+
+def _passes_filters(symbol: str, r_dist: float | None, tp1_pct: float | None) -> tuple[bool, str]:
+    """
+    Apply per-symbol post-VLM filters. Returns (passes, reason).
+
+    Rules (from aonly_research_summary_20260608.md):
+      BTC: r_dist >= 0.5%  +  TP1 < 1.5%
+      ETH: r_dist >= 1.5%  +  排除 TP1 1–2%
+      BNB: 0.3% <= r_dist <= 1.0%
+      SOL: r_dist >= 1.5%
+
+    b2act >= 2 is enforced by executor at activation time.
+    """
+    if r_dist is None or tp1_pct is None:
+        return True, ""   # can't compute → don't filter
+
+    if symbol == "BTC/USDT":
+        if r_dist < 0.5:
+            return False, f"r_dist {r_dist:.3f}% < 0.5%"
+        if tp1_pct >= 1.5:
+            return False, f"tp1 {tp1_pct:.3f}% >= 1.5%"
+
+    elif symbol == "ETH/USDT":
+        if r_dist < 1.5:
+            return False, f"r_dist {r_dist:.3f}% < 1.5%"
+        if 1.0 <= tp1_pct <= 2.0:
+            return False, f"tp1 {tp1_pct:.3f}% in dead zone 1–2%"
+
+    elif symbol == "BNB/USDT":
+        if not (0.3 <= r_dist <= 1.0):
+            return False, f"r_dist {r_dist:.3f}% outside 0.3–1.0%"
+
+    elif symbol == "SOL/USDT":
+        if r_dist < 1.5:
+            return False, f"r_dist {r_dist:.3f}% < 1.5%"
+
+    return True, ""
+
+
+def _filter_playbooks(signal: dict, vlm: dict) -> list[dict]:
+    """
+    Return playbooks that pass post-VLM filters.
+
+    Excludes:
+    - activation_rule is None (can never activate)
+    - fails per-symbol r_dist or TP1 zone filter
+
+    b2act >= 2 is enforced by executor at activation time.
+    No plausibility or trade_side filter (replay scores all playbooks).
+    """
+    symbol = signal.get("symbol", "")
+    valid = []
+    for pb in vlm.get("playbooks", []):
+        plan = pb.get("conditional_trade_plan", {})
+        ar = plan.get("activation_rule")
+        if ar is None:
+            continue
+        r_dist  = _r_dist_pct(ar)
+        tp1_pct = _tp1_dist_pct(ar)
+        passes, reason = _passes_filters(symbol, r_dist, tp1_pct)
+        if not passes:
+            logger.info("filter: %s %s excluded — %s",
+                        symbol, pb.get("hypothesis", "?"), reason)
+            continue
+        valid.append(pb)
+    return valid
+
+
+def _build_state(signal: dict, valid_playbooks: list[dict], pkg_name: str) -> dict:
+    """Build initial state.json for the executor."""
+    pb_states = []
+    for pb in valid_playbooks:
+        plan = pb.get("conditional_trade_plan", {})
+        ar = plan.get("activation_rule", {}) or {}
+        objectives = ar.get("objectives", [])
+        tp_levels = [o.get("level") for o in objectives if o.get("level") is not None]
+        act = ar.get("activates_if_close_crosses", {})
+        inv = ar.get("invalidation_after_activation", {})
+
+        tp1_pct = _tp1_dist_pct(ar)
+        act_level = act.get("level")
+        inv_level = inv.get("level")
+        r_dist_pct = (
+            abs(act_level - inv_level) / act_level * 100
+            if act_level and inv_level and act_level != 0
+            else None
+        )
+
+        pb_states.append({
+            "hypothesis":          pb.get("hypothesis"),
+            "direction":           ar.get("direction_if_activated"),
+            "status":              "WAITING_FOR_PRIMARY_TOUCH",
+            "primary_touch":       ar.get("primary_touch"),
+            "activates_if":        ar.get("activates_if_close_crosses"),
+            "cancels_if":          ar.get("cancels_if_close_crosses_first"),
+            "invalidation":        ar.get("invalidation_after_activation"),
+            "tp1_level":           tp_levels[0] if len(tp_levels) > 0 else None,
+            "tp2_level":           tp_levels[1] if len(tp_levels) > 1 else None,
+            "tp1_dist_pct":        round(tp1_pct, 4) if tp1_pct is not None else None,
+            "r_dist_pct":          round(r_dist_pct, 4) if r_dist_pct is not None else None,
+            "bars_since_t0":       0,
+            "primary_touched_at":  None,
+            "activated_at":        None,
+            "activation_price":    None,
+            "tp1_hit_at":          None,
+            "done_at":             None,
+            "result":              None,
+            "pnl_r":               None,
+        })
+
+    return {
+        "signal_dir":     pkg_name,
+        "symbol":         signal.get("symbol"),
+        "grade":          signal.get("grade"),
+        "bar_time":       signal.get("bar_time"),
+        "structure_side": signal.get("structure_side"),
+        "created_at":     pd.Timestamp.utcnow().isoformat(),
+        "overall_status": "WATCHING",
+        "playbooks":      pb_states,
+    }
+
+
+def move_to_active(pkg_dir: Path, signal: dict, vlm: dict) -> bool:
+    """
+    Apply post-VLM filter, build state.json, move pkg_dir → signal_active/.
+    Returns True if moved, False if filtered out (no valid playbooks).
+    """
+    valid_pbs = _filter_playbooks(signal, vlm)
+    if not valid_pbs:
+        logger.info("all playbooks filtered out for %s — not moving to active", pkg_dir.name)
+        return False
+
+    state = _build_state(signal, valid_pbs, pkg_dir.name)
+    (pkg_dir / "state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2)
+    )
+
+    SIGNAL_ACTIVE.mkdir(parents=True, exist_ok=True)
+    dest = SIGNAL_ACTIVE / pkg_dir.name
+    if dest.exists():
+        logger.warning("signal_active/%s already exists — skipping move", pkg_dir.name)
+        return True
+
+    pkg_dir.rename(dest)
+    logger.info("moved to signal_active/: %s (%d playbooks)", pkg_dir.name, len(valid_pbs))
+    return True
+
+
 # ── Pending queue helpers ─────────────────────────────────────────────────────
 
 def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
@@ -418,11 +591,13 @@ def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Stale check
+        # Stale check + A+ guard
         sig_file = d / "signal.json"
         if sig_file.exists():
             try:
                 sig = json.loads(sig_file.read_text())
+                if sig.get("grade") == "A+":
+                    continue
                 bar_time = pd.Timestamp(sig["bar_time"])
                 if bar_time.tzinfo is None:
                     bar_time = bar_time.tz_localize("UTC")
@@ -514,6 +689,12 @@ async def main() -> None:
                 if s == "ok":
                     logger.info("ok: %s  (%d chars, %d playbooks)",
                                 result["dir"], result["chars"], result["pbs"])
+                    try:
+                        signal = json.loads((pkg_dir / "signal.json").read_text())
+                        vlm    = json.loads((pkg_dir / "vlm_response.json").read_text())
+                        move_to_active(pkg_dir, signal, vlm)
+                    except Exception as e:
+                        logger.warning("move_to_active failed for %s: %s", pkg_dir.name, e)
                 elif s == "cached":
                     logger.info("cached: %s", result["dir"])
                 elif s == "blocked":
