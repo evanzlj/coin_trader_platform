@@ -726,26 +726,34 @@ header+demo key。
 
 → `keys_testnet.json` 各 1 个（§12.1），`keys_live.json` 才是 5+5。
 
-### 19.2 测试网能/不能验证
+### 19.2 验证手段矩阵（关键：Binance testnet 行情独立）
 
-**能（API 交互 + 逻辑正确性，反复刷）**：
-- hedge 平仓语义（P0-1）、最小下单量（P0-4）、杠杆档位上限（P0-5）
-- 一次挂三单 / OKX 多档 TP 方式（P1-2）、clientId 格式（P1-5）、对账查成交（P1-7）
-- 完整状态机走通：开仓 → TP1 半平移 SL → TP2 / SL / BE 各分支 → slot 释放 → 归档
-- 崩溃重启对账（§11.3）
+⚠️ **Binance testnet 有自己独立的一套行情，与真实币安不同步。** 我们的信号 level
+（activation/invalidation/TP）基于真实币安 K 线算出，所以**不能在 Binance testnet 上用真实
+信号 level 走端到端**——level 和 testnet 现价对不上，会瞬间成交或永不触发。
 
-**不能可靠验证（必须留到小额实盘）**：
-- 真实滑点 / 市价成交质量（testnet 盘口模拟、深度浅，成交价不可信）
-- 真实强平 MMR（P0-3 机制能测，真实档位参数看实盘）
-- 真实限频权重（P1-6）
-- 跨所价差（P2-1）
+因此「完整流程」拆成三种手段，各管一块：
+
+| 验证目标 | 手段 | 说明 |
+|---------|------|------|
+| 状态机全分支（primary→activation→b2act→ACTIVATED→TP1→BE/TP2/SL、cancel、同bar） | **mock broker 单元测试** | 喂构造 bar 序列 + state.json，精确控制每分支；不依赖交易所价格，最可靠，是状态机验证主力 |
+| slot 池调度（选账户 / margin / 同 symbol 约束） | **mock 单测** | 纯 Python 逻辑 |
+| 重启对账（§11.3） | mock 单测 + testnet | |
+| adapter 机械正确性（市价开仓 / 挂三单 / 撤 / 查 / set_leverage / hedge posSide / 精度 / clientId） | **Binance testnet 真实跑**，用 **testnet 现价**构造订单参数（非信号 level） | 验「和交易所对话」对不对，与价格真不真实无关 |
+| 信号 level → 真实价格触发 → 成交（端到端） | **OKX demo（真实行情）** + 小额实盘 | OKX demo 用真实行情，level 对得上 → 能跑端到端；Binance 端到端只能等小额实盘 |
+| 真实滑点 / 成交质量 / 强平 MMR / 限频 / 跨所价差 | **小额实盘**（§19.3 ②） | testnet 盘口模拟、深度浅，不可信 |
+
+> **OKX demo 用真实行情是个优势**：免费就能验「信号 level → 真实价格 → 触发成交」的端到端链路；
+> Binance 这条只能靠小额实盘补。状态机逻辑本身则由 **mock 单测**保证（能遍历所有分支），不依赖
+> 任何 testnet 的真实价格。
 
 ### 19.3 上线两段验证（gate）
 
 ```
-① 测试网阶段（ENV=testnet）
-   - broker adapter 打通：下单/查单/撤单/set_leverage/查仓/查成交
-   - 喂构造信号 + 真实历史信号，跑完整状态机所有分支
+① 测试网 / mock 阶段（ENV=testnet）
+   - mock 单测：状态机全分支 + slot 调度 + 重启对账（不依赖交易所价格）
+   - Binance testnet：adapter 机械正确性（用 testnet 现价构造订单，非信号 level）
+   - OKX demo（真实行情）：adapter + 信号端到端（真实 level 触发成交）
    - 故意杀进程，验证重启对账
    - 全部 P0 + 可测 P1 项打勾 → 才进下一阶段
         ↓
