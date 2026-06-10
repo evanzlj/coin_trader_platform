@@ -20,5 +20,15 @@ screenshots/
 history_data_manager/per_signal_v2.csv
 history_data_manager/aonly_research_summary_20260608.md
 
+# Live runtime state (machine-generated)
+live/state/
+live/charts/
+live/heartbeat/
+signal_pending/
+signal_active/
+signal_done/
+logs/
+*.parquet
+
 # OS
 .DS_Store
