@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""
+Live openclaw — signal_pending/ → ChatGPT → vlm_response.json
+
+Polls signal_pending/ for packages with .ready but no vlm_response.json.
+For each: checks signal freshness, uploads prompt + charts to ChatGPT,
+extracts JSON, and saves vlm_response.json.
+
+Usage:
+    python3 live/live_openclaw.py
+    python3 live/live_openclaw.py --cdp-url http://127.0.0.1:18800
+    python3 live/live_openclaw.py --delay-min 40 --delay-max 60
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+from playwright.async_api import async_playwright
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+SIGNAL_PENDING = ROOT / "signal_pending"
+CDP_URL        = "http://127.0.0.1:18800"
+TIMEOUT        = 360      # per-signal wait timeout (seconds)
+MAX_RETRIES    = 1
+PROMPT_VERSION = "v1.0"
+COOLDOWN_MIN   = 90       # seconds between signals
+COOLDOWN_MAX   = 120
+POLL_INTERVAL  = 30       # seconds between pending-queue checks
+STALE_SECONDS  = 7200     # 2h — skip signal if bar_time is older than this
+
+
+# ── JSON utilities ────────────────────────────────────────────────────────────
+
+def strip_fences(text: str) -> str:
+    text = text.strip()
+    m = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def extract_json(raw: str) -> dict | None:
+    text = strip_fences(raw)
+    for candidate in [text, re.sub(r",(\s*[}\]])", r"\1", text)]:
+        try:
+            d = json.loads(candidate)
+            if isinstance(d, dict):
+                return d
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def validate_response(parsed: dict) -> list[str]:
+    required = ["watch_summary", "playbooks"]
+    return [k for k in required if k not in parsed]
+
+
+# ── ChatGPT page helpers ──────────────────────────────────────────────────────
+
+async def fill_prompt(page, text: str) -> bool:
+    div = page.locator('div[contenteditable="true"]').first
+    await div.wait_for(state="visible", timeout=5000)
+    await div.click(force=True, timeout=10000)
+    await asyncio.sleep(0.5)
+    ok = await page.evaluate(
+        """(t) => {
+            const d = document.querySelector('div[contenteditable="true"]');
+            if (!d) return 'no_div';
+            d.focus(); d.textContent = t;
+            d.dispatchEvent(new Event('input', {bubbles: true}));
+            return 'ok';
+        }""",
+        text,
+    )
+    await asyncio.sleep(0.5)
+    await page.keyboard.press("Space")
+    await asyncio.sleep(0.2)
+    await page.keyboard.press("Backspace")
+    await asyncio.sleep(0.5)
+    return ok == "ok"
+
+
+async def send_message(page) -> bool:
+    try:
+        sb = page.locator('button[data-testid="send-button"]').first
+        await sb.wait_for(state="visible", timeout=5000)
+        disabled = await sb.get_attribute("disabled")
+        if disabled is not None:
+            logger.warning("send button disabled — trying Enter fallback")
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(3)
+            return True
+        await sb.evaluate("el => el.click()")
+        await asyncio.sleep(3)
+        return True
+    except Exception as e:
+        logger.warning("send evaluate failed: %s, trying native click", e)
+        try:
+            sb = page.locator('button[data-testid="send-button"]').first
+            await sb.click(timeout=5000)
+            await asyncio.sleep(3)
+            return True
+        except Exception:
+            try:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(3)
+                return True
+            except Exception as e3:
+                logger.error("send FAILED: %s", e3)
+                await screenshot(page, "send_failed")
+                return False
+
+
+async def screenshot(page, name: str) -> str:
+    ss_dir = ROOT / "live" / "screenshots"
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    path = ss_dir / f"{name}_{int(time.time())}.png"
+    await page.screenshot(path=str(path))
+    return str(path)
+
+
+async def handle_error(page, error_type: str) -> bool:
+    if error_type in ("thinking_failed", "stuck_analyzing"):
+        ss = await screenshot(page, error_type)
+        logger.warning("%s → screenshot: %s, waiting 30s then retry", error_type, ss)
+        await asyncio.sleep(30)
+        return True
+
+    if error_type == "server_error":
+        rb = page.locator('button:has-text("重试")').first
+        if await rb.count() > 0:
+            try:
+                await rb.click(timeout=5000)
+            except Exception:
+                await rb.evaluate("el => el.click()")
+            logger.info("clicked retry — waiting for response")
+            await asyncio.sleep(5)
+            return True
+        return False
+
+    if error_type == "timeout":
+        ss = await screenshot(page, "timeout")
+        logger.warning("timeout → screenshot: %s, waiting 10s then retry", ss)
+        await asyncio.sleep(10)
+        return True
+
+    if error_type in ("rate_limit", "blocked"):
+        logger.error("BLOCKED: %s — pausing, awaiting user", error_type)
+        return False
+
+    logger.warning("unknown error: %s", error_type)
+    return False
+
+
+async def wait_for_response(page, prev_count: int):
+    """Wait for a new assistant message to appear and stabilise.
+    Returns (text, error_type_or_None).
+    """
+    start = time.time()
+    last_text = ""
+    stable = 0
+    stuck_start = 0
+    rate_limit_hits = 0
+
+    while time.time() - start < TIMEOUT:
+        await asyncio.sleep(4)
+
+        # Rate-limit modal
+        try:
+            rl = page.locator('text="请求过于频繁"').first
+            if await rl.count() > 0:
+                rate_limit_hits += 1
+                logger.warning("rate limit modal #%d", rate_limit_hits)
+                dismiss = page.locator('button:has-text("明白了")').first
+                if await dismiss.count() > 0:
+                    try:
+                        await dismiss.click(timeout=5000)
+                    except Exception:
+                        await dismiss.evaluate("el => el.click()")
+                    await asyncio.sleep(3)
+                if rate_limit_hits >= 10:
+                    return None, "rate_limit"
+                await asyncio.sleep(30)
+                continue
+        except Exception:
+            pass
+
+        # Server error
+        try:
+            err = page.locator('text="Something went wrong"').first
+            if await err.count() > 0:
+                rb = page.locator('button:has-text("重试")').first
+                if await rb.count() > 0:
+                    try:
+                        await rb.click(timeout=5000)
+                    except Exception:
+                        await rb.evaluate("el => el.click()")
+                    await asyncio.sleep(5)
+                    continue
+                return None, "server_error"
+        except Exception:
+            pass
+
+        # Thinking stopped without output
+        try:
+            stopped = page.locator('text="已停止思考"').first
+            if await stopped.count() > 0 and (time.time() - start) > 30:
+                return None, "thinking_failed"
+        except Exception:
+            pass
+
+        msgs = page.locator('[data-message-author-role="assistant"]')
+        cnt = await msgs.count()
+
+        if cnt <= prev_count:
+            continue
+
+        text = await msgs.nth(cnt - 1).inner_text()
+        cur = text.strip()
+        cur_len = len(cur)
+
+        is_analyzing = "正在分析" in cur and cur_len < 50
+        if is_analyzing:
+            if stuck_start == 0:
+                stuck_start = time.time()
+            elif time.time() - stuck_start > 60:
+                return None, "stuck_analyzing"
+        else:
+            stuck_start = 0
+
+        if cur == last_text and cur_len > 500:
+            stable += 1
+        elif cur != last_text:
+            stable = 0
+            if cur_len > 0 and not is_analyzing:
+                logger.debug("response growing: %d chars", cur_len)
+
+        last_text = cur
+
+        if stable >= 5:
+            return text, None
+
+    return last_text if len(last_text) > 500 else None, "timeout"
+
+
+# ── Per-signal processing ─────────────────────────────────────────────────────
+
+async def process_one(page, pkg_dir: Path, retry_budget: int) -> dict:
+    dir_name = pkg_dir.name
+    vlm_path = pkg_dir / "vlm_response.json"
+
+    # Already done?
+    if vlm_path.exists():
+        try:
+            existing = json.loads(vlm_path.read_text())
+            if existing.get("watch_summary") and not existing.get("error"):
+                return {"dir": dir_name, "status": "cached"}
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    prompt_file = pkg_dir / "prompt.txt"
+    if not prompt_file.exists():
+        return {"dir": dir_name, "status": "error", "error": "no_prompt.txt"}
+
+    imgs_4h  = sorted(pkg_dir.glob("*_4h.png"))
+    imgs_15m = sorted(pkg_dir.glob("*_15m.png"))
+    img_4h   = imgs_4h[0] if imgs_4h else None
+    img_15m  = imgs_15m[0] if imgs_15m else None
+
+    if not img_4h or not img_15m:
+        missing = []
+        if not img_4h:  missing.append("4h.png")
+        if not img_15m: missing.append("15m.png")
+        return {"dir": dir_name, "status": "error", "error": f"missing_images:{missing}"}
+
+    prompt = prompt_file.read_text(encoding="utf-8")
+
+    for attempt in range(retry_budget + 1):
+        try:
+            if attempt > 0:
+                logger.info("retry %d/%d for %s", attempt, retry_budget, dir_name)
+                await asyncio.sleep(3)
+
+            prev_count = await page.locator(
+                '[data-message-author-role="assistant"]'
+            ).count()
+
+            fi = page.locator('input[type="file"]').first
+            await fi.set_input_files([str(img_4h), str(img_15m)])
+
+            sb = page.locator('button[data-testid="send-button"]').first
+            for _ in range(12):  # up to 24 seconds for upload
+                await asyncio.sleep(2)
+                disabled = await sb.get_attribute("disabled")
+                if disabled is None:
+                    break
+
+            if not await fill_prompt(page, prompt):
+                return {"dir": dir_name, "status": "error", "error": "fill_failed"}
+
+            await asyncio.sleep(2)
+            for _ in range(6):
+                disabled = await sb.get_attribute("disabled")
+                if disabled is None:
+                    break
+                await asyncio.sleep(2)
+
+            if not await send_message(page):
+                if attempt < retry_budget:
+                    await asyncio.sleep(5)
+                    continue
+                return {"dir": dir_name, "status": "error", "error": "send_failed"}
+
+            logger.info("sent to ChatGPT: %s", dir_name)
+            text, err = await wait_for_response(page, prev_count)
+
+            if err:
+                if attempt < retry_budget:
+                    recoverable = await handle_error(page, err)
+                    if recoverable:
+                        continue
+                    return {"dir": dir_name, "status": "blocked", "error": err}
+                return {"dir": dir_name, "status": "error", "error": err}
+
+            if not text or len(text) < 200:
+                if attempt < retry_budget:
+                    continue
+                return {"dir": dir_name, "status": "error", "error": "too_short"}
+
+            parsed = extract_json(text)
+            if parsed is None:
+                if attempt < retry_budget:
+                    continue
+                (pkg_dir / "_raw_response.txt").write_text(text, encoding="utf-8")
+                return {"dir": dir_name, "status": "parse_err"}
+
+            missing_keys = validate_response(parsed)
+            if missing_keys:
+                if attempt < retry_budget:
+                    continue
+                (pkg_dir / "_raw_response.txt").write_text(text, encoding="utf-8")
+                vlm_path.write_text(
+                    json.dumps(
+                        {"parsed": parsed, "error": f"missing:{missing_keys}"},
+                        ensure_ascii=False, indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                return {"dir": dir_name, "status": "validation_err",
+                        "error": f"missing:{missing_keys}"}
+
+            parsed["prompt_version"] = PROMPT_VERSION
+            vlm_path.write_text(
+                json.dumps(parsed, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return {
+                "dir": dir_name,
+                "status": "ok",
+                "chars": len(text),
+                "pbs": len(parsed.get("playbooks", [])),
+            }
+
+        except Exception as e:
+            if attempt >= retry_budget:
+                return {"dir": dir_name, "status": "error", "error": str(e)[:200]}
+
+    return {"dir": dir_name, "status": "error", "error": "max_retries"}
+
+
+# ── Pending queue helpers ─────────────────────────────────────────────────────
+
+def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
+    """Return package dirs that have .ready but no valid vlm_response.json,
+    sorted by directory name (= bar_time order).
+    Stale packages (bar_time < stale_cutoff) are logged and excluded.
+    """
+    if not SIGNAL_PENDING.exists():
+        return []
+
+    pending = []
+    for d in sorted(SIGNAL_PENDING.iterdir()):
+        if not d.is_dir():
+            continue
+        if not (d / ".ready").exists():
+            continue
+
+        # Already processed?
+        vlm = d / "vlm_response.json"
+        if vlm.exists():
+            try:
+                ex = json.loads(vlm.read_text())
+                if ex.get("watch_summary") and not ex.get("error"):
+                    continue
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Stale check
+        sig_file = d / "signal.json"
+        if sig_file.exists():
+            try:
+                sig = json.loads(sig_file.read_text())
+                bar_time = pd.Timestamp(sig["bar_time"])
+                if bar_time.tzinfo is None:
+                    bar_time = bar_time.tz_localize("UTC")
+                if bar_time < stale_cutoff:
+                    logger.info("stale package skipped: %s (bar_time=%s)", d.name, bar_time)
+                    continue
+            except Exception as e:
+                logger.warning("could not read bar_time from %s: %s", d.name, e)
+
+        pending.append(d)
+
+    return pending
+
+
+def extract_symbol(dir_name: str) -> str:
+    """btcusdt_A_20260608_2100 → btc"""
+    return dir_name.split("usdt")[0]
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="live_openclaw: signal_pending → ChatGPT → vlm_response.json")
+    parser.add_argument("--cdp-url", default=CDP_URL)
+    parser.add_argument("--delay-min", type=float, default=COOLDOWN_MIN)
+    parser.add_argument("--delay-max", type=float, default=COOLDOWN_MAX)
+    parser.add_argument("--tab-index", type=int, default=0)
+    args = parser.parse_args()
+
+    SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
+    logger.info("live_openclaw started — watching %s", SIGNAL_PENDING)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(args.cdp_url)
+        pages = browser.contexts[0].pages
+        if args.tab_index >= len(pages):
+            logger.error("tab index %d out of range (%d pages)", args.tab_index, len(pages))
+            return
+
+        page = pages[args.tab_index]
+        logger.info("using tab[%d]: %s", args.tab_index, await page.title())
+
+        try:
+            await asyncio.wait_for(
+                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000),
+                timeout=40,
+            )
+            await asyncio.sleep(4)
+        except Exception as e:
+            logger.warning("initial nav failed: %s, continuing with current page", e)
+
+        current_symbol = None
+        needs_fresh_chat = True
+
+        while True:
+            stale_cutoff = pd.Timestamp.utcnow() - pd.Timedelta(seconds=STALE_SECONDS)
+            pending = get_pending(stale_cutoff)
+
+            if not pending:
+                logger.debug("no pending packages — sleeping %ds", POLL_INTERVAL)
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            logger.info("%d package(s) pending", len(pending))
+
+            for pkg_dir in pending:
+                sym = extract_symbol(pkg_dir.name)
+
+                if needs_fresh_chat or current_symbol is None or sym != current_symbol:
+                    reason = ("first" if current_symbol is None
+                              else "symbol_change" if sym != current_symbol
+                              else "recovery")
+                    logger.info("new chat (%s)", reason)
+                    try:
+                        await asyncio.wait_for(
+                            page.goto("https://chatgpt.com/",
+                                      wait_until="domcontentloaded", timeout=30000),
+                            timeout=40,
+                        )
+                        await asyncio.sleep(4)
+                    except Exception as e:
+                        logger.warning("new-chat nav failed: %s", e)
+                    needs_fresh_chat = False
+                current_symbol = sym
+
+                result = await process_one(page, pkg_dir, MAX_RETRIES)
+                s = result["status"]
+
+                if s == "ok":
+                    logger.info("ok: %s  (%d chars, %d playbooks)",
+                                result["dir"], result["chars"], result["pbs"])
+                elif s == "cached":
+                    logger.info("cached: %s", result["dir"])
+                elif s == "blocked":
+                    logger.error("BLOCKED: %s — %s", result["dir"], result.get("error", ""))
+                    logger.error("pausing — please resolve and restart")
+                    await browser.close()
+                    return
+                else:
+                    logger.warning("%s: %s — %s", s, result["dir"], result.get("error", "")[:80])
+
+                if s not in ("ok", "cached"):
+                    needs_fresh_chat = True
+
+                # Cooldown between signals (skip after last in batch)
+                remaining = get_pending(pd.Timestamp.utcnow() - pd.Timedelta(seconds=STALE_SECONDS))
+                if remaining:
+                    delay = random.uniform(args.delay_min, args.delay_max)
+                    logger.info("cooldown %.0fs ...", delay)
+                    await asyncio.sleep(delay)
+
+            # Brief pause before next poll
+            await asyncio.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
