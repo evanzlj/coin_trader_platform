@@ -519,9 +519,10 @@ C3  交易所与品种兼容                          # 目前无硬限制（BNB
 
 ### 12.1 API key 文件（gitignored，你填）
 
-按环境分**两个文件**，executor 按 `ENV` 加载对应文件，**绝不混用**：
-`live/keys_testnet.json` 和 `live/keys_live.json`，结构相同：
+按环境分**两个文件**，executor 按 `ENV` 加载对应文件，**绝不混用**。
+**注意两个文件账号数量不同**（见 §19 测试网账号策略）：
 
+`live/keys_live.json`（实盘 = 10 账户）：
 ```jsonc
 {
   "binance": [{"label":"binance_0","api_key":"","secret":""}, ... ×5],
@@ -529,10 +530,20 @@ C3  交易所与品种兼容                          # 目前无硬限制（BNB
 }
 ```
 
+`live/keys_testnet.json`（测试网 = 每所 1 个即够）：
+```jsonc
+{
+  "binance": [{"label":"binance_tn", "api_key":"", "secret":""}],
+  "okx":     [{"label":"okx_demo",   "api_key":"", "secret":"", "passphrase":""}]
+}
+```
+
 - Binance testnet key 来自 `testnet.binancefuture.com`（独立注册的测试账号），只在 testnet
   base url 工作。
-- OKX testnet 用 **Demo Trading** 创建的 demo key（同账户内开通），调用时带 header
+- OKX testnet 用 **Demo Trading** 创建的 demo key（在已有子账户内开通，无需新注册），调用时带 header
   `x-simulated-trading: 1`。
+- **测试网各 1 个就够**：验 adapter 接口 + 状态机全分支；10 账户的 slot 调度逻辑用 mock 单元测试
+  覆盖，不依赖真实多账户。10 个真实账户在「小额实盘」阶段才全上（§19）。
 - executor 启动 `json.load`，代码中不出现 key。`.gitignore` 加 `live/keys_*.json`。
 
 ### 12.2 live/exec_config.py（进 git）
@@ -705,6 +716,15 @@ python3 live/watchdog.py                           # 守护三心跳
 
 → adapter 把 `ENV`（§12.2）作为开关，两家各自实现切换：Binance 切 base url+key；OKX 切
 header+demo key。
+
+**测试网账号数量：每所 1 个就够，不必凑 10 个。** 理由：
+- adapter 接口（下单/查单/撤单/挂三单/set_leverage/查仓）+ 状态机全分支 → 单账户即可验证；
+  hedge 模式下单账户开多个不同 symbol 仓位，也能覆盖「同账户多 slot」「同 symbol 冲突」约束。
+- 10 账户的 slot **调度逻辑**（选空闲账户、margin/同 symbol 约束）是纯 Python，用 **mock broker
+  单元测试**覆盖，不依赖真实多账户。
+- 真正需要凑齐 10 个的，只有**真实并发**——留到 §19.3 的「② 小额实盘」阶段，用真实 5+5 子账户。
+
+→ `keys_testnet.json` 各 1 个（§12.1），`keys_live.json` 才是 5+5。
 
 ### 19.2 测试网能/不能验证
 
