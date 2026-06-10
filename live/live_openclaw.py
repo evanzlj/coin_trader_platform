@@ -23,6 +23,7 @@ import random
 import re
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 SIGNAL_PENDING  = ROOT / "signal_pending"
 SIGNAL_ACTIVE   = ROOT / "signal_active"
+HEARTBEAT_FILE  = ROOT / "live" / "heartbeat" / "openclaw_last_run.txt"
 CDP_URL         = "http://127.0.0.1:18800"
 TIMEOUT        = 360      # per-signal wait timeout (seconds)
 MAX_RETRIES    = 1
@@ -617,6 +619,29 @@ def extract_symbol(dir_name: str) -> str:
     return dir_name.split("usdt")[0]
 
 
+def update_heartbeat() -> None:
+    """Write current timestamp to heartbeat file for watchdog."""
+    HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat())
+
+
+def resolve_cdp_url(http_url: str) -> str:
+    """Resolve HTTP CDP endpoint to WebSocket URL.
+    Playwright 1.60+ may reject HTTP-style CDP on some Chrome versions;
+    fall back to extracting webSocketDebuggerUrl from /json/version/.
+    """
+    try:
+        resp = urllib.request.urlopen(f"{http_url.rstrip('/')}/json/version/", timeout=5)
+        data = json.loads(resp.read().decode())
+        ws_url = data.get("webSocketDebuggerUrl")
+        if ws_url:
+            logger.info("resolved CDP WS: %s", ws_url[:60] + "...")
+            return ws_url
+    except Exception as e:
+        logger.warning("could not resolve WS from %s: %s", http_url, e)
+    return http_url  # fallback, let Playwright try original
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -631,7 +656,8 @@ async def main() -> None:
     logger.info("live_openclaw started — watching %s", SIGNAL_PENDING)
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(args.cdp_url)
+        cdp_target = resolve_cdp_url(args.cdp_url)
+        browser = await p.chromium.connect_over_cdp(cdp_target)
         pages = browser.contexts[0].pages
         if args.tab_index >= len(pages):
             logger.error("tab index %d out of range (%d pages)", args.tab_index, len(pages))
@@ -653,10 +679,11 @@ async def main() -> None:
         needs_fresh_chat = True
 
         while True:
-            stale_cutoff = pd.Timestamp.utcnow() - pd.Timedelta(seconds=STALE_SECONDS)
+            stale_cutoff = pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS)
             pending = get_pending(stale_cutoff)
 
             if not pending:
+                update_heartbeat()
                 logger.debug("no pending packages — sleeping %ds", POLL_INTERVAL)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
@@ -709,11 +736,13 @@ async def main() -> None:
                     needs_fresh_chat = True
 
                 # Cooldown between signals (skip after last in batch)
-                remaining = get_pending(pd.Timestamp.utcnow() - pd.Timedelta(seconds=STALE_SECONDS))
+                remaining = get_pending(pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS))
                 if remaining:
                     delay = random.uniform(args.delay_min, args.delay_max)
                     logger.info("cooldown %.0fs ...", delay)
                     await asyncio.sleep(delay)
+
+            update_heartbeat()
 
             # Brief pause before next poll
             await asyncio.sleep(POLL_INTERVAL)

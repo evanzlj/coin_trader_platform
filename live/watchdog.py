@@ -34,6 +34,7 @@ STALE_MINUTES  = 20
 
 PROCESSES = {
     "monitor":  HEARTBEAT_DIR / "monitor_last_run.txt",
+    "openclaw": HEARTBEAT_DIR / "openclaw_last_run.txt",
     "executor": HEARTBEAT_DIR / "executor_last_run.txt",
 }
 

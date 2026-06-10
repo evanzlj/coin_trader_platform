@@ -71,10 +71,12 @@ def _slug(symbol: str) -> str:
     return symbol.replace("/", "").lower()
 
 
-def _ssh_run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(cmd, capture_output=True)
+def _ssh_run(cmd: list[str], check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
+    kwargs = {"capture_output": True, "encoding": "utf-8", "errors": "replace"} if text else {"capture_output": True}
+    result = subprocess.run(cmd, **kwargs)
     if check and result.returncode != 0:
-        raise RuntimeError(result.stderr.decode().strip())
+        err = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else (result.stderr or "unknown error")
+        raise RuntimeError(err.strip())
     return result
 
 
@@ -82,10 +84,10 @@ def _ssh_python(script: str) -> subprocess.CompletedProcess:
     remote_cmd = f"python3 << 'PYEOF'\n{script}\nPYEOF"
     result = subprocess.run(
         ["ssh", REMOTE_HOST, remote_cmd],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+        raise RuntimeError((result.stderr or "unknown error").strip())
     return result
 
 
@@ -192,7 +194,7 @@ def transfer_and_append(dataset: str) -> dict[Path, int]:
     import tarfile
 
     remote_dir = f"{REMOTE_TMP}/{dataset}"
-    result = _ssh_run(["ssh", REMOTE_HOST, f"tar -czf - -C {remote_dir} . 2>/dev/null || true"])
+    result = _ssh_run(["ssh", REMOTE_HOST, f"tar -czf - -C {remote_dir} . 2>/dev/null || true"], text=False)
 
     appended: dict[Path, int] = {}
 

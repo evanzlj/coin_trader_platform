@@ -31,7 +31,7 @@ def _symbol_slug(symbol: str) -> str:
 
 def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, shell=True, check=check, text=True,
-                          capture_output=True)
+                          capture_output=True, encoding="utf-8", errors="replace")
 
 
 def ssh_run(script: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -39,7 +39,7 @@ def ssh_run(script: str, check: bool = True) -> subprocess.CompletedProcess:
     remote_cmd = f"python3 << 'PYEOF'\n{script}\nPYEOF"
     result = subprocess.run(
         ["ssh", REMOTE_HOST, remote_cmd],
-        text=True, capture_output=True,
+        text=True, capture_output=True, encoding="utf-8", errors="replace",
     )
     if check and result.returncode != 0:
         print(result.stderr, file=sys.stderr)
@@ -121,9 +121,10 @@ def rsync_from_remote(dataset: str) -> None:
     result = subprocess.run(
         ["ssh", REMOTE_HOST, f"tar -czf - -C {remote_dir} ."],
         capture_output=True,
+        encoding=None,  # binary transfer, don't decode
     )
     if result.returncode != 0:
-        print(result.stderr.decode(), file=sys.stderr)
+        print(result.stderr.decode("utf-8", errors="replace"), file=sys.stderr)
         raise RuntimeError("ssh+tar transfer failed")
 
     with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:gz") as tar:
