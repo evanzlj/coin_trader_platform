@@ -163,8 +163,13 @@ while True:
     for pkg in list_signal_active():
         if all_terminal(pkg): archive_to_done(pkg)
     update_heartbeat()
-    sleep(15)
+    sleep(POLL_SECONDS)        # 干完一轮活再 sleep（非定时器），天然不堆积请求
 ```
+
+> **防请求堆积（中国 Windows + 美国代理下尤其重要）**：主循环是「干完一轮、再 sleep」的结构，
+> **不是固定间隔定时器** —— 上一轮没跑完绝不叠加发起新一轮（单实例 + 重入保护）。每轮用**批量接口**
+> （每账户一次查全部 open orders / positions，而非每单一次请求）压低请求数；每个请求设超时 + 退避重试。
+> `POLL_SECONDS` 是默认值，须按真实往返延迟实测单轮耗时来定（§18 P1-9）。
 
 - `for bar in bars[...]`：重启/补数据时一次可能补多根，**必须逐根顺序喂**，否则错过中间 bar
   的 primary touch / activation（与 scorer 逐 bar 迭代一致）。
@@ -399,9 +404,10 @@ actual_qty = sz * ctVal
 deviation  = (actual_qty - qty_coin) / qty_coin
 ```
 
-绝大多数合约 lotSz 足够细，deviation 很小。**仅当某品种实测 |deviation| 超阈值（±5% / ±10%）
-才考虑给该品种加路由偏好**（如优先 Binance）；否则 slot **纯随机分配**（§9）。
-Binance 用 stepSize 取整，同理。每笔记录 `actual_r_usdt`。
+绝大多数合约 lotSz 足够细，deviation 很小。**若某品种在某交易所实测 |deviation| 超阈值（默认 ±5%），
+则该 (品种, 交易所) 组合不满足分配约束 C4**（§9.2）——分配时把该交易所的账户从候选**排除**，在剩余
+满足约束的账户中**随机选**（不是加权偏好，仍是纯随机，只是候选集变小）。Binance 用 stepSize 取整，
+同理。每笔记录 `actual_r_usdt`。
 
 ### 8.4 持仓模式 + 平仓语义（已查证）
 
@@ -442,12 +448,14 @@ OKX long/short 模式同理（平仓 posSide 不变、side 相反）。
 C1  账户剩余可用 margin ≥ 本笔 margin        # 已占 margin + 本笔 ≤ 120
 C2  账户内无相同 symbol 的活跃持仓           # 避免 hedge 合并 + Binance symbol 级杠杆冲突
 C3  交易所与品种兼容                          # 目前无硬限制（BNB margin 70u 已兼容 OKX 50x）
+C4  该(symbol,交易所)数量取整偏差 ≤ 阈值     # OKX |deviation|>阈值 → 排除该所账户（§8.3）
 ```
 
 - C1 自动排除「2 笔 BNB 同账户」（70+70>120）；允许「BNB 70 + 其他 40 = 110 ≤120」。
 - C2：Binance 同 symbol 的 long/short 共用 symbol 级杠杆，两笔 r_dist 不同会杠杆打架，故同账户
   干脆不放同 symbol（任何方向）。每账户 2 笔必须不同 symbol。
-- **满足约束的账户中随机选**（你确认：偏好随机，不做软路由，除非 §8.3 实测某品种取整偏差超阈值）。
+- **满足约束的账户中纯随机选**（不做加权/软路由）。§8.3 的取整偏差超阈值不是「偏好」而是约束 C4：
+  把超阈值的交易所账户从候选**排除**，再在剩余满足约束的账户里随机 —— 候选集变小，但仍是纯随机。
 - 无可用账户 → 放弃进场，`result="skipped_no_slot"`，记日志。研究峰值并发才 7，20 上限充裕。
 
 ### 9.3 Slot 状态恢复（崩溃重启）
@@ -490,7 +498,7 @@ C3  交易所与品种兼容                          # 目前无硬限制（BNB
 |------|------|
 | 入场市价单失败 | 同单号重试 1 次；仍失败 → 不进场，`result="entry_failed"`，**不占 slot**，告警。绝不在无实仓时记 ACTIVATED |
 | 入场部分成交 | 以实际 filled qty 重算 TP/SL 数量 |
-| TP/SL 挂单失败 | 重试；TP 挂不上 → 降级为 executor 轮询 + 市价平（记录降级）；**SL 挂不上 → 立即市价平仓退出**（不允许无止损裸仓） |
+| TP/SL 挂单失败 | 重试；TP 挂不上 → 降级为 executor 轮询 + 市价平（记录降级）；**SL 挂不上 → 立即市价平仓退出 + 飞书告警**（不允许无止损裸仓），通知人工可介入重挂（见 §10.3） |
 | 撤单失败 | 重试 + 查单状态（可能撤时刚成交） |
 | 查单超时 | 本轮跳过该 pb，下轮重试，不臆测 |
 | 数据滞后/无新 bar | 不推进；超 N 分钟无新 bar 告警 |
@@ -499,6 +507,19 @@ C3  交易所与品种兼容                          # 目前无硬限制（BNB
 | 进程崩溃 | 重启走 §9.3 + §11.3 对账 |
 
 无滑点保护（市价滑点不可预知，靠未来平均值衡量）。
+
+### 10.3 飞书告警 + 人工接管
+
+预留**飞书 webhook 口子**（`FEISHU_WEBHOOK`，§12.2）。以下推飞书：SL 挂不上已强平、入场失败、
+对账不一致、无 slot、数据滞后。
+
+**人工接管机制**（避免 executor 与人工重复操作）：
+- 人收到告警后可手动介入（重挂 SL / 手动平仓 / 接管该笔）。
+- executor 每轮扫描时，若发现某 (账户, symbol) 上有**非自己下的订单/持仓变化**（client_id 不在它
+  记录里），或 state.exec 标了 `manual_override=true` → **暂停对该 pb 的自动操作**，仅记录 + 心跳，
+  等人工处理完显式清除标记再恢复。
+- 人工接管入口：在该 pb 的 state.json 置 `manual_override=true`（人工或小工具写入），executor 读到即让位。
+- 原则同 §11.3 对账不一致：**宁可让位、不抢操作**。
 
 ---
 
@@ -561,8 +582,9 @@ SL_MODE         = "touch"      # 真实 stop 单，盘中触发
 TRIGGER_PX_TYPE = "last"       # 触发价口径：last(=Binance CONTRACT_PRICE/OKX last)，与信号 level 一致
 POS_MODE        = "hedge"      # long/short；平仓靠 posSide+反向 side，不用 reduceOnly
 MARGIN_MODE     = "isolated"
-POLL_SECONDS    = 15
-OKX_R_DEV_THRESHOLD = 0.05     # 取整 R 偏差超此值才考虑路由偏好
+POLL_SECONDS    = 15           # 默认值，按真实环境（中国Win+美国代理往返延迟）实测单轮耗时调整（§18 P1-9）
+OKX_R_DEV_THRESHOLD = 0.05     # |取整偏差|超此 → 该所账户对该品种不满足约束 C4（§8.3/§9.2）
+FEISHU_WEBHOOK  = ""           # 告警/人工接管通知口子（§10.3）；从 env/keys 注入，不硬编码
 ```
 
 ---
@@ -573,7 +595,8 @@ OKX_R_DEV_THRESHOLD = 0.05     # 取整 R 偏差超此值才考虑路由偏好
   TP2_FILLED / BE_EXIT / SKIPPED_* / ERROR_*），含 account/exchange/symbol/pos_side/价格/qty/
   actual_r_usdt/时间。
 - `live/heartbeat/executor_last_run.txt`：每轮更新，watchdog 监控。
-- 醒目告警：入场失败、SL 挂不上已强平、对账不一致、无 slot、数据滞后。
+- 醒目告警 + **飞书推送**（`FEISHU_WEBHOOK`，§10.3）：入场失败、SL 挂不上已强平、对账不一致、
+  无 slot、数据滞后、检测到人工接管。
 
 ---
 
@@ -604,13 +627,14 @@ python3 live/watchdog.py                           # 守护三心跳
 
 剩余差异：
 
-| # | 差异 | scorer | 实盘 | 影响/态度 |
-|---|------|--------|------|----------|
-| 1 | TP1 后保护 | 原 invalidation（touch） | **BE（入场价）** | 实盘更保守 |
-| 2 | 入场价 | 激活 K 线 close | 收线后市价（含滑点） | 研究已含滑点假设 |
-| 3 | BTC 真实亏损 | 1R（含 buffer 回测） | >1R（median 1.11R，封顶 1.2R） | 已接受 |
-| 4 | OKX 数量 | 连续币量 | 按 ctVal/lotSz/minSz 实算 | 偏差通常很小，超阈值才路由 |
-| 5 | 成本 | 0.22% + funding 0.01%/8h | 真实 fee + 滑点 + funding | 可能略高于假设 |
+> TP1 后保护用 **BE（入场价）**——研究 S3 本来就是 BE，实盘一致，**非差异**（不再扯 replay_report）。
+
+| # | 差异 | scorer/研究 | 实盘 | 影响/态度 |
+|---|------|------------|------|----------|
+| 1 | 入场价 | 激活 K 线 close | 收线后市价（含滑点） | 研究已含滑点假设 |
+| 2 | BTC 真实亏损 | 1R（含 buffer 回测） | >1R（median 1.11R，封顶 1.2R） | 已接受 |
+| 3 | OKX 数量 | 连续币量 | 按 ctVal/lotSz/minSz 实算 | 偏差很小，超阈值则排除该所账户（C4） |
+| 4 | 成本 | 0.22% + funding 0.01%/8h | 真实 fee + 滑点 + funding | 可能略高于假设 |
 
 研究是 in-sample 5 个月小样本，实盘 = OOS。上线后用 `trade_log.jsonl` 持续比对止损率 / TP2 率 / 月度 R。
 
@@ -680,9 +704,10 @@ python3 live/watchdog.py                           # 守护三心跳
 | P1-3 | OKX 市价单 sz 单位 + ctVal/lotSz/minSz | ⚠️ 启动拉 instruments 实算（§8.3） |
 | P1-4 | set_leverage 时机/层级 | ⚠️ hedge 下是 symbol 级还是 posSide 级；有持仓时能否改（§9 C2 已规避同 symbol） |
 | P1-5 | clientOrderId 格式 | ⚠️ Binance `^[\.A-Z\:/a-z0-9_-]{1,36}$` / OKX 字母数字 1-32；client_id_base 要同时兼容 |
-| P1-6 | API 限频权重 | ⚠️ 10 账户 × 15s 查单/查仓的权重，确认不超限；adapter 内置最小间隔 |
+| P1-6 | API 限频权重 | ⚠️ 10 账户 × 每轮查单/查仓的权重，确认不超限；用批量接口 + adapter 内置最小间隔 |
 | P1-7 | 查历史成交接口 + 保留时长 | ⚠️ 重启对账（§11.3）依赖，确认能查到宕机期间的成交 |
 | P1-8 | 子账户 API 权限/IP 白名单 | ⚠️ 每个子账户 key 有合约权限、是否需绑 IP |
+| P1-9 | **跨境代理轮询耗时** | ⚠️ 中国 Win + 美国代理往返延迟下，实测单轮（批量查 N 账户）耗时，据此定 `POLL_SECONDS`；循环「干完再 sleep」+ 重入保护防堆积（§4） |
 
 ### P2 — 跨系统一致性，需明确口径
 
