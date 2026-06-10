@@ -105,6 +105,8 @@ state.json。剩下的每个**独立监控、独立激活、独立分仓**（研
   state.json 必然完整。
 - executor 更新 state.json 用「写 `state.json.tmp` → `os.replace()`」原子替换。executor 是
   `signal_active/` 内 state.json 的**唯一 writer**，无需文件锁。
+- ⚠️ **双机部署后（§20）**：openclaw 在中国写 state.json、executor 在 btc-ml 读 —— 跨机器后同机
+  原子 rename 失效，改为「传完落 `.ready` 标记」保证 executor 不读半包（见 §20.2）。
 
 ### 3.2 CSV：有竞态，需修复 ⚠️
 
@@ -600,18 +602,21 @@ FEISHU_WEBHOOK  = ""           # 告警/人工接管通知口子（§10.3）；�
 
 ---
 
-## 14. 部署启动顺序（Windows）
+## 14. 部署启动顺序（双机，详见 §20）
 
 ```bash
-# 一次性
-python3 history_data_manager/fetch_history.py      # 数据
-python3 live/warmup_replay.py                      # buffer/dedup（首次）
+# —— 中国 Windows（有 UI：monitor + openclaw）——
+python3 history_data_manager/fetch_history.py      # 一次性：拉数据
+python3 live/warmup_replay.py                      # 一次性：buffer/dedup
+python3 live/monitor.py                            # 常驻 A
+python3 live/live_openclaw.py                      # 常驻 B（Chrome CDP 先开）
 
-# 常驻
-python3 live/monitor.py                            # A
-python3 live/live_openclaw.py                      # B（Chrome CDP 先开）
-python3 live/executor.py                           # C（先填 keys.json）
-python3 live/watchdog.py                           # 守护三心跳
+# —— btc-ml 新加坡（executor）——
+#   先填好 btc-ml 本地的 keys_live.json / keys_testnet.json
+python3 live/executor.py                           # 常驻 C（读本地 DB + 收 state.json）
+
+# —— watchdog：各机守本机心跳 ——
+python3 live/watchdog.py                           # 中国守 monitor/openclaw；btc-ml 守 executor
 ```
 
 ---
@@ -800,3 +805,51 @@ header+demo key。
 - `live/keys_testnet.json` / `live/keys_live.json` 两份（§12.1）。
 - `ENV` 切换即切 key 文件 + base url/header，代码一份，环境两套。
 - 误用保护：OKX 用 demo key 打实盘 base url（或反之）会直接报错，天然防串环境。
+
+---
+
+## 20. 部署架构（实测确定 2026-06-10）
+
+### 20.1 进程分布（双机）
+
+按「需求各回各家」拆到两台机器：
+
+| 进程 | 机器 | 为什么 |
+|------|------|--------|
+| monitor + openclaw | **中国 Windows**（有 UI） | openclaw 靠 Chrome + ChatGPT 登录态，绑死能开浏览器、你能盯着的机器；monitor 与它同机，signal_pending 本地交接 |
+| **executor** | **btc-ml（新加坡 Vultr）** | 数据源本机、独立 IP、低延迟直连交易所；executor 不需要 UI |
+
+btc-ml 实测：新加坡 Vultr，独立 IP `45.76.176.244`，UTC 时区，2 核 3.8G、load≈0.08（极闲），
+到 Binance ~160-200ms / OKX ~140-160ms（完整 HTTPS，连接复用后更低），采集 DB 实时写入。
+低频交易绰绰有余，远胜中国 + 美国代理。**不需要再买服务器。**
+
+### 20.2 数据流与跨机器同步
+
+```
+中国 Windows:
+  monitor（SSH 拉 btc-ml 数据，现状不变）→ signal_pending → openclaw（ChatGPT）→ state.json
+                                                                       │
+                                          （state.json 单向推到 btc-ml，几 KB）
+                                                                       ▼
+btc-ml（新加坡）:
+  executor ← 本地采集 DB（行情）+ 收到的 state.json → 直连币安/OKX 下单（低延迟）
+```
+
+- **跨机器只有一段**：中国 openclaw 产出的 `state.json` 单向推到 btc-ml（新加坡有公网 IP，中国
+  push 最简单；只传几 KB json，图不传——executor 用不到图）。
+- **完整性（取代同机原子 rename）**：跨机器无原子 rename。改为「先传到临时名，传完再落 `.ready`
+  标记」，executor 只认带 ready 的包、绝不读半个；断网时中国侧积压、恢复后重传。
+- state.json 之后由 btc-ml executor **本地**维护（唯一 writer），signal_done 也在 btc-ml 本地。
+
+### 20.3 executor 在 btc-ml 读行情
+
+- btc-ml 上 **sqlite3 CLI 没装，但 python3 sqlite3 模块可用**（fetch_delta 已在用）。executor 走
+  python sqlite3 **直读本地采集 DB**（`/home/evan/repo/ai_crypto_analyst/data/ai_crypto_analyst.db`，
+  表 `ohlcv_bars`），或本地导一份 CSV。本地读，比中国 SSH 拉更实时。
+- ⚠️ 读取口径必须与 monitor/scorer 一致（P2-2：open_time、收线对齐、tz=UTC），否则 primary/activation
+  判断会与中国侧 monitor 产出的 level 错位。
+
+### 20.4 keys 与安全
+
+- 交易 `keys_live.json` / `keys_testnet.json` 放 **btc-ml 本地**（executor 在那跑），gitignored。
+- btc-ml 已有的采集 key 是只读行情；下单是另一套有交易权限的 key，互不影响。
