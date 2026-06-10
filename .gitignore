@@ -19,6 +19,8 @@ screenshots/
 # Research output
 history_data_manager/per_signal_v2.csv
 history_data_manager/aonly_research_summary_20260608.md
+scoring/aplus_*.csv
+live_dashboard.html
 
 # Live runtime state (machine-generated)
 live/state/
