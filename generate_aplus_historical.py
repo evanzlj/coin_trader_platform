@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 
+import pandas as pd
+
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
@@ -30,6 +32,17 @@ SYMBOLS  = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 START    = "2020-01-01"
 END      = "2026-06-09"
 
+# Per-symbol earliest bar_time for package generation.
+# Chart lookback is 90 days (4H) + 14 days (15m), so we need enough history.
+# BTC/ETH/BNB futures data starts 2020-01, safe from 2020-09.
+# SOL futures listed on Binance ~2020-09, meaningful liquidity from 2021-07.
+SYMBOL_START = {
+    "BTC/USDT": pd.Timestamp("2020-09-01", tz="UTC"),
+    "ETH/USDT": pd.Timestamp("2020-09-01", tz="UTC"),
+    "BNB/USDT": pd.Timestamp("2020-09-01", tz="UTC"),
+    "SOL/USDT": pd.Timestamp("2021-07-01", tz="UTC"),
+}
+
 signals = []
 
 
@@ -39,7 +52,7 @@ async def collect():
 
     @gen.on_signal
     async def h(evt):
-        if evt.grade == "A+":
+        if evt.grade == "A+" and evt.bar_time >= SYMBOL_START.get(evt.symbol, pd.Timestamp("2020-01-01", tz="UTC")):
             signals.append(evt)
 
     await feed.start()
