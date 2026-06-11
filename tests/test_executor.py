@@ -364,6 +364,28 @@ class TestFaultInjection(unittest.TestCase):
         self.assertIsNone(r)
         self.assertEqual(pb["status"], "ACTIVATED")   # 没误判 DONE_SL
 
+    def test_tp1_degraded_market_close(self):
+        # TP1 挂单缺失 + 价格到 tp1 → 市价平半仓 + 移 BE（§20 降级闭环）
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        ex["tp1_order_id"] = None                 # 模拟 TP1 挂失败
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        r = manage_open_position(b, "BTC/USDT", pb, ref_price=72300)   # short: ref<=tp1(72400)
+        self.assertEqual(r, "TP1_HIT")
+        self.assertTrue(any(c[0] == "market_close" for c in b.calls))
+
+    def test_tp1_degraded_not_reached_holds(self):
+        # TP1 缺失但价格未到 → 不平，保持 ACTIVATED
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        ex["tp1_order_id"] = None
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        r = manage_open_position(b, "BTC/USDT", pb, ref_price=72600)   # 未到 tp1(72400)
+        self.assertIsNone(r)
+        self.assertEqual(pb["status"], "ACTIVATED")
+
     def test_be_fail_keeps_original_sl(self):
         # TP1 成交后挂 BE 失败 → 保留原 SL（仍有止损），不裸奔
         b = MockBroker(spec=SPEC, fill_price=72700)

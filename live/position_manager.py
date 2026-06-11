@@ -103,8 +103,17 @@ def _try_tp(broker: Broker, symbol: str, ps: PosSide, qty: float, price: float, 
         return None
 
 
-def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]:
-    """推进 ACTIVATED / TP1_HIT。SL/BE 触发用持仓 ground truth；TP 用普通单查询。"""
+def _reached_tp(ref_price: float, target: Optional[float], ps: PosSide) -> bool:
+    """降级判断：ref_price 是否到达 TP（short 在下方，long 在上方）。"""
+    if target is None:
+        return False
+    return ref_price <= target if ps == PosSide.SHORT else ref_price >= target
+
+
+def manage_open_position(broker: Broker, symbol: str, pb: dict,
+                         ref_price: Optional[float] = None) -> Optional[str]:
+    """推进 ACTIVATED / TP1_HIT。SL/BE 触发用持仓 ground truth；TP 用普通单查询。
+    TP 挂单缺失（降级）时用 ref_price 到价市价平（§20）。"""
     ex = pb["exec"]
     ps = PosSide(ex["pos_side"])
     base = ex["client_id_base"]
@@ -112,10 +121,19 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]
     pos = broker.get_position(symbol, ps)
 
     if status == PBStatus.ACTIVATED.value:
-        tp1 = broker.get_order(symbol, ex.get("tp1_order_id")) if ex.get("tp1_order_id") else None
-        if tp1 and tp1.state == OrderState.UNKNOWN:
-            return None                                                # 查单异常，本轮不臆测（§19）
-        if tp1 and tp1.state == OrderState.FILLED:                     # 半仓止盈 → 移 SL 到 BE
+        tp1_done = False
+        if ex.get("tp1_order_id"):
+            tp1 = broker.get_order(symbol, ex["tp1_order_id"])
+            if tp1 and tp1.state == OrderState.UNKNOWN:
+                return None                                            # 查单异常，本轮不臆测（§19）
+            tp1_done = bool(tp1 and tp1.state == OrderState.FILLED)
+        elif ref_price is not None and _reached_tp(ref_price, ex.get("tp1"), ps):
+            try:                                                       # TP1 挂单缺失（降级）→ 到价市价平半仓（§20）
+                broker.market_close(symbol, ps, ex["half_qty"], f"{base}_T1M")
+                tp1_done = True
+            except Exception as e:
+                notify.feishu_alert(f"TP1 degraded market-close failed: {symbol} — {e}")
+        if tp1_done:                                                   # 半仓止盈 → 移 SL 到 BE
             rest = ex["qty"] - ex["half_qty"]
             try:                                                        # 先挂 BE
                 be_oid = broker.place_stop_market(symbol, ps, rest, ex["entry_price"], f"{base}_SBE")
@@ -143,10 +161,19 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]
         return None
 
     if status == PBStatus.TP1_HIT.value:
-        tp2 = broker.get_order(symbol, ex.get("tp2_order_id")) if ex.get("tp2_order_id") else None
-        if tp2 and tp2.state == OrderState.UNKNOWN:
-            return None                                                # 查单异常，本轮不臆测（§19）
-        if tp2 and tp2.state == OrderState.FILLED:                     # TP2 全达成
+        tp2_done = False
+        if ex.get("tp2_order_id"):
+            tp2 = broker.get_order(symbol, ex["tp2_order_id"])
+            if tp2 and tp2.state == OrderState.UNKNOWN:
+                return None                                            # 查单异常，本轮不臆测（§19）
+            tp2_done = bool(tp2 and tp2.state == OrderState.FILLED)
+        elif ref_price is not None and _reached_tp(ref_price, ex.get("tp2"), ps):
+            try:                                                       # TP2 挂单缺失（降级）→ 到价市价平剩余（§20）
+                broker.market_close(symbol, ps, ex.get("qty_remaining") or ex["qty"], f"{base}_T2M")
+                tp2_done = True
+            except Exception as e:
+                notify.feishu_alert(f"TP2 degraded market-close failed: {symbol} — {e}")
+        if tp2_done:                                                   # TP2 全达成
             _cancel(broker, symbol, ex.get("sl_order_id"))
             pb["status"] = PBStatus.DONE_TP2.value
             pb["result"] = "tp2"

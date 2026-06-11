@@ -107,6 +107,16 @@ class ExecutorEngine:
             shutil.rmtree(dest)
         shutil.move(str(pkg_dir), str(dest))
 
+    def _ref_price(self, symbol: str, now: pd.Timestamp) -> Optional[float]:
+        """最新收线 close，用于 TP 降级到价判断（§20）。"""
+        try:
+            df = self.reader.load_recent(symbol, 1, now=now)
+            if df is not None and not df.empty:
+                return float(df.iloc[-1]["close"])
+        except Exception:
+            pass
+        return None
+
     # ── 主步骤 ────────────────────────────────────────────────────────────────
 
     def tick(self, now: Optional[pd.Timestamp] = None) -> None:
@@ -117,6 +127,7 @@ class ExecutorEngine:
         for pkg_dir, state in pkgs:
             symbol = state["symbol"]
             changed = False
+            ref_price = None
             for pb in state["playbooks"]:
                 if pb["status"] in OPEN_STATUSES:
                     if (pb.get("exec") or {}).get("manual_override"):
@@ -124,8 +135,10 @@ class ExecutorEngine:
                     broker = self.brokers.get(pb["exec"]["account"])
                     if broker is None:
                         continue
+                    if ref_price is None:
+                        ref_price = self._ref_price(symbol, now)   # TP 降级到价判断（§20）
                     try:
-                        result = manage_open_position(broker, symbol, pb)
+                        result = manage_open_position(broker, symbol, pb, ref_price=ref_price)
                     except Exception as e:
                         logger.error("manage error %s %s: %s", symbol, pb.get("hypothesis"), e)
                         continue                       # 一个 pb 出错不拖垮整轮
