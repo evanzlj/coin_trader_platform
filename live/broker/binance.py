@@ -137,8 +137,10 @@ class BinanceBroker(Broker):
         """从 RESULT 响应取成交价/量；缺则短延迟后 query 兜底（避开下单后异步落库）。"""
         price = float(resp.get("avgPrice") or 0)
         filled = float(resp.get("executedQty") or 0)
-        if price == 0:
-            time.sleep(0.3)
+        for _ in range(4):                      # 重试拿成交价（下单后异步落库延迟）
+            if price > 0:
+                break
+            time.sleep(0.5)
             try:
                 od = self.client.query_order(symbol=sym, orderId=resp["orderId"])
                 price = float(od.get("avgPrice") or 0)

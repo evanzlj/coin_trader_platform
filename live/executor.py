@@ -180,9 +180,10 @@ class ExecutorEngine:
             self.last_processed[symbol] = latest
         self._save_cursor()
 
-        # (b.5) 定期对账（§21 #5）—— 用内存 pkgs，归档交给 (c)
-        if (self.last_reconcile is None
-                or (now - self.last_reconcile) >= pd.Timedelta(minutes=cfg.RECONCILE_MINUTES)):
+        # (b.5) 定期对账（§21 #5）—— 首轮只记时间不对账（避免对刚开仓误判，交易所持仓异步）
+        if self.last_reconcile is None:
+            self.last_reconcile = now
+        elif (now - self.last_reconcile) >= pd.Timedelta(minutes=cfg.RECONCILE_MINUTES):
             for pkg_dir, state in pkgs:
                 symbol = state["symbol"]
                 rec_changed = False
