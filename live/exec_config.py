@@ -37,6 +37,7 @@ MARGIN_MODE = "isolated"       # 逐仓
 
 # ── 账户池（§9）─────────────────────────────────────────────────────────────
 ACCOUNTS            = 10        # 5 Binance + 5 OKX
+CAPITAL_PER_ACCOUNT = 120       # 每账户本金 USDT
 MAX_PER_ACCOUNT     = 2         # 每账户最多并行 2 笔
 OKX_R_DEV_THRESHOLD = 0.05      # |取整偏差|超此 → 该所账户对该品种不满足约束 C4（§8.3）
 
