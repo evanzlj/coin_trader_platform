@@ -36,11 +36,12 @@ class PBStatus(str, Enum):
     DONE_SL                   = "DONE_SL"
     DONE_BE                   = "DONE_BE"
     DONE_TP2                  = "DONE_TP2"
+    DONE_UNKNOWN              = "DONE_UNKNOWN"      # 无敞口但状态对不上 → 安全终态（§21）
 
 
 TERMINAL = {
     PBStatus.DONE_CANCELLED, PBStatus.DONE_SL,
-    PBStatus.DONE_BE, PBStatus.DONE_TP2,
+    PBStatus.DONE_BE, PBStatus.DONE_TP2, PBStatus.DONE_UNKNOWN,
 }
 
 

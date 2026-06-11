@@ -41,9 +41,10 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
         o = broker.get_order(symbol, oid)
         return o is not None and o.state == OrderState.FILLED
 
-    # 有持仓 → 检查 SL 还在否，缺则补挂（防无保护裸持 §19 P0-3）
+    # 有持仓 → 检查 SL 还在否，缺则补挂；补不上则平退出（防无保护裸持 §19/§21）
     if pos is not None:
-        _ensure_sl(broker, symbol, pb)
+        if _ensure_sl(broker, symbol, pb):
+            return "resolved"                          # 已平退出（status 变了）
         return "ok"
 
     # 无持仓：宕机期间已被平，按订单成交定真实终态
@@ -56,9 +57,12 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
             pb["status"] = PBStatus.DONE_TP2.value
             pb["result"] = "tp2_reconciled"
             return "resolved"
-        # TP1 成交但持仓已空 → BE 段在宕机期发生，无法确定终态 → 人工
+        # TP1 成交但持仓已空 → BE 段在宕机期发生，无敞口 → 安全终态（§21）
         if filled(ex.get("tp1_order_id")):
-            return _flag_manual(pb, "manual_tp1_ambiguous", symbol)
+            pb["status"] = PBStatus.DONE_UNKNOWN.value
+            pb["result"] = "tp1_then_unknown_exit"
+            notify.feishu_alert(f"reconcile: TP1 filled then closed, unknown exit ({symbol})")
+            return "resolved"
 
     elif status == PBStatus.TP1_HIT.value:
         if filled(ex.get("sl_order_id")):          # 此时 sl_order_id 已是 BE 单
@@ -70,17 +74,21 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
             pb["result"] = "tp2_reconciled"
             return "resolved"
 
-    # 持仓没了但订单状态也对不上（强平 / 人工平 / 未知）→ 人工
-    return _flag_manual(pb, "manual_no_position", symbol)
+    # 持仓没了但订单状态也对不上 → 无敞口，安全终态（API-only 账户无人工出口，不挂人工 §21）
+    pb["status"] = PBStatus.DONE_UNKNOWN.value
+    pb["result"] = "no_position_unknown_exit"
+    notify.feishu_alert(f"reconcile: no position, unknown exit ({symbol} {pb.get('hypothesis')})")
+    return "resolved"
 
 
-def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> None:
-    """持仓还在但 SL 没了（被撤/拒/过期）→ 重新挂 SL（不留无保护裸持 §19 P0-3）。"""
+def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
+    """持仓还在但 SL 没了 → 重挂 SL；补不上则市价平退出（不留无保护裸持 §19/§21）。
+    返回 True = 已平退出（status 改为 DONE_UNKNOWN）。"""
     ex = pb["exec"]
     ps = PosSide(ex["pos_side"])
     sl = broker.get_order(symbol, ex.get("sl_order_id"))
     if sl is not None and sl.state == OrderState.UNKNOWN:
-        return                                          # 查单异常，本轮不动
+        return False                                    # 查单异常，本轮不动
     if sl is None or sl.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
         qty = ex.get("qty_remaining") or ex["qty"]
         try:
@@ -89,7 +97,17 @@ def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> None:
             ex["sl_order_id"] = new_sl
             notify.feishu_alert(f"reconcile: SL missing → replaced ({symbol} {ex.get('account')})")
         except Exception as e:
-            notify.feishu_alert(f"reconcile: SL replace FAILED ({symbol}): {e}")
+            # SL 补不上 → 不留无保护仓，市价平退出；平也失败 → recovering（tick 重试）
+            notify.feishu_alert(f"reconcile: SL replace FAILED, closing ({symbol}): {e}")
+            try:
+                broker.market_close(symbol, ps, qty, f"{ex['client_id_base']}_SLFC")
+                pb["status"] = PBStatus.DONE_UNKNOWN.value
+                pb["result"] = "sl_unplaceable_closed"
+                return True
+            except Exception as ce:
+                ex["recovering"] = True
+                notify.feishu_alert(f"reconcile: close also FAILED, recovering ({symbol}): {ce}")
+    return False
 
 
 def _flag_manual(pb: dict, result: str, symbol: str) -> str:

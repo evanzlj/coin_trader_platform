@@ -198,12 +198,41 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
         self.assertEqual(pb["status"], "DONE_SL")
 
-    def test_manual(self):
+    def test_no_position_unknown_exit(self):
+        # 无持仓 + 订单状态对不上 → 无敞口安全终态（不挂人工，§21）
         b = MockBroker(spec=SPEC)
         b.orders["o2"] = OrderStatus("o2", "x", OrderState.NEW, 0, 0)
         pb = self._active()
-        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "manual")
-        self.assertTrue(pb["exec"]["manual_override"])
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertFalse(pb["exec"].get("manual_override"))
+
+    def test_sl_unplaceable_closes(self):
+        # 持仓在 + SL 没了 + 补挂失败 → 市价平退出（DONE_UNKNOWN，不裸持不挂人工 §21）
+        b = MockBroker(spec=SPEC, fail_on={"place_stop_market"})
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        b.orders["o2"] = OrderStatus("o2", "x", OrderState.CANCELED, 0, 0)
+        pb = self._active()
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertTrue(any(c[0] == "market_close" for c in b.calls))
+
+    def test_recover_flat_done_unknown(self):
+        # 裸仓恢复：持仓已无 → DONE_UNKNOWN（自动收口，无人工出口 §21）
+        b = MockBroker(spec=SPEC)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base"}, "status": "ACTIVATED"}
+        self.assertTrue(eng._try_recover(b, "BTC/USDT", pb))
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+
+    def test_recover_retries_close(self):
+        # 裸仓恢复：仍有持仓 → 重试市价平
+        b = MockBroker(spec=SPEC)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base"}, "status": "ACTIVATED"}
+        self.assertFalse(eng._try_recover(b, "BTC/USDT", pb))
+        self.assertTrue(any(c[0] == "market_close" for c in b.calls))
 
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)

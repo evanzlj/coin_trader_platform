@@ -28,7 +28,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from live import exec_config as cfg
-from live.broker.base import Broker
+from live.broker.base import Broker, PosSide
 from live.data_reader import OhlcvReader
 from live.playbook_fsm import (
     Bar, PBStatus, TERMINAL, WaitEvent,
@@ -117,6 +117,23 @@ class ExecutorEngine:
             pass
         return None
 
+    def _try_recover(self, broker: Broker, symbol: str, pb: dict) -> bool:
+        """裸仓恢复：重试市价平；平掉 → DONE_UNKNOWN（API-only 无人工出口，自动收口 §21）。"""
+        ex = pb["exec"]
+        ps = PosSide(ex["pos_side"])
+        pos = broker.get_position(symbol, ps)
+        if pos is None:
+            pb["status"] = PBStatus.DONE_UNKNOWN.value
+            pb["result"] = "recovered_flat"
+            notify.feishu_alert(f"recovered (flat): {symbol} {ex.get('account')}")
+            return True
+        try:
+            broker.market_close(symbol, ps, pos.qty, f"{ex.get('client_id_base', 'rcv')}_RCV")
+            notify.feishu_alert(f"recovering: retried market-close {symbol} {ex.get('account')}")
+        except Exception as e:
+            notify.feishu_alert(f"recovering: market-close STILL failing {symbol}: {e}")
+        return False
+
     # ── 主步骤 ────────────────────────────────────────────────────────────────
 
     def tick(self, now: Optional[pd.Timestamp] = None) -> None:
@@ -130,11 +147,16 @@ class ExecutorEngine:
             ref_price = None
             for pb in state["playbooks"]:
                 if pb["status"] in OPEN_STATUSES:
-                    if (pb.get("exec") or {}).get("manual_override"):
-                        continue                       # 人工接管中，executor 让位（§10.3）
-                    broker = self.brokers.get(pb["exec"]["account"])
+                    ex0 = pb.get("exec") or {}
+                    broker = self.brokers.get(ex0.get("account"))
                     if broker is None:
                         continue
+                    if ex0.get("recovering"):          # 裸仓恢复中：每轮重试平仓（§21）
+                        if self._try_recover(broker, symbol, pb):
+                            changed = True
+                        continue
+                    if ex0.get("manual_override"):
+                        continue                       # 仅配置类（无 broker 等）仍让位
                     if ref_price is None:
                         ref_price = self._ref_price(symbol, now)   # TP 降级到价判断（§20）
                     try:
@@ -250,15 +272,15 @@ class ExecutorEngine:
                              account=account, exchange=ex["exchange"], entry=ex["entry_price"],
                              qty=ex["qty"], actual_r=ex["actual_r_usdt"])
         except NakedPositionError as e:
-            # 有仓、无 SL、平不掉 → 占 slot + 人工接管 + 强告警（绝不弃管）
+            # 有仓、无 SL、平不掉 → recovering（tick 每轮重试平仓，不永久挂人工 §21）
             pb["exec"] = {"account": account, "exchange": broker.exchange,
                           "pos_side": pos_side_of(pb["direction"]).value,
-                          "margin": margin, "manual_override": True, "client_id_base": base}
+                          "margin": margin, "recovering": True, "client_id_base": base}
             pb["status"] = PBStatus.ACTIVATED.value
-            pb["result"] = f"NAKED:{e}"
-            logger.error("NAKED POSITION %s %s acc=%s: %s", symbol, pb.get("hypothesis"), account, e)
+            pb["result"] = f"NAKED_recovering:{e}"
+            logger.error("NAKED POSITION recovering %s %s acc=%s: %s", symbol, pb.get("hypothesis"), account, e)
             notify.trade_log("ERROR_NAKED_POSITION", symbol=symbol, account=account, error=str(e))
-            notify.feishu_alert(f"NAKED POSITION {symbol} {account}: {e}")
+            notify.feishu_alert(f"NAKED POSITION recovering {symbol} {account}: {e}")
         except Exception as e:
             pb["status"] = PBStatus.DONE_CANCELLED.value
             pb["result"] = f"entry_failed:{e}"
