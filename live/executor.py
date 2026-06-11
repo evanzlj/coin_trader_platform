@@ -37,6 +37,7 @@ from live.playbook_fsm import (
 from live.position_manager import open_position, manage_open_position
 from live.slot_pool import Account, build_accounts, build_occupancy, allocate
 from live.single_instance import SingleInstance, AlreadyRunning
+from live import reconcile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +70,7 @@ class ExecutorEngine:
         self.accounts = accounts
         self.c4_ok = c4_ok
         self.last_processed: dict[str, pd.Timestamp] = self._load_cursor()
+        self.last_reconcile: Optional[pd.Timestamp] = None
 
     # ── state.json I/O ────────────────────────────────────────────────────────
 
@@ -131,6 +133,8 @@ class ExecutorEngine:
             changed = False
             for pb in state["playbooks"]:
                 if pb["status"] in OPEN_STATUSES:
+                    if (pb.get("exec") or {}).get("manual_override"):
+                        continue                       # 人工接管中，executor 让位（§10.3）
                     broker = self.brokers.get(pb["exec"]["account"])
                     if broker is None:
                         continue
@@ -169,6 +173,21 @@ class ExecutorEngine:
                     self.save_state(pkg_dir, state)
             self.last_processed[symbol] = latest
         self._save_cursor()
+
+        # (b.5) 定期对账（§21 #5）—— 用内存 pkgs，归档交给 (c)
+        if (self.last_reconcile is None
+                or (now - self.last_reconcile) >= pd.Timedelta(minutes=cfg.RECONCILE_MINUTES)):
+            for pkg_dir, state in pkgs:
+                symbol = state["symbol"]
+                rec_changed = False
+                for pb in state["playbooks"]:
+                    if pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):
+                        broker = self.brokers.get(pb["exec"]["account"])
+                        if broker and reconcile.reconcile_position(broker, symbol, pb) != "ok":
+                            rec_changed = True
+                if rec_changed:
+                    self.save_state(pkg_dir, state)
+            self.last_reconcile = now
 
         # (c) 归档终态 + 心跳
         for pkg_dir, state in pkgs:
@@ -240,6 +259,7 @@ def main() -> None:
         brokers = build_brokers()
         reader = OhlcvReader()
         engine = ExecutorEngine(reader, brokers, accounts)
+        reconcile.startup_reconcile(engine)
         logger.info("executor started (ENV=%s, %d accounts)", cfg.ENV, len(accounts))
         while True:
             try:
