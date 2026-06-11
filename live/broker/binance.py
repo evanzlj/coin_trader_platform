@@ -8,6 +8,7 @@ hedge 模式（§8.4）：positionSide=LONG/SHORT + 反向 side，**不传 reduc
 """
 from __future__ import annotations
 
+import decimal
 import time
 from typing import Optional
 
@@ -40,6 +41,11 @@ _ALGO_STATE = {
 
 def _sym(symbol: str) -> str:
     return symbol.replace("/", "")
+
+
+def _dec(step: float) -> int:
+    """step（如 0.0001）对应的小数位数。"""
+    return max(0, -decimal.Decimal(str(step)).as_tuple().exponent)
 
 
 class BinanceBroker(Broker):
@@ -141,11 +147,17 @@ class BinanceBroker(Broker):
                 pass
         return price, (filled or qty)
 
+    def _q(self, symbol: str, qty: float) -> str:
+        return f"{qty:.{_dec(self.get_symbol_spec(symbol).qty_step)}f}"
+
+    def _p(self, symbol: str, price: float) -> str:
+        return f"{price:.{_dec(self.get_symbol_spec(symbol).price_tick)}f}"
+
     def market_open(self, symbol: str, pos_side: PosSide, qty: float, client_id: str) -> Fill:
         sym = _sym(symbol)
         side = open_side(pos_side)
         resp = self.client.new_order(
-            symbol=sym, side=side.value, type="MARKET", quantity=qty,
+            symbol=sym, side=side.value, type="MARKET", quantity=self._q(symbol, qty),
             positionSide=pos_side.value, newClientOrderId=client_id,
             newOrderRespType="RESULT",
         )
@@ -156,7 +168,7 @@ class BinanceBroker(Broker):
         sym = _sym(symbol)
         side = close_side(pos_side)
         resp = self.client.new_order(
-            symbol=sym, side=side.value, type="MARKET", quantity=qty,
+            symbol=sym, side=side.value, type="MARKET", quantity=self._q(symbol, qty),
             positionSide=pos_side.value, newClientOrderId=client_id,
             newOrderRespType="RESULT",
         )
@@ -167,7 +179,7 @@ class BinanceBroker(Broker):
                            price: float, client_id: str) -> str:
         resp = self.client.new_order(
             symbol=_sym(symbol), side=close_side(pos_side).value, type="LIMIT",
-            quantity=qty, price=price, timeInForce="GTC",
+            quantity=self._q(symbol, qty), price=self._p(symbol, price), timeInForce="GTC",
             positionSide=pos_side.value, newClientOrderId=client_id,
         )
         return str(resp["orderId"])
@@ -178,7 +190,8 @@ class BinanceBroker(Broker):
         resp = self.client.sign_request("POST", "/fapi/v1/algoOrder", {
             "algoType": "CONDITIONAL", "symbol": _sym(symbol),
             "side": close_side(pos_side).value, "positionSide": pos_side.value,
-            "type": "STOP_MARKET", "quantity": qty, "triggerPrice": stop_price,
+            "type": "STOP_MARKET", "quantity": self._q(symbol, qty),
+            "triggerPrice": self._p(symbol, stop_price),
             "workingType": "CONTRACT_PRICE", "clientAlgoId": client_id,
         })
         return "algo:" + str(resp["algoId"])
