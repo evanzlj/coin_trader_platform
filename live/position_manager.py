@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from live.broker.base import Broker, PosSide, OrderState
+from live.broker.base import Broker, PosSide, OrderState, Fill, open_side
 from live.playbook_fsm import PBStatus, compute_sizing, compute_sl_price
 from live import notify
 
@@ -38,11 +38,23 @@ def open_position(broker: Broker, symbol: str, pb: dict, entry_estimate: float,
     qty = broker.round_qty(symbol, sizing.qty)
 
     broker.set_leverage(symbol, ps, sizing.leverage)
-    fill = broker.market_open(symbol, ps, qty, f"{client_id_base}_E")
+    try:
+        fill = broker.market_open(symbol, ps, qty, f"{client_id_base}_E")
+    except Exception as e:
+        # 市价单可能超时但已成交 → 查持仓/同 clientOrderId 接管（幂等，防孤儿仓 §18）
+        time.sleep(1.0)
+        pos = broker.get_position(symbol, ps)
+        if pos is not None and pos.qty > 0:
+            od = broker.get_order(symbol, client_id=f"{client_id_base}_E")
+            fill = Fill(od.order_id if od else "RECOVERED", f"{client_id_base}_E",
+                        symbol, ps, open_side(ps), pos.entry_price, pos.qty)
+            notify.feishu_alert(f"market_open timeout but position found, recovered: {symbol} {account}")
+        else:
+            raise RuntimeError(f"market_open failed, no position: {e}") from e
     entry = fill.price
     qty = fill.qty                                   # 以实际成交为准（含部分成交）
     if qty <= 0:
-        raise SLPlacementError("market_open filled 0 qty")
+        raise RuntimeError("market_open filled 0 qty")
 
     sl_price = broker.round_price(symbol, compute_sl_price(symbol, direction, pb["invalidation"]["level"]))
     # ── 不允许裸仓：SL 挂不上 → 立即平退出 ──

@@ -325,6 +325,21 @@ class TestFaultInjection(unittest.TestCase):
         b = MockBroker(spec=SPEC, fail_on={"cancel_order"})
         _cancel(b, "BTC/USDT", "someoid")   # 重试后告警，不抛
 
+    def test_market_open_timeout_recovered(self):
+        # 市价单超时但已成交 → 查持仓接管，不抛、不孤儿，SL 挂上
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"market_open_timeout"})
+        ex = open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+        self.assertEqual(ex["entry_price"], 72700)
+        self.assertIsNotNone(b.get_position("BTC/USDT", PosSide.SHORT))
+        self.assertIsNotNone(ex["sl_order_id"])
+
+    def test_market_open_fail_no_position_raises(self):
+        # 市价单失败且无持仓 → 抛（entry_failed），无裸仓
+        b = MockBroker(spec=SPEC, fail_on={"market_open"})
+        with self.assertRaises(Exception):
+            open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+        self.assertIsNone(b.get_position("BTC/USDT", PosSide.SHORT))
+
     def test_be_fail_keeps_original_sl(self):
         # TP1 成交后挂 BE 失败 → 保留原 SL（仍有止损），不裸奔
         b = MockBroker(spec=SPEC, fill_price=72700)

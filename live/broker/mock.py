@@ -63,10 +63,15 @@ class MockBroker(Broker):
 
     # ── 下单 ──
     def market_open(self, symbol, pos_side, qty, client_id) -> Fill:
+        if "market_open" in self.fail_on:
+            raise RuntimeError("injected market_open fail")
         oid = self._next_oid()
         price = self._fill_price
         self.positions[(symbol, pos_side)] = Position(symbol, pos_side, qty, price)
+        self.orders[oid] = OrderStatus(oid, client_id, OrderState.FILLED, qty, price)
         self.calls.append(("market_open", symbol, pos_side, qty, client_id))
+        if "market_open_timeout" in self.fail_on:      # 模拟超时但已成交
+            raise RuntimeError("injected market_open timeout (but filled)")
         return Fill(oid, client_id, symbol, pos_side, open_side(pos_side), price, qty)
 
     def market_close(self, symbol, pos_side, qty, client_id) -> Fill:
