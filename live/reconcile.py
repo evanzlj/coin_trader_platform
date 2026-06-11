@@ -31,6 +31,9 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
     返回 'ok'（一致继续）| 'resolved'（已被平，定终态）| 'manual'（对不上，挂起人工）。
     原地更新 pb（status / exec.manual_override）。"""
     ex = pb.get("exec") or {}
+    if ex.get("recovering"):
+        # 裸仓恢复中：exec 信息不完整（无 qty/sl_price），交给 tick 的 _try_recover 用持仓量平，不走普通对账（§21）
+        return "ok"
     ps = PosSide(ex["pos_side"])
     pos = broker.get_position(symbol, ps)
     status = pb["status"]

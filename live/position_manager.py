@@ -122,13 +122,17 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
 
     if status == PBStatus.ACTIVATED.value:
         tp1_done = False
+        tp1_dead = ex.get("tp1_order_id") is None                     # 无挂单 → 需降级
         if ex.get("tp1_order_id"):
             tp1 = broker.get_order(symbol, ex["tp1_order_id"])
             if tp1 and tp1.state == OrderState.UNKNOWN:
                 return None                                            # 查单异常，本轮不臆测（§19）
-            tp1_done = bool(tp1 and tp1.state == OrderState.FILLED)
-        elif ref_price is not None and _reached_tp(ref_price, ex.get("tp1"), ps):
-            try:                                                       # TP1 挂单缺失（降级）→ 到价市价平半仓（§20）
+            if tp1 and tp1.state == OrderState.FILLED:
+                tp1_done = True
+            elif tp1 is None or tp1.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
+                tp1_dead = True                                        # 死单（撤/过期/拒）→ 降级（§20）
+        if not tp1_done and tp1_dead and ref_price is not None and _reached_tp(ref_price, ex.get("tp1"), ps):
+            try:                                                       # TP1 缺失/失效（降级）→ 到价市价平半仓
                 broker.market_close(symbol, ps, ex["half_qty"], f"{base}_T1M")
                 tp1_done = True
             except Exception as e:
@@ -162,13 +166,17 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
 
     if status == PBStatus.TP1_HIT.value:
         tp2_done = False
+        tp2_dead = ex.get("tp2_order_id") is None
         if ex.get("tp2_order_id"):
             tp2 = broker.get_order(symbol, ex["tp2_order_id"])
             if tp2 and tp2.state == OrderState.UNKNOWN:
                 return None                                            # 查单异常，本轮不臆测（§19）
-            tp2_done = bool(tp2 and tp2.state == OrderState.FILLED)
-        elif ref_price is not None and _reached_tp(ref_price, ex.get("tp2"), ps):
-            try:                                                       # TP2 挂单缺失（降级）→ 到价市价平剩余（§20）
+            if tp2 and tp2.state == OrderState.FILLED:
+                tp2_done = True
+            elif tp2 is None or tp2.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
+                tp2_dead = True                                        # 死单（撤/过期/拒）→ 降级（§20）
+        if not tp2_done and tp2_dead and ref_price is not None and _reached_tp(ref_price, ex.get("tp2"), ps):
+            try:                                                       # TP2 缺失/失效（降级）→ 到价市价平剩余
                 broker.market_close(symbol, ps, ex.get("qty_remaining") or ex["qty"], f"{base}_T2M")
                 tp2_done = True
             except Exception as e:

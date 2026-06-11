@@ -234,6 +234,14 @@ class TestReconcile(unittest.TestCase):
         self.assertFalse(eng._try_recover(b, "BTC/USDT", pb))
         self.assertTrue(any(c[0] == "market_close" for c in b.calls))
 
+    def test_recovering_reconcile_no_crash(self):
+        # recovering pb（exec 无 qty/sl_price）走 reconcile 不崩，交给 tick 处理（§21 边界）
+        b = MockBroker(spec=SPEC)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        pb = {"hypothesis": "X", "status": "ACTIVATED",
+              "exec": {"account": "a", "pos_side": "SHORT", "recovering": True, "client_id_base": "base"}}
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")   # 不 KeyError
+
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
@@ -414,6 +422,17 @@ class TestFaultInjection(unittest.TestCase):
         r = manage_open_position(b, "BTC/USDT", pb, ref_price=72600)   # 未到 tp1(72400)
         self.assertIsNone(r)
         self.assertEqual(pb["status"], "ACTIVATED")
+
+    def test_tp1_canceled_degraded_close(self):
+        # TP1 订单被取消（非 None）+ 价格到 tp1 → 仍走降级市价平（§20 死单边界）
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        b.cancel_order("BTC/USDT", order_id=ex["tp1_order_id"])        # TP1 → CANCELED
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        r = manage_open_position(b, "BTC/USDT", pb, ref_price=72300)
+        self.assertEqual(r, "TP1_HIT")
+        self.assertTrue(any(c[0] == "market_close" for c in b.calls))
 
     def test_be_fail_keeps_original_sl(self):
         # TP1 成交后挂 BE 失败 → 保留原 SL（仍有止损），不裸奔
