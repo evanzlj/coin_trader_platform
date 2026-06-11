@@ -8,6 +8,7 @@ hedge 模式（§8.4）：positionSide=LONG/SHORT + 反向 side，**不传 reduc
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from binance.um_futures import UMFutures
@@ -122,18 +123,30 @@ class BinanceBroker(Broker):
 
     # ── 下单 ──────────────────────────────────────────────────────────────────
 
+    def _fill_px(self, sym: str, resp: dict, qty: float) -> tuple[float, float]:
+        """从 RESULT 响应取成交价/量；缺则短延迟后 query 兜底（避开下单后异步落库）。"""
+        price = float(resp.get("avgPrice") or 0)
+        filled = float(resp.get("executedQty") or 0)
+        if price == 0:
+            time.sleep(0.3)
+            try:
+                od = self.client.query_order(symbol=sym, orderId=resp["orderId"])
+                price = float(od.get("avgPrice") or 0)
+                filled = float(od.get("executedQty") or filled)
+            except Exception:
+                pass
+        return price, (filled or qty)
+
     def market_open(self, symbol: str, pos_side: PosSide, qty: float, client_id: str) -> Fill:
         sym = _sym(symbol)
         side = open_side(pos_side)
         resp = self.client.new_order(
             symbol=sym, side=side.value, type="MARKET", quantity=qty,
             positionSide=pos_side.value, newClientOrderId=client_id,
+            newOrderRespType="RESULT",
         )
-        oid = resp["orderId"]
-        od = self.client.query_order(symbol=sym, orderId=oid)   # 拿实际成交价/量
-        return Fill(str(oid), client_id, symbol, pos_side, side,
-                    float(od.get("avgPrice") or 0),
-                    float(od.get("executedQty") or qty), raw=od)
+        price, filled = self._fill_px(sym, resp, qty)
+        return Fill(str(resp["orderId"]), client_id, symbol, pos_side, side, price, filled, raw=resp)
 
     def market_close(self, symbol: str, pos_side: PosSide, qty: float, client_id: str) -> Fill:
         sym = _sym(symbol)
@@ -141,12 +154,10 @@ class BinanceBroker(Broker):
         resp = self.client.new_order(
             symbol=sym, side=side.value, type="MARKET", quantity=qty,
             positionSide=pos_side.value, newClientOrderId=client_id,
+            newOrderRespType="RESULT",
         )
-        oid = resp["orderId"]
-        od = self.client.query_order(symbol=sym, orderId=oid)
-        return Fill(str(oid), client_id, symbol, pos_side, side,
-                    float(od.get("avgPrice") or 0),
-                    float(od.get("executedQty") or qty), raw=od)
+        price, filled = self._fill_px(sym, resp, qty)
+        return Fill(str(resp["orderId"]), client_id, symbol, pos_side, side, price, filled, raw=resp)
 
     def place_reduce_limit(self, symbol: str, pos_side: PosSide, qty: float,
                            price: float, client_id: str) -> str:
