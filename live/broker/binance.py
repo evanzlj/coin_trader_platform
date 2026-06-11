@@ -101,13 +101,17 @@ class BinanceBroker(Broker):
         sym = _sym(symbol)
         try:
             if order_id and order_id.startswith("algo:"):
-                od = self.client.sign_request("GET", "/fapi/v1/algoOrder",
-                                              {"symbol": sym, "algoId": int(order_id.split(":", 1)[1])})
-                st = od.get("algoStatus") or od.get("status")
-                return OrderStatus(order_id, od.get("clientAlgoId", ""),
-                                   _ALGO_STATE.get(st, OrderState.NEW),
-                                   float(od.get("executedQty") or 0),
-                                   float(od.get("avgPrice") or 0), raw=od)
+                # algo 单查活跃列表（单查 /fapi/v1/algoOrder 在 testnet 返回 -2013）。
+                # 不在活跃列表 = 已触发/撤销 → None；触发由持仓判断（manage/reconcile）。
+                aid = order_id.split(":", 1)[1]
+                lst = self.client.sign_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym})
+                rows = lst if isinstance(lst, list) else lst.get("orders", [])
+                for od in rows:
+                    if str(od.get("algoId")) == aid:
+                        return OrderStatus(order_id, od.get("clientAlgoId", ""),
+                                           _ALGO_STATE.get(od.get("algoStatus"), OrderState.NEW),
+                                           float(od.get("actualQty") or 0), 0.0, raw=od)
+                return None
             if order_id is not None:
                 oid = order_id.split(":", 1)[1] if order_id.startswith("ord:") else order_id
                 od = self.client.query_order(symbol=sym, orderId=int(oid))

@@ -62,21 +62,19 @@ def open_position(broker: Broker, symbol: str, pb: dict, entry_estimate: float,
 
 
 def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]:
-    """查订单状态推进 ACTIVATED / TP1_HIT。返回新 status（变化时），否则 None。"""
+    """推进 ACTIVATED / TP1_HIT。返回新 status（变化时），否则 None。
+
+    SL/BE 触发用**持仓**判断（ground truth，跨两家通用，且绕开交易所 algo 历史查询差异）：
+    持仓没了而 TP 未成交 = 被止损/保本平掉。TP 用普通限价单查询（可靠）。
+    """
     ex = pb["exec"]
     ps = PosSide(ex["pos_side"])
     base = ex["client_id_base"]
     status = pb["status"]
+    pos = broker.get_position(symbol, ps)
 
     if status == PBStatus.ACTIVATED.value:
-        sl = broker.get_order(symbol, ex.get("sl_order_id"))
         tp1 = broker.get_order(symbol, ex.get("tp1_order_id"))
-        if sl and sl.state == OrderState.FILLED:                       # 全仓止损
-            _cancel(broker, symbol, ex.get("tp1_order_id"))
-            _cancel(broker, symbol, ex.get("tp2_order_id"))
-            pb["status"] = PBStatus.DONE_SL.value
-            pb["result"] = "sl"
-            return pb["status"]
         if tp1 and tp1.state == OrderState.FILLED:                     # 半仓止盈 → 移 SL 到 BE
             _cancel(broker, symbol, ex.get("sl_order_id"))
             rest = ex["qty"] - ex["half_qty"]
@@ -87,17 +85,22 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]
             ex["tp1_filled_at"] = True
             pb["status"] = PBStatus.TP1_HIT.value
             return pb["status"]
+        if pos is None:                                                # 全仓没了且 TP1 未成交 = SL 触发
+            _cancel(broker, symbol, ex.get("tp1_order_id"))
+            _cancel(broker, symbol, ex.get("tp2_order_id"))
+            pb["status"] = PBStatus.DONE_SL.value
+            pb["result"] = "sl"
+            return pb["status"]
         return None
 
     if status == PBStatus.TP1_HIT.value:
         tp2 = broker.get_order(symbol, ex.get("tp2_order_id")) if ex.get("tp2_order_id") else None
-        be = broker.get_order(symbol, ex.get("sl_order_id"))
         if tp2 and tp2.state == OrderState.FILLED:                     # TP2 全达成
             _cancel(broker, symbol, ex.get("sl_order_id"))
             pb["status"] = PBStatus.DONE_TP2.value
             pb["result"] = "tp2"
             return pb["status"]
-        if be and be.state == OrderState.FILLED:                       # 回到 BE 保本出
+        if pos is None:                                                # 剩余半仓没了且 TP2 未成交 = BE 触发
             _cancel(broker, symbol, ex.get("tp2_order_id"))
             pb["status"] = PBStatus.DONE_BE.value
             pb["result"] = "be"
