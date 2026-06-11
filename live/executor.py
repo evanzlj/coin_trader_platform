@@ -38,6 +38,7 @@ from live.position_manager import open_position, manage_open_position
 from live.slot_pool import Account, build_accounts, build_occupancy, allocate
 from live.single_instance import SingleInstance, AlreadyRunning
 from live import reconcile
+from live import notify
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,8 +139,13 @@ class ExecutorEngine:
                     broker = self.brokers.get(pb["exec"]["account"])
                     if broker is None:
                         continue
-                    if manage_open_position(broker, symbol, pb):
+                    result = manage_open_position(broker, symbol, pb)
+                    if result:
                         changed = True
+                        notify.trade_log(result, symbol=symbol,
+                                         hypothesis=pb.get("hypothesis"),
+                                         account=pb["exec"]["account"],
+                                         actual_r=pb["exec"].get("actual_r_usdt"))
             if changed:
                 self.save_state(pkg_dir, state)
 
@@ -213,7 +219,8 @@ class ExecutorEngine:
         if account is None:
             pb["status"] = PBStatus.DONE_CANCELLED.value
             pb["result"] = "skipped_no_slot"
-            logger.warning("no slot for %s %s", symbol, pb.get("hypothesis"))
+            notify.trade_log("SKIPPED_NO_SLOT", symbol=symbol, hypothesis=pb.get("hypothesis"))
+            notify.feishu_alert(f"no slot for {symbol} {pb.get('hypothesis')}")
             return
 
         broker = self.brokers[account]
@@ -225,10 +232,15 @@ class ExecutorEngine:
             logger.info("ENTERED %s %s @ %s acc=%s qty=%s 1R=%.2f",
                         symbol, pb.get("hypothesis"), ex["entry_price"], account,
                         ex["qty"], ex["actual_r_usdt"])
+            notify.trade_log("ACTIVATED", symbol=symbol, hypothesis=pb.get("hypothesis"),
+                             account=account, exchange=ex["exchange"], entry=ex["entry_price"],
+                             qty=ex["qty"], actual_r=ex["actual_r_usdt"])
         except Exception as e:
             pb["status"] = PBStatus.DONE_CANCELLED.value
             pb["result"] = f"entry_failed:{e}"
             logger.error("ENTRY FAILED %s %s: %s", symbol, pb.get("hypothesis"), e)
+            notify.trade_log("ERROR_ENTRY_FAILED", symbol=symbol, hypothesis=pb.get("hypothesis"), error=str(e))
+            notify.feishu_alert(f"ENTRY FAILED {symbol} {pb.get('hypothesis')}: {e}")
 
     def _heartbeat(self, now: pd.Timestamp) -> None:
         cfg.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)

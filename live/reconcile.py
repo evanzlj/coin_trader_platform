@@ -77,6 +77,8 @@ def _flag_manual(pb: dict, result: str, symbol: str) -> str:
     pb["result"] = result
     logger.error("RECONCILE manual needed: %s %s — %s",
                  symbol, pb.get("hypothesis"), result)
+    from live import notify
+    notify.feishu_alert(f"RECONCILE manual: {symbol} {pb.get('hypothesis')} — {result}")
     return "manual"
 
 
