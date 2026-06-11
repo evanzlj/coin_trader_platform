@@ -237,6 +237,7 @@ class TestEndToEnd(unittest.TestCase):
         pkg = cfg.SIGNAL_ACTIVE / "btcusdt_A_test"
         pkg.mkdir()
         state = {"signal_dir": "btcusdt_A_test", "symbol": "BTC/USDT", "overall_status": "WATCHING",
+                 "bar_time": "2026-06-11T00:00:00+00:00",
                  "playbooks": [{**short_pb(), "hypothesis": "DOWNSIDE"}]}
         (pkg / "state.json").write_text(json.dumps(state), encoding="utf-8")
         (pkg / ".ready").touch()
@@ -267,6 +268,19 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(self.pkg.exists())                       # 已归档
         done = json.loads((cfg.SIGNAL_DONE / "btcusdt_A_test" / "state.json").read_text())
         self.assertEqual(done["playbooks"][0]["status"], "DONE_TP2")
+
+    def test_stale_signal_discarded_no_order(self):
+        # 信号 T0(00:00) 距 now(10:00) 600min > 240 → 丢弃，绝不下单（防错时开仓 §17）
+        keys = {"binance": [{"label": f"binance_{i}", "api_key": "x", "secret": "x"} for i in range(5)],
+                "okx": [{"label": f"okx_{i}", "api_key": "x", "secret": "x", "passphrase": "x"} for i in range(5)]}
+        accts = build_accounts(keys)
+        brokers = {a.label: MockBroker(a.label, a.exchange, spec=SPEC, fill_price=72700) for a in accts}
+        eng = ExecutorEngine(OhlcvReader(self.dbp), brokers, accts)
+        eng.tick(now=pd.Timestamp("2026-06-11T10:00:00+00:00"))
+        done = json.loads((cfg.SIGNAL_DONE / "btcusdt_A_test" / "state.json").read_text())
+        self.assertEqual(done["playbooks"][0]["status"], "DONE_CANCELLED")
+        self.assertEqual(done["playbooks"][0]["result"], "stale_discard")
+        self.assertFalse(any(c[0] == "market_open" for b in brokers.values() for c in b.calls))
 
 
 class TestFaultInjection(unittest.TestCase):

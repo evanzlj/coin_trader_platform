@@ -72,7 +72,6 @@ class ExecutorEngine:
         self.brokers = brokers              # account_label -> Broker
         self.accounts = accounts
         self.c4_ok = c4_ok
-        self.last_processed: dict[str, pd.Timestamp] = self._load_cursor()
         self.last_reconcile: Optional[pd.Timestamp] = None
 
     # ── state.json I/O ────────────────────────────────────────────────────────
@@ -108,22 +107,6 @@ class ExecutorEngine:
             shutil.rmtree(dest)
         shutil.move(str(pkg_dir), str(dest))
 
-    def _load_cursor(self) -> dict:
-        if cfg.CURSOR_FILE.exists():
-            try:
-                raw = json.loads(cfg.CURSOR_FILE.read_text(encoding="utf-8"))
-                return {s: pd.Timestamp(t) for s, t in raw.items()}
-            except Exception:
-                pass
-        return {}
-
-    def _save_cursor(self) -> None:
-        cfg.CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cfg.CURSOR_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({s: t.isoformat() for s, t in self.last_processed.items()}),
-                       encoding="utf-8")
-        os.replace(tmp, cfg.CURSOR_FILE)
-
     # ── 主步骤 ────────────────────────────────────────────────────────────────
 
     def tick(self, now: Optional[pd.Timestamp] = None) -> None:
@@ -152,35 +135,46 @@ class ExecutorEngine:
                 self.save_state(pkg_dir, state)
 
         # (b) 新收线 bar → WAITING 推进 + 开仓
-        symbols = {st["symbol"] for _, st in pkgs}
-        for symbol in symbols:
+        # 每个信号在 state["last_bar"] 记自己的游标，从 T0(bar_time) 开始**增量喂、只喂 T0 之后**的 bar，
+        # 永不回溯历史（防 cursor 丢失 → 旧 bar 错时开仓）。首次见到的信号若 T0 过旧（同步积压）→ 丢弃。
+        for pkg_dir, state in pkgs:
+            if not any(pb["status"] in WAITING_STATUSES for pb in state["playbooks"]):
+                continue
+            symbol = state["symbol"]
+            t0 = pd.Timestamp(state["bar_time"])
+            last_bar_raw = state.get("last_bar")
+
+            if last_bar_raw is None:                         # 首次见此信号
+                age_min = (now - t0).total_seconds() / 60
+                if age_min > cfg.SIGNAL_MAX_AGE_MINUTES:     # T0 过旧 → 丢弃，绝不错时开仓
+                    for pb in state["playbooks"]:
+                        if pb["status"] in WAITING_STATUSES:
+                            pb["status"] = PBStatus.DONE_CANCELLED.value
+                            pb["result"] = "stale_discard"
+                    self.save_state(pkg_dir, state)
+                    logger.warning("stale signal discarded (%.0f min old): %s", age_min, pkg_dir.name)
+                    continue
+                last_bar = t0
+            else:
+                last_bar = pd.Timestamp(last_bar_raw)
+
             if self.reader.is_stale(symbol, now=now):
                 logger.warning("data stale for %s — skip new entries", symbol)
                 continue
-            last = self.last_processed.get(symbol)
             latest = self.reader.latest_closed_bar_time(symbol, now=now)
-            if latest is None or (last is not None and latest <= last):
+            if latest is None or latest <= last_bar:
                 continue
-            bars_df = self.reader.load_closed_since(symbol, last, now=now)
             bars = [Bar(r.open_time, r.open, r.high, r.low, r.close)
-                    for r in bars_df.itertuples(index=False)]
-            for pkg_dir, state in pkgs:
-                if state["symbol"] != symbol:
-                    continue
-                changed = False
-                for pb in state["playbooks"]:
-                    for bar in bars:
-                        if pb["status"] not in WAITING_STATUSES:
-                            break
-                        ev = step_waiting(pb, bar)
-                        if ev != WaitEvent.NONE:
-                            changed = True
-                        if ev == WaitEvent.ACTIVATE:
-                            self._enter(state, symbol, pb, bar, [s for _, s in pkgs])
-                if changed:
-                    self.save_state(pkg_dir, state)
-            self.last_processed[symbol] = latest
-        self._save_cursor()
+                    for r in self.reader.load_closed_since(symbol, last_bar, now=now).itertuples(index=False)
+                    if r.open_time > t0]                     # 只喂信号 T0 之后的 bar
+            for pb in state["playbooks"]:
+                for bar in bars:
+                    if pb["status"] not in WAITING_STATUSES:
+                        break
+                    if step_waiting(pb, bar) == WaitEvent.ACTIVATE:
+                        self._enter(state, symbol, pb, bar, [s for _, s in pkgs])
+            state["last_bar"] = latest.isoformat()
+            self.save_state(pkg_dir, state)
 
         # (b.5) 定期对账（§21 #5）—— 首轮只记时间不对账（避免对刚开仓误判，交易所持仓异步）
         if self.last_reconcile is None:
