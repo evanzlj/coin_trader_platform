@@ -103,6 +103,61 @@ def _try_tp(broker: Broker, symbol: str, ps: PosSide, qty: float, price: float, 
         return None
 
 
+def adopt_position(broker: Broker, symbol: str, intent: dict, qty: float, entry: float) -> dict:
+    """接管 OPENING 崩溃后已存在的仓：补 SL/TP（确定性 client id，先查再挂），返回完整 exec（§18）。"""
+    direction = intent["direction"]
+    ps = pos_side_of(direction)
+    base = intent["client_id_base"]
+    sl_price = broker.round_price(symbol, compute_sl_price(symbol, direction, intent["invalidation"]["level"]))
+    half = broker.round_qty(symbol, qty / 2)
+    rest = broker.round_qty(symbol, qty - half)
+
+    sl_oid = _ensure_protective(broker, symbol, ps, qty, sl_price, f"{base}_S", "stop")
+    tp1_oid = tp2_oid = None
+    tp1 = intent.get("tp1_level")
+    if tp1:
+        tp1 = broker.round_price(symbol, tp1)
+        tp1_oid = _ensure_protective(broker, symbol, ps, half, tp1, f"{base}_T1", "limit")
+    tp2 = intent.get("tp2_level")
+    if tp2:
+        tp2 = broker.round_price(symbol, tp2)
+        tp2_oid = _ensure_protective(broker, symbol, ps, rest, tp2, f"{base}_T2", "limit")
+
+    actual_r = qty * abs(entry - sl_price)
+    return {
+        "account": intent["account"], "exchange": broker.exchange, "pos_side": ps.value,
+        "entry_order_id": f"{base}_E", "entry_price": entry,
+        "qty": qty, "qty_remaining": qty, "half_qty": half,
+        "margin": intent.get("margin"), "leverage": intent.get("leverage"),
+        "sl_order_id": sl_oid, "tp1_order_id": tp1_oid, "tp2_order_id": tp2_oid,
+        "sl_price": sl_price, "tp1": tp1, "tp2": tp2,
+        "actual_r_usdt": round(actual_r, 4),
+        "client_id_base": base, "tp1_filled_at": None,
+        "tp_degraded": (tp1_oid is None and bool(intent.get("tp1_level"))) or (bool(tp2) and tp2_oid is None),
+        "adopted": True,
+    }
+
+
+def _ensure_protective(broker: Broker, symbol: str, ps: PosSide, qty: float, price: float,
+                       cid: str, kind: str) -> Optional[str]:
+    """先按 client id 查保护单是否已活跃，存在则复用；否则挂（确定性 id，重启幂等 §18）。"""
+    try:
+        existing = broker.get_order(symbol, client_id=cid)
+    except Exception:
+        existing = None
+    if existing is not None and existing.state in (OrderState.NEW, OrderState.PARTIALLY_FILLED):
+        return existing.order_id                       # 已挂着 → 复用，不重复挂
+    if existing is not None and existing.state == OrderState.UNKNOWN:
+        return None                                    # 查单异常，不臆测（下轮 reconcile 再补）
+    try:
+        if kind == "stop":
+            return broker.place_stop_market(symbol, ps, qty, price, cid)
+        return broker.place_reduce_limit(symbol, ps, qty, price, cid)
+    except Exception as e:
+        notify.feishu_alert(f"adopt: place {cid} failed: {e}")
+        return None
+
+
 def _reached_tp(ref_price: float, target: Optional[float], ps: PosSide) -> bool:
     """降级判断：ref_price 是否到达 TP（short 在下方，long 在上方）。"""
     if target is None:

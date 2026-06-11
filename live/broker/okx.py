@@ -147,6 +147,18 @@ class OKXBroker(Broker):
         except Exception as e:
             msg = str(e).lower()
             if "not exist" in msg or "51603" in msg or "51000" in msg:
+                if order_id is None and client_id:
+                    # 普通单不存在 → 查 algo（SL 是 algo，by algoClOrdId，供 adopt 先查再挂 §18）
+                    try:
+                        d = self._data(self.trade.get_algo_order_details(algoClOrdId=_cl(client_id)))
+                        if d:
+                            a = d[0]
+                            return OrderStatus("algo:" + a["algoId"], client_id,
+                                               _ALGO_STATE.get(a.get("state"), OrderState.NEW),
+                                               float(a.get("actualSz") or 0) * m["ctVal"],
+                                               float(a.get("actualPx") or 0), raw=a)
+                    except Exception:
+                        pass
                 return None                            # 订单确实不存在
             return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
 

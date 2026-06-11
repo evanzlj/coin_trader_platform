@@ -123,6 +123,37 @@ def _flag_manual(pb: dict, result: str, symbol: str) -> str:
     return "manual"
 
 
+def _recover_opening(engine, symbol: str, pb: dict) -> None:
+    """OPENING（开仓中崩溃）恢复（§18）：查 {base}_E 订单/实际持仓 → 接管 / 作废 / 保持。"""
+    ex = pb.get("exec") or {}
+    broker = engine.brokers.get(ex.get("account"))
+    if broker is None:
+        _flag_manual(pb, "manual_no_broker", symbol)
+        return
+    ps = PosSide(ex["pos_side"])
+    pos = broker.get_position(symbol, ps)
+    od = broker.get_order(symbol, client_id=f"{ex['client_id_base']}_E")
+    filled = od is not None and od.state == OrderState.FILLED
+    if (pos is not None and pos.qty > 0) or filled:
+        # 有仓 / entry 已成交 → 接管：补 SL/TP，转 ACTIVATED
+        qty = pos.qty if (pos is not None and pos.qty > 0) else od.filled_qty
+        entry = pos.entry_price if (pos is not None and pos.qty > 0) else od.avg_price
+        from live.position_manager import adopt_position
+        pb["exec"] = adopt_position(broker, symbol, ex, qty, entry)
+        pb["status"] = PBStatus.ACTIVATED.value
+        notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={qty})")
+        return
+    if od is not None and od.state == OrderState.UNKNOWN:
+        return                                          # 查单 API 异常 → 保持 OPENING，下轮再看（不臆测）
+    if pos is None and od is None:
+        # 无仓且订单明确不存在 → 作废
+        pb["status"] = PBStatus.DONE_CANCELLED.value
+        pb["result"] = "opening_aborted"
+        notify.feishu_alert(f"OPENING aborted, no position ({symbol} {ex.get('account')})")
+        return
+    # 其他不确定（od 存在但未成交、无仓）→ 保持 OPENING
+
+
 def startup_reconcile(engine) -> None:
     """启动对账（§21 #2）：WAITING 旧包丢弃；ACTIVATED/TP1_HIT 对账恢复。"""
     for pkg_dir, state in engine.load_states():
@@ -133,6 +164,9 @@ def startup_reconcile(engine) -> None:
             if st in WAITING:
                 pb["status"] = PBStatus.DONE_CANCELLED.value
                 pb["result"] = "restart_discard"
+                changed = True
+            elif st == PBStatus.OPENING.value:
+                _recover_opening(engine, symbol, pb)    # 开仓中崩溃 → 查交易所接管/作废（§18）
                 changed = True
             elif st in OPEN:
                 broker = engine.brokers.get((pb.get("exec") or {}).get("account"))

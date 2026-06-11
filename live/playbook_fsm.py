@@ -30,6 +30,7 @@ from live import exec_config as cfg
 class PBStatus(str, Enum):
     WAITING_FOR_PRIMARY_TOUCH = "WAITING_FOR_PRIMARY_TOUCH"
     WAITING_FOR_ACTIVATION    = "WAITING_FOR_ACTIVATION"
+    OPENING                   = "OPENING"          # 已分配 slot、真实下单前持久化（崩溃恢复锚点 §18）
     ACTIVATED                 = "ACTIVATED"
     TP1_HIT                   = "TP1_HIT"
     DONE_CANCELLED            = "DONE_CANCELLED"

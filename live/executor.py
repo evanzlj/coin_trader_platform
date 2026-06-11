@@ -211,7 +211,7 @@ class ExecutorEngine:
                     if pb["status"] not in WAITING_STATUSES:
                         break
                     if step_waiting(pb, bar) == WaitEvent.ACTIVATE:
-                        self._enter(state, symbol, pb, bar, [s for _, s in pkgs])
+                        self._enter(state, symbol, pb, bar, [s for _, s in pkgs], pkg_dir)
             state["last_bar"] = latest.isoformat()
             self.save_state(pkg_dir, state)
 
@@ -223,7 +223,10 @@ class ExecutorEngine:
                 symbol = state["symbol"]
                 rec_changed = False
                 for pb in state["playbooks"]:
-                    if pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):
+                    if pb["status"] == PBStatus.OPENING.value:          # startup 留下的 OPENING → 继续恢复（§18）
+                        reconcile._recover_opening(self, symbol, pb)
+                        rec_changed = True
+                    elif pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):
                         broker = self.brokers.get(pb["exec"]["account"])
                         if broker and reconcile.reconcile_position(broker, symbol, pb) != "ok":
                             rec_changed = True
@@ -239,8 +242,8 @@ class ExecutorEngine:
         self._heartbeat(now)
 
     def _enter(self, state: dict, symbol: str, pb: dict, bar: Bar,
-               all_states: list) -> None:
-        """激活进场：校验 → 分配 slot → 开仓。失败不占 slot、不记 ACTIVATED。
+               all_states: list, pkg_dir) -> None:
+        """激活进场：校验 → 分配 slot → 写 OPENING 意图 → 开仓。失败不占 slot、不记 ACTIVATED。
         all_states = 本 tick 内存中的所有 state（含已激活的），用于 occ 防同 tick 超分配。"""
         ok, reason = validate_levels(pb)
         if not ok:
@@ -261,6 +264,17 @@ class ExecutorEngine:
 
         broker = self.brokers[account]
         base = make_client_id_base(state["signal_dir"], pb["hypothesis"])
+        # 真实下单前先持久化 OPENING 意图（崩溃后 reconcile 可凭 account+{base}_E 查交易所接管，§18）
+        pb["status"] = PBStatus.OPENING.value
+        pb["exec"] = {"account": account, "exchange": broker.exchange,
+                      "pos_side": pos_side_of(pb["direction"]).value,
+                      "client_id_base": base, "direction": pb["direction"],
+                      "margin": margin, "bar_time": state.get("bar_time"),
+                      "opening_at": pd.Timestamp.now("UTC").isoformat(),
+                      "r_dist_pct": pb["r_dist_pct"],
+                      "tp1_level": pb.get("tp1_level"), "tp2_level": pb.get("tp2_level"),
+                      "invalidation": pb["invalidation"]}
+        self.save_state(pkg_dir, state)
         try:
             ex = open_position(broker, symbol, pb, bar.close, account, margin, base)
             pb["exec"] = ex

@@ -242,6 +242,44 @@ class TestReconcile(unittest.TestCase):
               "exec": {"account": "a", "pos_side": "SHORT", "recovering": True, "client_id_base": "base"}}
         self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")   # 不 KeyError
 
+    def test_opening_recover_adopts(self):
+        # OPENING + 有仓 → 接管补 SL/TP，转 ACTIVATED（§18 崩溃恢复）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"hypothesis": "X", "status": "OPENING",
+              "exec": {"account": "a", "exchange": "mock", "pos_side": "SHORT", "client_id_base": "base",
+                       "direction": "short", "margin": 40, "invalidation": {"level": 73000, "dir": "above"},
+                       "tp1_level": 72400, "tp2_level": 72000}}
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "ACTIVATED")
+        self.assertIsNotNone(pb["exec"]["sl_order_id"])
+        self.assertTrue(pb["exec"].get("adopted"))
+
+    def test_opening_recover_aborts(self):
+        # OPENING + 无仓 + 订单不存在 → 作废
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"hypothesis": "X", "status": "OPENING",
+              "exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base", "direction": "short",
+                       "invalidation": {"level": 73000, "dir": "above"}}}
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_CANCELLED")
+        self.assertEqual(pb["result"], "opening_aborted")
+
+    def test_opening_recover_unknown_holds(self):
+        # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fail_on={"get_order"})
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"hypothesis": "X", "status": "OPENING",
+              "exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base", "direction": "short",
+                       "invalidation": {"level": 73000, "dir": "above"}}}
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")
+
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)

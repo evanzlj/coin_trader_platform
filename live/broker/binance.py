@@ -126,6 +126,17 @@ class BinanceBroker(Broker):
                 od = self.client.query_order(symbol=sym, origClientOrderId=client_id)
         except ClientError as e:
             if getattr(e, "error_code", None) == -2013:
+                if order_id is None and client_id:
+                    # 普通单不存在 → 查 algo（SL 是 algo 单，by clientAlgoId，供 adopt 先查再挂 §18）
+                    try:
+                        lst = self.client.sign_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym})
+                        for a in (lst if isinstance(lst, list) else lst.get("orders", [])):
+                            if a.get("clientAlgoId") == client_id:
+                                return OrderStatus("algo:" + str(a["algoId"]), client_id,
+                                                   _ALGO_STATE.get(a.get("algoStatus"), OrderState.NEW),
+                                                   float(a.get("actualQty") or 0), 0.0, raw=a)
+                    except Exception:
+                        return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
                 return None                            # 订单确实不存在
             return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
         except Exception:
