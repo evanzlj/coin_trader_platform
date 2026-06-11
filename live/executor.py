@@ -249,11 +249,19 @@ class ExecutorEngine:
 
 # ── main（部署入口；broker 构建等 adapter #4/#5）──────────────────────────────
 
-def build_brokers() -> dict[str, Broker]:
-    raise NotImplementedError(
-        "broker 构建等 Binance/OKX adapter（#4/#5）完成后接入；"
-        "测试用 ExecutorEngine(brokers=mock) 注入"
-    )
+def build_brokers(keys: dict) -> dict[str, Broker]:
+    """按 keys 构建每账户 Broker（binance→BinanceBroker, okx→OKXBroker）。
+    交易所 SDK 延迟到此 import（Mac 开发机未装，不影响 import executor / 跑单测）。"""
+    from live.broker.binance import BinanceBroker
+    from live.broker.okx import OKXBroker
+    brokers: dict[str, Broker] = {}
+    for a in keys["binance"]:
+        brokers[a["label"]] = BinanceBroker(a["label"], a["api_key"], a["secret"],
+                                            cfg.binance_base_url())
+    for a in keys["okx"]:
+        brokers[a["label"]] = OKXBroker(a["label"], a["api_key"], a["secret"],
+                                        a["passphrase"], cfg.okx_simulated_flag())
+    return brokers
 
 
 def main() -> None:
@@ -268,7 +276,7 @@ def main() -> None:
         from live.keys_loader import load_keys
         keys = load_keys()
         accounts = build_accounts(keys)
-        brokers = build_brokers()
+        brokers = build_brokers(keys)
         reader = OhlcvReader()
         engine = ExecutorEngine(reader, brokers, accounts)
         reconcile.startup_reconcile(engine)
