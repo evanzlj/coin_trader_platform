@@ -24,7 +24,9 @@ from live.playbook_fsm import (
     Bar, WaitEvent, step_waiting, compute_sizing, compute_sl_price, validate_levels,
 )
 from live.slot_pool import Occupancy, build_accounts, allocate
-from live.position_manager import open_position, manage_open_position
+from live.position_manager import (
+    open_position, manage_open_position, _cancel, SLPlacementError, NakedPositionError,
+)
 from live.reconcile import reconcile_position, startup_reconcile
 from live.broker.mock import MockBroker
 from live.broker.base import SymbolSpec, OrderStatus, OrderState, Position, PosSide
@@ -265,6 +267,64 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(self.pkg.exists())                       # 已归档
         done = json.loads((cfg.SIGNAL_DONE / "btcusdt_A_test" / "state.json").read_text())
         self.assertEqual(done["playbooks"][0]["status"], "DONE_TP2")
+
+
+class TestFaultInjection(unittest.TestCase):
+    """故障注入（task #16）：SL 挂不上 / 撤单失败 / BE 挂失败 —— 不裸仓、不弃管。"""
+
+    def setUp(self):
+        self._tl = cfg.TRADE_LOG
+        self.tmp = Path(tempfile.mkdtemp())
+        cfg.TRADE_LOG = self.tmp / "tl.jsonl"
+
+    def tearDown(self):
+        cfg.TRADE_LOG = self._tl
+        shutil.rmtree(self.tmp)
+
+    def _pb(self):
+        return {"direction": "short", "r_dist_pct": 0.5, "invalidation": {"level": 73000, "dir": "above"},
+                "tp1_level": 72400, "tp2_level": 72000}
+
+    def test_sl_fail_closes_position(self):
+        # SL 挂不上 → 市价平退出，不裸仓
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"place_stop_market"})
+        with self.assertRaises(SLPlacementError):
+            open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+        self.assertIsNone(b.get_position("BTC/USDT", PosSide.SHORT))
+
+    def test_sl_and_close_fail_naked(self):
+        # SL 挂不上 且 平仓也失败 → NakedPositionError（裸仓还在，交人工）
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"place_stop_market", "market_close"})
+        with self.assertRaises(NakedPositionError):
+            open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+        self.assertIsNotNone(b.get_position("BTC/USDT", PosSide.SHORT))
+
+    def test_tp_fail_degraded_sl_still_on(self):
+        # TP 挂不上 → 不致命，SL 仍在
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"place_reduce_limit"})
+        ex = open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+        self.assertIsNone(ex["tp1_order_id"])
+        self.assertTrue(ex["tp_degraded"])
+        self.assertIsNotNone(ex["sl_order_id"])
+
+    def test_cancel_fail_no_raise(self):
+        b = MockBroker(spec=SPEC, fail_on={"cancel_order"})
+        _cancel(b, "BTC/USDT", "someoid")   # 重试后告警，不抛
+
+    def test_be_fail_keeps_original_sl(self):
+        # TP1 成交后挂 BE 失败 → 保留原 SL（仍有止损），不裸奔
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        orig_sl = ex["sl_order_id"]
+        b.fill_order(ex["tp1_order_id"])
+        b.fail_on = {"place_stop_market"}     # BE 挂会失败
+        r = manage_open_position(b, "BTC/USDT", pb)
+        self.assertEqual(r, "TP1_HIT")
+        self.assertEqual(pb["result"], "tp1_be_degraded")
+        self.assertEqual(pb["exec"]["sl_order_id"], orig_sl)
+        self.assertTrue(pb["exec"].get("be_failed"))
 
 
 if __name__ == "__main__":

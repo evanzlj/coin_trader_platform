@@ -34,7 +34,9 @@ from live.playbook_fsm import (
     Bar, PBStatus, TERMINAL, WaitEvent,
     step_waiting, validate_levels,
 )
-from live.position_manager import open_position, manage_open_position
+from live.position_manager import (
+    open_position, manage_open_position, NakedPositionError, pos_side_of,
+)
 from live.slot_pool import Account, build_accounts, build_occupancy, allocate
 from live.single_instance import SingleInstance, AlreadyRunning
 from live import reconcile
@@ -236,6 +238,16 @@ class ExecutorEngine:
             notify.trade_log("ACTIVATED", symbol=symbol, hypothesis=pb.get("hypothesis"),
                              account=account, exchange=ex["exchange"], entry=ex["entry_price"],
                              qty=ex["qty"], actual_r=ex["actual_r_usdt"])
+        except NakedPositionError as e:
+            # 有仓、无 SL、平不掉 → 占 slot + 人工接管 + 强告警（绝不弃管）
+            pb["exec"] = {"account": account, "exchange": broker.exchange,
+                          "pos_side": pos_side_of(pb["direction"]).value,
+                          "margin": margin, "manual_override": True, "client_id_base": base}
+            pb["status"] = PBStatus.ACTIVATED.value
+            pb["result"] = f"NAKED:{e}"
+            logger.error("NAKED POSITION %s %s acc=%s: %s", symbol, pb.get("hypothesis"), account, e)
+            notify.trade_log("ERROR_NAKED_POSITION", symbol=symbol, account=account, error=str(e))
+            notify.feishu_alert(f"NAKED POSITION {symbol} {account}: {e}")
         except Exception as e:
             pb["status"] = PBStatus.DONE_CANCELLED.value
             pb["result"] = f"entry_failed:{e}"

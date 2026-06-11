@@ -17,9 +17,11 @@ from live.broker.base import (
 class MockBroker(Broker):
     def __init__(self, label: str = "mock_0", exchange: str = "mock",
                  spec: Optional[SymbolSpec] = None,
-                 fill_price: float = 100.0, balance: float = 120.0) -> None:
+                 fill_price: float = 100.0, balance: float = 120.0,
+                 fail_on: Optional[set] = None) -> None:
         self.label = label
         self.exchange = exchange
+        self.fail_on = fail_on or set()      # 方法名集合 → 注入抛错（故障注入测试）
         self._spec = spec or SymbolSpec("*", 0.001, 0.1, 0.001, 5.0)
         self._fill_price = fill_price
         self._balance = balance
@@ -68,20 +70,28 @@ class MockBroker(Broker):
         return Fill(oid, client_id, symbol, pos_side, open_side(pos_side), price, qty)
 
     def market_close(self, symbol, pos_side, qty, client_id) -> Fill:
+        if "market_close" in self.fail_on:
+            raise RuntimeError("injected market_close fail")
         self._reduce_position(symbol, pos_side, qty)
         oid = self._next_oid()
         self.calls.append(("market_close", symbol, pos_side, qty, client_id))
         return Fill(oid, client_id, symbol, pos_side, close_side(pos_side), self._fill_price, qty)
 
     def place_reduce_limit(self, symbol, pos_side, qty, price, client_id) -> str:
+        if "place_reduce_limit" in self.fail_on:
+            raise RuntimeError("injected place_reduce_limit fail")
         return self._place(symbol, pos_side, qty, "limit", client_id,
                            ("place_reduce_limit", symbol, pos_side, qty, price, client_id))
 
     def place_stop_market(self, symbol, pos_side, qty, stop_price, client_id) -> str:
+        if "place_stop_market" in self.fail_on:
+            raise RuntimeError("injected place_stop_market fail")
         return self._place(symbol, pos_side, qty, "stop", client_id,
                            ("place_stop_market", symbol, pos_side, qty, stop_price, client_id))
 
     def cancel_order(self, symbol, order_id=None, client_id=None) -> None:
+        if "cancel_order" in self.fail_on:
+            raise RuntimeError("injected cancel_order fail")
         if order_id and order_id in self.orders:
             self.orders[order_id].state = OrderState.CANCELED
         self.calls.append(("cancel_order", symbol, order_id, client_id))
