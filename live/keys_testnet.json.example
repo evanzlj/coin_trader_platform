@@ -1,0 +1,8 @@
+{
+  "binance": [
+    {"label": "binance_tn", "api_key": "", "secret": ""}
+  ],
+  "okx": [
+    {"label": "okx_demo", "api_key": "", "secret": "", "passphrase": ""}
+  ]
+}

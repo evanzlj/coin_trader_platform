@@ -1,0 +1,16 @@
+{
+  "binance": [
+    {"label": "binance_0", "api_key": "", "secret": ""},
+    {"label": "binance_1", "api_key": "", "secret": ""},
+    {"label": "binance_2", "api_key": "", "secret": ""},
+    {"label": "binance_3", "api_key": "", "secret": ""},
+    {"label": "binance_4", "api_key": "", "secret": ""}
+  ],
+  "okx": [
+    {"label": "okx_0", "api_key": "", "secret": "", "passphrase": ""},
+    {"label": "okx_1", "api_key": "", "secret": "", "passphrase": ""},
+    {"label": "okx_2", "api_key": "", "secret": "", "passphrase": ""},
+    {"label": "okx_3", "api_key": "", "secret": "", "passphrase": ""},
+    {"label": "okx_4", "api_key": "", "secret": "", "passphrase": ""}
+  ]
+}

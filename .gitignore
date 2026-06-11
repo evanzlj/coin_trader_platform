@@ -22,6 +22,11 @@ history_data_manager/aonly_research_summary_20260608.md
 scoring/aplus_*.csv
 live_dashboard.html
 
+# API keys (never commit; *.json.example templates ARE tracked)
+live/keys_*.json
+live/executor.lock
+live/trade_log.jsonl
+
 # Live runtime state (machine-generated)
 live/state/
 live/charts/
