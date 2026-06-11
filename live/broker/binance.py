@@ -28,6 +28,14 @@ _STATE = {
     "EXPIRED_IN_MATCH": OrderState.EXPIRED,
 }
 
+# Algo（条件单）状态 → 统一态。字段/取值待 testnet 实测确认后微调。
+_ALGO_STATE = {
+    "NEW": OrderState.NEW, "WORKING": OrderState.NEW, "ACTIVE": OrderState.NEW,
+    "TRIGGERED": OrderState.FILLED, "FINISHED": OrderState.FILLED, "FILLED": OrderState.FILLED,
+    "CANCELLED": OrderState.CANCELED, "CANCELED": OrderState.CANCELED,
+    "EXPIRED": OrderState.EXPIRED, "REJECTED": OrderState.REJECTED,
+}
+
 
 def _sym(symbol: str) -> str:
     return symbol.replace("/", "")
@@ -89,11 +97,21 @@ class BinanceBroker(Broker):
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,
                   client_id: Optional[str] = None) -> Optional[OrderStatus]:
+        sym = _sym(symbol)
         try:
+            if order_id and order_id.startswith("algo:"):
+                od = self.client.sign_request("GET", "/fapi/v1/algoOrder",
+                                              {"symbol": sym, "algoId": int(order_id.split(":", 1)[1])})
+                st = od.get("algoStatus") or od.get("status")
+                return OrderStatus(order_id, od.get("clientAlgoId", ""),
+                                   _ALGO_STATE.get(st, OrderState.NEW),
+                                   float(od.get("executedQty") or 0),
+                                   float(od.get("avgPrice") or 0), raw=od)
             if order_id is not None:
-                od = self.client.query_order(symbol=_sym(symbol), orderId=int(order_id))
+                oid = order_id.split(":", 1)[1] if order_id.startswith("ord:") else order_id
+                od = self.client.query_order(symbol=sym, orderId=int(oid))
             else:
-                od = self.client.query_order(symbol=_sym(symbol), origClientOrderId=client_id)
+                od = self.client.query_order(symbol=sym, origClientOrderId=client_id)
         except Exception:
             return None
         return OrderStatus(
@@ -141,17 +159,23 @@ class BinanceBroker(Broker):
 
     def place_stop_market(self, symbol: str, pos_side: PosSide, qty: float,
                           stop_price: float, client_id: str) -> str:
-        resp = self.client.new_order(
-            symbol=_sym(symbol), side=close_side(pos_side).value, type="STOP_MARKET",
-            quantity=qty, stopPrice=stop_price, workingType="CONTRACT_PRICE",
-            positionSide=pos_side.value, newClientOrderId=client_id,
-        )
-        return str(resp["orderId"])
+        # 条件单走 Algo Service（/fapi/v1/algoOrder，2025-12 迁移）。返回带 algo: 前缀。
+        resp = self.client.sign_request("POST", "/fapi/v1/algoOrder", {
+            "algoType": "CONDITIONAL", "symbol": _sym(symbol),
+            "side": close_side(pos_side).value, "positionSide": pos_side.value,
+            "type": "STOP_MARKET", "quantity": qty, "triggerPrice": stop_price,
+            "workingType": "CONTRACT_PRICE", "clientAlgoId": client_id,
+        })
+        return "algo:" + str(resp["algoId"])
 
     def cancel_order(self, symbol: str, order_id: Optional[str] = None,
                      client_id: Optional[str] = None) -> None:
         sym = _sym(symbol)
-        if order_id is not None:
-            self.client.cancel_order(symbol=sym, orderId=int(order_id))
+        if order_id and order_id.startswith("algo:"):
+            self.client.sign_request("DELETE", "/fapi/v1/algoOrder",
+                                     {"symbol": sym, "algoId": int(order_id.split(":", 1)[1])})
+        elif order_id is not None:
+            oid = order_id.split(":", 1)[1] if order_id.startswith("ord:") else order_id
+            self.client.cancel_order(symbol=sym, orderId=int(oid))
         else:
             self.client.cancel_order(symbol=sym, origClientOrderId=client_id)
