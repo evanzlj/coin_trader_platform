@@ -14,6 +14,7 @@ import logging
 
 from live.broker.base import Broker, PosSide, OrderState
 from live.playbook_fsm import PBStatus, TERMINAL
+from live import notify
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,9 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
         o = broker.get_order(symbol, oid)
         return o is not None and o.state == OrderState.FILLED
 
-    # 有持仓 → 仓位还在，继续（挂单缺失检查留待补挂逻辑；先认 ok）
+    # 有持仓 → 检查 SL 还在否，缺则补挂（防无保护裸持 §19 P0-3）
     if pos is not None:
+        _ensure_sl(broker, symbol, pb)
         return "ok"
 
     # 无持仓：宕机期间已被平，按订单成交定真实终态
@@ -70,6 +72,24 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
 
     # 持仓没了但订单状态也对不上（强平 / 人工平 / 未知）→ 人工
     return _flag_manual(pb, "manual_no_position", symbol)
+
+
+def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> None:
+    """持仓还在但 SL 没了（被撤/拒/过期）→ 重新挂 SL（不留无保护裸持 §19 P0-3）。"""
+    ex = pb["exec"]
+    ps = PosSide(ex["pos_side"])
+    sl = broker.get_order(symbol, ex.get("sl_order_id"))
+    if sl is not None and sl.state == OrderState.UNKNOWN:
+        return                                          # 查单异常，本轮不动
+    if sl is None or sl.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
+        qty = ex.get("qty_remaining") or ex["qty"]
+        try:
+            new_sl = broker.place_stop_market(symbol, ps, qty, ex["sl_price"],
+                                              f"{ex['client_id_base']}_SR")
+            ex["sl_order_id"] = new_sl
+            notify.feishu_alert(f"reconcile: SL missing → replaced ({symbol} {ex.get('account')})")
+        except Exception as e:
+            notify.feishu_alert(f"reconcile: SL replace FAILED ({symbol}): {e}")
 
 
 def _flag_manual(pb: dict, result: str, symbol: str) -> str:

@@ -13,6 +13,7 @@ import time
 from typing import Optional
 
 from binance.um_futures import UMFutures
+from binance.error import ClientError
 
 from live.broker.base import (
     Broker, Side, PosSide, OrderState,
@@ -123,8 +124,12 @@ class BinanceBroker(Broker):
                 od = self.client.query_order(symbol=sym, orderId=int(oid))
             else:
                 od = self.client.query_order(symbol=sym, origClientOrderId=client_id)
+        except ClientError as e:
+            if getattr(e, "error_code", None) == -2013:
+                return None                            # 订单确实不存在
+            return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
         except Exception:
-            return None
+            return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
         return OrderStatus(
             str(od["orderId"]), od.get("clientOrderId", ""),
             _STATE.get(od.get("status"), OrderState.NEW),

@@ -172,12 +172,24 @@ class TestReconcile(unittest.TestCase):
         return {"hypothesis": "X", "direction": "short", "status": "ACTIVATED",
                 "exec": {"account": "a", "pos_side": "SHORT", "sl_order_id": "o2",
                          "tp1_order_id": "o3", "tp2_order_id": "o4",
-                         "entry_price": 72700, "qty": 0.027, "half_qty": 0.013}}
+                         "entry_price": 72700, "qty": 0.027, "half_qty": 0.013,
+                         "sl_price": 73073, "client_id_base": "base"}}
 
     def test_position_present_ok(self):
         b = MockBroker(spec=SPEC)
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        b.orders["o2"] = OrderStatus("o2", "x", OrderState.NEW, 0, 0)   # SL 还在
         self.assertEqual(reconcile_position(b, "BTC/USDT", self._active()), "ok")
+
+    def test_reconcile_replaces_missing_sl(self):
+        # 持仓还在但 SL 被撤 → 对账补挂新 SL（§19 P0-3）
+        b = MockBroker(spec=SPEC)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        b.orders["o2"] = OrderStatus("o2", "x", OrderState.CANCELED, 0, 0)
+        pb = self._active()
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")
+        self.assertNotEqual(pb["exec"]["sl_order_id"], "o2")           # 换了新 SL
+        self.assertTrue(any(c[0] == "place_stop_market" for c in b.calls))
 
     def test_sl_reconciled(self):
         b = MockBroker(spec=SPEC)
@@ -339,6 +351,18 @@ class TestFaultInjection(unittest.TestCase):
         with self.assertRaises(Exception):
             open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
         self.assertIsNone(b.get_position("BTC/USDT", PosSide.SHORT))
+
+    def test_get_order_unknown_no_premature_done(self):
+        # TP 查单 UNKNOWN（API 异常）+ 持仓没了 → 不臆测 DONE_SL，本轮跳过（§19 P0-6）
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        b.fail_on = {"get_order"}        # 查单返回 UNKNOWN
+        b.positions.clear()              # 持仓查不到
+        r = manage_open_position(b, "BTC/USDT", pb)
+        self.assertIsNone(r)
+        self.assertEqual(pb["status"], "ACTIVATED")   # 没误判 DONE_SL
 
     def test_be_fail_keeps_original_sl(self):
         # TP1 成交后挂 BE 失败 → 保留原 SL（仍有止损），不裸奔

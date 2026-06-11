@@ -124,7 +124,11 @@ class ExecutorEngine:
                     broker = self.brokers.get(pb["exec"]["account"])
                     if broker is None:
                         continue
-                    result = manage_open_position(broker, symbol, pb)
+                    try:
+                        result = manage_open_position(broker, symbol, pb)
+                    except Exception as e:
+                        logger.error("manage error %s %s: %s", symbol, pb.get("hypothesis"), e)
+                        continue                       # 一个 pb 出错不拖垮整轮
                     if result:
                         changed = True
                         notify.trade_log(result, symbol=symbol,

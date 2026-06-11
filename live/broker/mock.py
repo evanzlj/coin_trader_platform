@@ -54,6 +54,8 @@ class MockBroker(Broker):
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,
                   client_id: Optional[str] = None) -> Optional[OrderStatus]:
+        if "get_order" in self.fail_on:                # 模拟查单 API 异常 → UNKNOWN
+            return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
         if order_id is not None:
             return self.orders.get(order_id)
         for o in self.orders.values():

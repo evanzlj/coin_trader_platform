@@ -113,6 +113,8 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]
 
     if status == PBStatus.ACTIVATED.value:
         tp1 = broker.get_order(symbol, ex.get("tp1_order_id")) if ex.get("tp1_order_id") else None
+        if tp1 and tp1.state == OrderState.UNKNOWN:
+            return None                                                # 查单异常，本轮不臆测（§19）
         if tp1 and tp1.state == OrderState.FILLED:                     # 半仓止盈 → 移 SL 到 BE
             rest = ex["qty"] - ex["half_qty"]
             try:                                                        # 先挂 BE
@@ -142,6 +144,8 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict) -> Optional[str]
 
     if status == PBStatus.TP1_HIT.value:
         tp2 = broker.get_order(symbol, ex.get("tp2_order_id")) if ex.get("tp2_order_id") else None
+        if tp2 and tp2.state == OrderState.UNKNOWN:
+            return None                                                # 查单异常，本轮不臆测（§19）
         if tp2 and tp2.state == OrderState.FILLED:                     # TP2 全达成
             _cancel(broker, symbol, ex.get("sl_order_id"))
             pb["status"] = PBStatus.DONE_TP2.value

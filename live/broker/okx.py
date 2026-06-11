@@ -144,8 +144,11 @@ class OKXBroker(Broker):
                 return OrderStatus("ord:" + d["ordId"], d.get("clOrdId", ""), state,
                                    float(d.get("accFillSz") or 0) * m["ctVal"],
                                    float(d.get("avgPx") or 0), raw=d)
-        except Exception:
-            return None
+        except Exception as e:
+            msg = str(e).lower()
+            if "not exist" in msg or "51603" in msg or "51000" in msg:
+                return None                            # 订单确实不存在
+            return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
 
     # ── 下单 ──────────────────────────────────────────────────────────────────
 

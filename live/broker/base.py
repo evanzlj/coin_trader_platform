@@ -39,6 +39,7 @@ class OrderState(str, Enum):
     CANCELED         = "CANCELED"
     REJECTED         = "REJECTED"
     EXPIRED          = "EXPIRED"
+    UNKNOWN          = "UNKNOWN"           # 查单 API 异常，状态未知（不臆测，§19）
 
 
 # ── 数据类 ─────────────────────────────────────────────────────────────────────
