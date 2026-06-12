@@ -162,28 +162,43 @@ def scenario_terminal_drains_orders(brokers, accts):
     return ok
 
 
-def scenario_duplicate_client_id_idempotent(brokers, accts):
-    """④ 重复 client id：同 {base}_E 第二次下单 → 交易所拒（幂等保证，防超时重试重复开仓 §18）。"""
+class _TimeoutOnceBroker:
+    """包装真实 broker：market_open 真实下单后抛一次（模拟 SDK 超时但订单已成交），之后透传。"""
+    def __init__(self, inner):
+        self._inner = inner
+        self._fired = False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def market_open(self, *a, **k):
+        fill = self._inner.market_open(*a, **k)              # 真实下单（已成交）
+        if not self._fired:
+            self._fired = True
+            raise RuntimeError("injected SDK timeout (order actually filled)")
+        return fill
+
+
+def scenario_market_open_timeout_recovers(brokers, accts):
+    """④ market_open 超时但实际成交 → open_position 查持仓接管，**不重发** → 不翻倍开仓（§18 真实验证）。
+    重要发现：binance MARKET 单 client_id 不防重复（成交即完成 → 同 id 重发 = 新仓），所以幂等
+    必须靠 executor「超时不重发、查持仓接管」，不能靠交易所 client_id 唯一性。"""
+    from live.position_manager import open_position
     label, broker = _binance_broker(brokers)
     sym, ps = "BTC/USDT", PosSide.SHORT
     base = f"fi4{int(time.time()) % 1000000}"
-    broker.set_leverage(sym, ps, 10)
-    broker.market_open(sym, ps, 0.002, f"{base}_E")
-    print("  setup: first open ok (qty=0.002)")
-    dup_rejected = False
-    try:
-        broker.market_open(sym, ps, 0.002, f"{base}_E")      # 同 client id 再下
-        print("  inject: SECOND open with SAME client id — NOT rejected (risk!)")
-    except Exception as e:
-        dup_rejected = True
-        print(f"  inject: second open rejected ✓ ({str(e)[:70]})")
+    P = float(broker.client.ticker_price(symbol="BTCUSDT")["price"])
+    pb = {"direction": "short", "r_dist_pct": 0.5,
+          "invalidation": {"level": round(P * 1.003, 1), "dir": "above"},
+          "tp1_level": round(P * 0.99, 1), "tp2_level": round(P * 0.985, 1)}
+    wrapped = _TimeoutOnceBroker(broker)
+    ex = open_position(wrapped, sym, pb, P, label, 40, base)  # market_open 抛 → 查持仓接管
     pos = broker.get_position(sym, ps)
     qty = pos.qty if pos else 0
-    ok = dup_rejected and abs(qty - 0.002) < 1e-6            # 没翻倍
-    print(f"  RESULT: {'✓ idempotent (pos=0.002, no double-open)' if ok else '✗ FAILED'} pos={qty}")
-    if pos:
-        broker.market_close(sym, ps, pos.qty, f"{base}_C")
-        time.sleep(2)
+    ok = bool(pos) and qty < ex["qty"] * 1.5 and ex["entry_price"] > 0   # 没翻倍 + entry 接管出来
+    print(f"  RESULT: {'✓ recovered, no double-open' if ok else '✗ FAILED'} pos={qty} sized={ex['qty']} entry={ex['entry_price']}")
+    _cleanup(broker, ex)
+    print(f"  cleanup: {broker.get_position(sym, ps) or 'FLAT'}")
     return ok
 
 
@@ -191,7 +206,7 @@ SCENARIOS = {
     "crash_activated_sl_removed": scenario_crash_activated_sl_removed,
     "crash_opening_adopts": scenario_crash_opening_adopts,
     "terminal_drains_orders": scenario_terminal_drains_orders,
-    "duplicate_client_id_idempotent": scenario_duplicate_client_id_idempotent,
+    "market_open_timeout_recovers": scenario_market_open_timeout_recovers,
 }
 
 
