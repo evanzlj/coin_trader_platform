@@ -129,8 +129,13 @@ def main():
     ex = _wait(_opened, timeout=70)
     if not ex:
         p1.kill(); p1.wait()
-        print("DRILL FAIL: executor did not open in time. exec1.log tail:")
-        print((tmp / "exec1.log").read_text()[-2500:])
+        st = _read_state(tmp / "active", tmp / "done")
+        pb0 = st["playbooks"][0] if st else None
+        print("DRILL FAIL: executor did not reach ACTIVATED.")
+        print(f"  pb status={pb0.get('status') if pb0 else None} result={pb0.get('result') if pb0 else None}"
+              f" last_bar={st.get('last_bar') if st else None}")
+        print("  exec1.log tail:")
+        print((tmp / "exec1.log").read_text()[-2000:])
         return
     acct, exch, sl_oid = ex["account"], ex["exchange"], ex.get("sl_order_id")
     broker = next(b for b in brokers.values() if b.exchange == exch)
