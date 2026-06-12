@@ -222,6 +222,53 @@ def scenario_drain_unknown_then_retry(brokers, accts):
     return ok
 
 
+class _DelayedPositionBroker:
+    """包装：get_position 前 n 次返回 None（模拟仓位最终一致性延迟），之后透传。"""
+    def __init__(self, inner, n=1):
+        self._inner = inner
+        self._left = n
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_position(self, symbol, pos_side):
+        if self._left > 0:
+            self._left -= 1
+            return None
+        return self._inner.get_position(symbol, pos_side)
+
+
+def scenario_position_lag_grace(brokers, accts):
+    """⑥ OPENING + entry FILLED 但仓位延迟可见 → grace 内保持 OPENING；仓位出现后 adopt（§22.5 grace 最终一致性）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi6{int(time.time()) % 1000000}"
+    broker.set_leverage(sym, ps, 10)
+    fill = broker.market_open(sym, ps, 0.002, f"{base}_E")    # entry 真实成交
+    inval = round(fill.price * 1.003, 1)
+    ex = {"account": label, "exchange": "binance", "pos_side": ps.value, "client_id_base": base,
+          "direction": "short", "margin": 40, "opening_at": pd.Timestamp.now("UTC").isoformat(),
+          "invalidation": {"level": inval, "dir": "above"},
+          "tp1_level": round(fill.price * 0.99, 1), "tp2_level": round(fill.price * 0.985, 1)}
+    pb = {"hypothesis": "X", "direction": "short", "status": "OPENING", "exec": ex}
+    print(f"  setup: entry filled @ {fill.price}, position will lag")
+
+    # —— 注入：get_position 延迟返回 None + grace 内 → 保持 OPENING ——
+    db = _DelayedPositionBroker(broker, n=1)
+    reconcile._recover_opening(ExecutorEngine(None, {label: db}, accts), sym, pb)
+    held = pb["status"] == "OPENING"
+    print(f"  inject: pos lag → status={pb['status']} (held OPENING={held})")
+
+    # —— 恢复：仓位可见 → adopt ——
+    reconcile._recover_opening(ExecutorEngine(None, {label: broker}, accts), sym, pb)
+    print(f"  recover: pos visible → status={pb['status']} adopted={pb['exec'].get('adopted')}")
+    ok = held and pb["status"] == "ACTIVATED" and pb["exec"].get("adopted")
+    print(f"  RESULT: {'✓ grace held then adopted' if ok else '✗ FAILED'}")
+    _cleanup(broker, pb["exec"])
+    print(f"  cleanup: {broker.get_position(sym, ps) or 'FLAT'}")
+    return ok
+
+
 def scenario_market_open_timeout_recovers(brokers, accts):
     """④ market_open 超时但实际成交 → open_position 查持仓接管，**不重发** → 不翻倍开仓（§18 真实验证）。
     重要发现：binance MARKET 单 client_id 不防重复（成交即完成 → 同 id 重发 = 新仓），所以幂等
@@ -251,6 +298,7 @@ SCENARIOS = {
     "terminal_drains_orders": scenario_terminal_drains_orders,
     "market_open_timeout_recovers": scenario_market_open_timeout_recovers,
     "drain_unknown_then_retry": scenario_drain_unknown_then_retry,
+    "position_lag_grace": scenario_position_lag_grace,
 }
 
 
