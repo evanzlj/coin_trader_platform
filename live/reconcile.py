@@ -53,8 +53,11 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
 
     # 有持仓 → 检查 SL 还在否，缺则补挂；补不上则平退出（防无保护裸持 §19/§21）
     if pos is not None:
-        if _ensure_sl(broker, symbol, pb):
+        r = _ensure_sl(broker, symbol, pb)
+        if r == "exited":
             return "resolved"                          # 已平退出（status 变了）
+        if r == "rearmed":
+            return "updated"                           # 补挂了新 SL → 非 ok，periodic 必须保存（§22 七律7）
         return "ok"
 
     # 无持仓：宕机期间已被平，按订单成交定真实终态。§22.5：终态前必须 drain 所有订单（撤干净才归档）。
@@ -84,14 +87,14 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
     return resolve(PBStatus.DONE_UNKNOWN.value, "no_position_unknown_exit")
 
 
-def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
+def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> str:
     """持仓还在但 SL 没了 → 重挂 SL；补不上则市价平退出（不留无保护裸持 §19/§21）。
-    返回 True = 已平退出（status 改为 DONE_UNKNOWN）。"""
+    返回 'exited'（已平退出）| 'rearmed'（补挂了新 SL，state 必须保存）| 'none'（没变）。"""
     ex = pb["exec"]
     ps = PosSide(ex["pos_side"])
     sl = safe_get_order(broker, symbol, ex.get("sl_order_id"))
     if sl is not None and sl.state == OrderState.UNKNOWN:
-        return False                                    # 查单异常，本轮不动
+        return "none"                                   # 查单异常，本轮不动
     if sl is None or sl.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
         qty = ex.get("qty_remaining") or ex["qty"]
         try:
@@ -99,6 +102,7 @@ def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
                                               f"{ex['client_id_base']}_SR")
             ex["sl_order_id"] = new_sl
             notify.feishu_alert(f"reconcile: SL missing → replaced ({symbol} {ex.get('account')})")
+            return "rearmed"                            # 补挂成功 → 必须保存新 sl_order_id（§22 七律7）
         except Exception as e:
             # SL 补不上 → 不留无保护仓，市价平退出；平也失败 → recovering（tick 重试）
             notify.feishu_alert(f"reconcile: SL replace FAILED, closing ({symbol}): {e}")
@@ -106,11 +110,11 @@ def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
                 broker.market_close(symbol, ps, qty, f"{ex['client_id_base']}_SLFC")
                 from live.position_manager import terminalize
                 terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "sl_unplaceable_closed")
-                return True
+                return "exited"
             except Exception as ce:
                 ex["recovering"] = True
                 notify.feishu_alert(f"reconcile: close also FAILED, recovering ({symbol}): {ce}")
-    return False
+    return "none"
 
 
 def _flag_manual(pb: dict, result: str, symbol: str) -> str:

@@ -200,7 +200,7 @@ class TestReconcile(unittest.TestCase):
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
         b.orders["o2"] = OrderStatus("o2", "x", OrderState.CANCELED, 0, 0)
         pb = self._active()
-        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "updated")   # 补挂 → 非 ok，periodic 必须保存
         self.assertNotEqual(pb["exec"]["sl_order_id"], "o2")           # 换了新 SL
         self.assertTrue(any(c[0] == "place_stop_market" for c in b.calls))
 
@@ -469,6 +469,30 @@ class TestReconcile(unittest.TestCase):
         reconcile_position(b, "BTC/USDT", pb)
         self.assertEqual(pb["status"], "DONE_UNKNOWN")
         self.assertEqual(len([c for c in b.calls if c[0] == "cancel_order"]), 2)  # tp1/tp2 撤
+
+    def test_recover_opening_drains_entry_order(self):
+        # OPENING 终态 drain 必须含 entry 单 {base}_E（晚成交→孤儿仓，比孤儿 TP 更危险 §22.5 P0）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC)
+        oid = b._next_oid()
+        b.orders[oid] = OrderStatus(oid, "base_E", OrderState.NEW, 0, 0)   # entry 单还 NEW
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"hypothesis": "X", "status": "OPENING",
+              "exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base", "direction": "short",
+                       "opening_at": "2020-01-01T00:00:00+00:00", "invalidation": {"level": 73000, "dir": "above"}}}
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertTrue(pb["status"].startswith("DONE"))
+        self.assertTrue(any(c[0] == "cancel_order" for c in b.calls))      # base_E 被撤
+
+    def test_reconcile_sr_in_drain_set(self):
+        # reconcile 补挂的 {base}_SR 在 drain 全集里（终态撤掉，不留 replacement SL §22.5 P0）
+        b = MockBroker(spec=SPEC)                          # 无持仓
+        pb = self._active()
+        oid = b._next_oid()
+        b.orders[oid] = OrderStatus(oid, "base_SR", OrderState.NEW, 0, 0)  # 补挂 SR 还活着，exec 没记
+        reconcile_position(b, "BTC/USDT", pb)
+        self.assertTrue(pb["status"].startswith("DONE"))
+        self.assertTrue(any(c[0] == "cancel_order" for c in b.calls))      # base_SR 撤了
 
     def test_try_recover_drains_orders(self):
         # recovering 平仓后 pos None → terminalize drain 剩余订单（§22.5 P0）

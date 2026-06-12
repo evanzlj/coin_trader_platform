@@ -28,6 +28,12 @@ class AdoptUnknownError(Exception):
     """接管时保护单查询 UNKNOWN，无法确认是否已挂 → 保持 OPENING（不重复挂、不平退出，§22）。"""
 
 
+PROTECTIVE_SUFFIXES = ("_E", "_S", "_SR", "_T1", "_T2", "_SBE")
+"""本系统所有 deterministic client id 后缀（§22 七律7 Every Order Must Be Owned）。
+   entry(_E) / SL(_S) / reconcile 补挂 SL(_SR) / TP1(_T1) / TP2(_T2) / BE(_SBE)。
+   所有 place 的 client id 都必须是 {base}+这些后缀之一；drain 按全集撤，确保无遗漏。"""
+
+
 def pos_side_of(direction: str) -> PosSide:
     return PosSide.SHORT if direction == "short" else PosSide.LONG
 
@@ -295,7 +301,7 @@ def _drain_orders(broker: Broker, symbol: str, ex: dict) -> bool:
             candidates.append(("order_id", ex[key]))
     base = ex.get("client_id_base")
     if base:
-        for sfx in ("_S", "_T1", "_T2", "_SBE"):        # deterministic 保护单 client id
+        for sfx in PROTECTIVE_SUFFIXES:                 # 本系统全部 deterministic client id（含 _E entry / _SR 补挂 SL）
             candidates.append(("client_id", f"{base}{sfx}"))
     for by, ident in candidates:
         o = safe_get_order(broker, symbol, **{by: ident})
