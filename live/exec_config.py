@@ -49,12 +49,17 @@ STALE_DATA_MINUTES = 20         # 最新 bar 超此未更新 → 停开新仓（
 RECONCILE_MINUTES  = 15         # 定期对账间隔（§21 #5）
 
 # ── 路径 ────────────────────────────────────────────────────────────────────
-SIGNAL_ACTIVE  = ROOT / "signal_active"
-SIGNAL_DONE    = ROOT / "signal_done"
-HEARTBEAT_FILE = ROOT / "live" / "heartbeat" / "executor_last_run.txt"
-TRADE_LOG      = ROOT / "live" / "trade_log.jsonl"
-LOCK_FILE      = ROOT / "live" / "executor.lock"
-CURSOR_FILE    = ROOT / "live" / "state" / "executor_cursor.txt"
+def _p(env_key: str, default: Path) -> Path:
+    """路径支持 env 覆盖（默认生产路径；进程级故障注入 drill 用隔离目录，不污染生产）。"""
+    v = os.environ.get(env_key)
+    return Path(v) if v else default
+
+SIGNAL_ACTIVE  = _p("SIGNAL_ACTIVE",  ROOT / "signal_active")
+SIGNAL_DONE    = _p("SIGNAL_DONE",    ROOT / "signal_done")
+HEARTBEAT_FILE = _p("HEARTBEAT_FILE", ROOT / "live" / "heartbeat" / "executor_last_run.txt")
+TRADE_LOG      = _p("TRADE_LOG",      ROOT / "live" / "trade_log.jsonl")
+LOCK_FILE      = _p("LOCK_FILE",      ROOT / "live" / "executor.lock")
+CURSOR_FILE    = _p("CURSOR_FILE",    ROOT / "live" / "state" / "executor_cursor.txt")
 
 # btc-ml 本地采集 DB（§20.3）—— executor 直读取行情
 OHLCV_DB = Path(os.environ.get(
