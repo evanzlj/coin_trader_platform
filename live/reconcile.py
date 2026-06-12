@@ -130,6 +130,17 @@ def _flag_manual(pb: dict, result: str, symbol: str) -> str:
     return "manual"
 
 
+def _within_opening_grace(ex: dict) -> bool:
+    """OPENING 是否在 opening_at 起的 grace 窗口内（缺 opening_at → 保守视为窗口内，§22）。"""
+    opening_at = ex.get("opening_at")
+    if not opening_at:
+        return True
+    try:
+        return (pd.Timestamp.now("UTC") - pd.Timestamp(opening_at)).total_seconds() < cfg.OPENING_GRACE_SECONDS
+    except Exception:
+        return True
+
+
 def _recover_opening(engine, symbol: str, pb: dict) -> None:
     """OPENING 恢复包装：**永不抛**——任何未预期异常（get_symbol_spec/round 抖等）→ 保持 OPENING，
     下 tick 重试，绝不打崩 startup/tick/periodic（§22 不变量3）。"""
@@ -187,33 +198,32 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
             notify.feishu_alert(f"OPENING adopt naked, recovering ({symbol}): {e}")
         return
 
-    # 无持仓
+    # 无持仓 —— 统一规则（§22）：grace 内一律保持 OPENING（订单/仓位都可能尚未同步，不靠一次查询判终态）；
+    # 只有「交易所明确返回失败终态」或「超 grace + 有证据」才终态化。
     if od_unknown:
-        return                                          # 查单 API 异常 → 保持 OPENING（不臆测）
+        return                                          # 查单 UNKNOWN → 保持 OPENING
+
+    # 例外：交易所明确返回失败终态（订单确实存在且死了，非同步延迟）→ 立即作废
+    if od is not None and od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
+        pb["status"] = PBStatus.DONE_CANCELLED.value
+        pb["result"] = "opening_aborted"
+        notify.feishu_alert(f"OPENING aborted, entry order dead ({symbol} {ex.get('account')})")
+        return
+
+    # 其余（od FILLED 可能已平 / od None 可能没下成 / od NEW 未落实）grace 内都可能"尚未同步" → 保持 OPENING
+    if _within_opening_grace(ex):
+        return                                          # grace 内 → 保持 OPENING，下 tick 再查
+
+    # 超 grace 仍无仓 → 按证据终态化
     if od is not None and od.state == OrderState.FILLED:
-        # entry 成交但当前查不到仓 → 可能是仓位最终一致性窗口（订单先于仓位可见）。
-        # grace 内保持 OPENING 等下 tick 再查；只有超过 grace 仍无仓才认已平退出（§22 P0：不靠一次查询判终态）。
-        opening_at = ex.get("opening_at")
-        within_grace = True                             # 缺 opening_at → 保守保持 OPENING（不误判孤儿）
-        if opening_at:
-            try:
-                age = (pd.Timestamp.now("UTC") - pd.Timestamp(opening_at)).total_seconds()
-                within_grace = age < cfg.OPENING_GRACE_SECONDS
-            except Exception:
-                within_grace = True
-        if within_grace:
-            return                                      # 保持 OPENING（仓位可能还没同步），下 tick 再查
-        pb["status"] = PBStatus.DONE_UNKNOWN.value
+        pb["status"] = PBStatus.DONE_UNKNOWN.value      # 开过仓但已平退出（无敞口）
         pb["result"] = "opening_filled_then_flat"
         notify.feishu_alert(f"OPENING filled then flat after grace ({symbol} {ex.get('account')})")
         return
-    if od is None or od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
-        # entry 单不存在 / 明确失败（撤/拒/过期）+ 无仓 → 没开成，作废（明确失败，不永久占 slot §22）
-        pb["status"] = PBStatus.DONE_CANCELLED.value
-        pb["result"] = "opening_aborted"
-        notify.feishu_alert(f"OPENING aborted, entry dead/absent + no position ({symbol} {ex.get('account')})")
-        return
-    # od 存在但未成交（NEW）+ 无仓 → 保持 OPENING（下 tick 再看）
+    pb["status"] = PBStatus.DONE_CANCELLED.value        # od None/NEW + 超 grace → 没开成
+    pb["result"] = "opening_aborted"
+    notify.feishu_alert(f"OPENING aborted, no position/order after grace ({symbol} {ex.get('account')})")
+    return
 
 
 def startup_reconcile(engine) -> None:

@@ -1006,8 +1006,8 @@ btc-ml（新加坡）:
 | **任意 `get_order` 调用** | 正常状态 | 订单不存在 → None | adapter 抛（OKX `_inst_meta` / public API 抖）→ `safe_get_order` 归一 UNKNOWN，**绝不打崩 startup/reconcile**（统一 wrapper）|
 | `market_open` Fill/avgPrice | price>0 → 接受 entry | — | price≤0 / 量未知 → 查 position 补；补不出 → 抛（保持 OPENING）|
 | `_enter` open_position 抛 | — | — | 不判死 → `_recover_opening`（查交易所实际）|
-| `_recover_opening` get_position | 有仓 **且 entry_price>0** → adopt 补 SL/TP | 无仓 + entry CANCELED/REJECTED/EXPIRED/不存在 → `opening_aborted` | get_position 抛 / 有仓但 **entry_price≤0** → 用 entry 单 avg_price 补，补不出保持 `OPENING` |
-| `_recover_opening` 无仓 + entry FILLED | 超 grace 仍无仓 → 已平 `DONE_UNKNOWN` | — | **grace 内 → 保持 `OPENING`**（仓位最终一致性窗口，订单先于仓位可见）；entry NEW → 保持 |
+| `_recover_opening` 有持仓 | entry_price>0 → adopt 补 SL/TP | — | entry_price≤0 → 用 od avg 补/保持；get_position 抛 → 保持；adopt 查 SL UNKNOWN → 保持 |
+| `_recover_opening` 无持仓（**统一 grace 门槛**）| 超 grace+FILLED → 已平 `DONE_UNKNOWN`；超 grace+无单/NEW → `opening_aborted` | entry CANCELED/REJECTED/EXPIRED → **立即** `opening_aborted`（交易所确认死单，非同步延迟）| **grace 内一律保持 `OPENING`**（od None/FILLED/NEW 都可能尚未同步，不逐个 od 判，统一过 grace）；od UNKNOWN → 保持 |
 | adopt 补 SL | 挂上 → ACTIVATED | place 失败 → 平退出 `DONE_UNKNOWN` / 平不掉 → `recovering` | **查询 UNKNOWN → `AdoptUnknownError` → 保持 OPENING**（不重复挂、不平退出）|
 | manage get_order(TP) | FILLED → 推进 | NEW → 等 | UNKNOWN → 本轮跳过不臆测 |
 | manage SL/BE 触发判定 | — | pos None+TP未成交 → DONE_SL/BE | get_position 抛 → tick per-pb catch，保持 |

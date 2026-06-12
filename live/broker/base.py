@@ -13,6 +13,7 @@ TP / SL 这类减仓单：与持仓同 pos_side、相反 side（由 adapter 内�
 """
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -121,7 +122,9 @@ def safe_get_order(broker: "Broker", symbol: str,
     归一为 UNKNOWN，**绝不抛**（§22 不变量3：查询异常只能保持态，不打崩流程）。"""
     try:
         return broker.get_order(symbol, order_id=order_id, client_id=client_id)
-    except Exception:
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "safe_get_order %s id=%s cid=%s → UNKNOWN: %s", symbol, order_id, client_id, e)
         return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
 
 

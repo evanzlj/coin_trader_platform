@@ -327,10 +327,22 @@ class TestReconcile(unittest.TestCase):
         eng = ExecutorEngine(None, {"a": b}, [])
         pb = {"hypothesis": "X", "status": "OPENING",
               "exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base", "direction": "short",
+                       "opening_at": "2020-01-01T00:00:00+00:00",          # grace 外
                        "invalidation": {"level": 73000, "dir": "above"}}}
         _recover_opening(eng, "BTC/USDT", pb)
         self.assertEqual(pb["status"], "DONE_CANCELLED")
         self.assertEqual(pb["result"], "opening_aborted")
+
+    def test_recover_opening_order_none_within_grace_holds(self):
+        # 订单与仓位都暂时不可见 + grace 内 → 保持 OPENING（统一 grace 门槛，§22 P0）
+        from live.reconcile import _recover_opening
+        import pandas as pd
+        b = MockBroker(spec=SPEC)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        pb["exec"]["opening_at"] = pd.Timestamp.now("UTC").isoformat()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")
 
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
