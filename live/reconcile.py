@@ -172,13 +172,13 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
         pb["result"] = "opening_filled_then_flat"
         notify.feishu_alert(f"OPENING filled then flat ({symbol} {ex.get('account')})")
         return
-    if od is None:
-        # 无仓且订单明确不存在 → 没开成，作废
+    if od is None or od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
+        # entry 单不存在 / 明确失败（撤/拒/过期）+ 无仓 → 没开成，作废（明确失败，不永久占 slot §22）
         pb["status"] = PBStatus.DONE_CANCELLED.value
         pb["result"] = "opening_aborted"
-        notify.feishu_alert(f"OPENING aborted, no position/order ({symbol} {ex.get('account')})")
+        notify.feishu_alert(f"OPENING aborted, entry dead/absent + no position ({symbol} {ex.get('account')})")
         return
-    # od 存在但未成交（NEW）+ 无仓 → 保持 OPENING
+    # od 存在但未成交（NEW）+ 无仓 → 保持 OPENING（下 tick 再看）
 
 
 def startup_reconcile(engine) -> None:

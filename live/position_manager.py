@@ -55,6 +55,17 @@ def open_position(broker: Broker, symbol: str, pb: dict, entry_estimate: float,
     qty = fill.qty                                   # 以实际成交为准（含部分成交）
     if qty <= 0:
         raise RuntimeError("market_open filled 0 qty")
+    if entry <= 0:
+        # 成交价未知（UNKNOWN：查询失败返回 price=0）→ 查持仓补足；补不出 → 抛（保持 OPENING，不接受 price=0 §22）
+        try:
+            pos = broker.get_position(symbol, ps)
+        except Exception:
+            pos = None
+        if pos is not None and pos.entry_price > 0:
+            entry = pos.entry_price
+            qty = pos.qty or qty
+        else:
+            raise RuntimeError("market_open entry price unknown (price<=0), hold for recovery")
 
     sl_price = broker.round_price(symbol, compute_sl_price(symbol, direction, pb["invalidation"]["level"]))
     # ── 不允许裸仓：SL 挂不上 → 立即平退出 ──

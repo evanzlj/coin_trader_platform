@@ -349,6 +349,17 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(pb["status"], "DONE_UNKNOWN")
         self.assertEqual(pb["result"], "opening_filled_then_flat")
 
+    def test_recover_opening_entry_dead_aborts(self):
+        # 无仓 + entry 单 CANCELED/REJECTED/EXPIRED → 作废（明确失败，不永久占 slot §22 P1）
+        from live.reconcile import _recover_opening
+        for st in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
+            b = MockBroker(spec=SPEC)
+            b.orders["base_E"] = OrderStatus("base_E", "base_E", st, 0, 0)
+            eng = ExecutorEngine(None, {"a": b}, [])
+            pb = self._opening_pb()
+            _recover_opening(eng, "BTC/USDT", pb)
+            self.assertEqual(pb["status"], "DONE_CANCELLED", str(st))
+
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
@@ -495,6 +506,12 @@ class TestFaultInjection(unittest.TestCase):
         with self.assertRaises(Exception):
             open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
         self.assertIsNone(b.get_position("BTC/USDT", PosSide.SHORT))
+
+    def test_open_position_zero_price_raises(self):
+        # market_open 成交价未知(price<=0)且持仓 entry 也未知 → 抛（保持 OPENING，不接受 price=0 §22 P1）
+        b = MockBroker(spec=SPEC, fill_price=0.0)
+        with self.assertRaises(Exception):
+            open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
 
     def test_get_order_unknown_no_premature_done(self):
         # TP 查单 UNKNOWN（API 异常）+ 持仓没了 → 不臆测 DONE_SL，本轮跳过（§19 P0-6）
