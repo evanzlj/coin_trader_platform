@@ -712,6 +712,45 @@ class TestFaultInjection(unittest.TestCase):
             self.assertEqual(r, expected,
                              f"tp1={tp1_state} pos={has_pos} unknown={fail_order} ref={ref}")
 
+    def test_manage_tp1hit_decision_table(self):
+        """manage TP1_HIT 的 (tp2 状态 × 有无仓 × ref 到价) 决策穷举（对称 ACTIVATED，§22 封闭）。"""
+        def setup(tp2_state, has_pos, fail_order=False):
+            b = MockBroker(spec=SPEC, fill_price=72700)
+            pb = self._pb()
+            ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+            pb["exec"] = ex; pb["status"] = "ACTIVATED"
+            b.fill_order(ex["tp1_order_id"])                  # TP1 成交（减半仓）
+            manage_open_position(b, "BTC/USDT", pb)           # → TP1_HIT（移 BE）
+            ex = pb["exec"]
+            oid = ex.get("tp2_order_id")
+            if tp2_state is None:
+                ex["tp2_order_id"] = None
+            elif tp2_state == "FILLED":
+                b.orders[oid].state = OrderState.FILLED
+            elif tp2_state == "dead":
+                b.orders[oid].state = OrderState.CANCELED
+            if not has_pos:
+                b.positions.clear()
+            if fail_order:
+                b.fail_on = {"get_order"}
+            return b, pb
+        # (tp2_state, has_pos, fail_order, ref, 期望) — tp2 level=72000(short 下方，ref<=72000 为到价)
+        cases = [
+            ("FILLED", True,  False, None,  "DONE_TP2"),
+            (None,     True,  False, 71900, "DONE_TP2"),      # 降级到价 → 市价平剩余
+            (None,     True,  False, 72100, None),            # 未到 → 保持
+            ("dead",   True,  False, 71900, "DONE_TP2"),
+            ("NEW",    True,  False, None,  None),            # 保持
+            ("NEW",    False, False, None,  "DONE_BE"),       # 无仓 + TP2 未成交 → BE 触发
+            ("NEW",    True,  True,  None,  None),            # UNKNOWN + 有仓 → 保持
+            ("NEW",    False, True,  None,  "DONE_UNKNOWN"),  # UNKNOWN + 无仓 → 无敞口终态
+        ]
+        for tp2_state, has_pos, fail_order, ref, expected in cases:
+            b, pb = setup(tp2_state, has_pos, fail_order)
+            r = manage_open_position(b, "BTC/USDT", pb, ref_price=ref)
+            self.assertEqual(r, expected,
+                             f"tp2={tp2_state} pos={has_pos} unknown={fail_order} ref={ref}")
+
     def test_tp1_degraded_market_close(self):
         # TP1 挂单缺失 + 价格到 tp1 → 市价平半仓 + 移 BE（§20 降级闭环）
         b = MockBroker(spec=SPEC, fill_price=72700)
