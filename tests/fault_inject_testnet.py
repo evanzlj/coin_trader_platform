@@ -292,6 +292,51 @@ def scenario_market_open_timeout_recovers(brokers, accts):
     return ok
 
 
+class _AllThrowBroker:
+    """包装：get_position / get_order 全抛（模拟断网 / API 全挂）。"""
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_position(self, *a, **k):
+        raise RuntimeError("injected network down (get_position)")
+
+    def get_order(self, *a, **k):
+        raise RuntimeError("injected network down (get_order)")
+
+
+def scenario_network_down_no_crash(brokers, accts):
+    """⑧ 断网/API 全挂 → reconcile/recover 不崩、不臆测终态，保持态等恢复（§22 不变量3）。纯状态，不下单。"""
+    label, broker = _binance_broker(brokers)
+    sym = "BTC/USDT"
+    base = f"fi8{int(time.time()) % 1000000}"
+    fb = _AllThrowBroker(broker)
+    eng = ExecutorEngine(None, {label: fb}, accts)
+
+    pb_act = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED",
+              "exec": {"account": label, "pos_side": "SHORT", "client_id_base": base,
+                       "sl_order_id": "x", "tp1_order_id": "y", "tp2_order_id": "z",
+                       "qty": 0.002, "sl_price": 63000.0}}
+    r1 = reconcile.reconcile_position(fb, sym, pb_act)
+    act_ok = r1 == "ok" and pb_act["status"] == "ACTIVATED"
+
+    pb_open = {"hypothesis": "X", "direction": "short", "status": "OPENING",
+               "exec": {"account": label, "pos_side": "SHORT", "client_id_base": base, "direction": "short",
+                        "opening_at": pd.Timestamp.now("UTC").isoformat(),
+                        "invalidation": {"level": 63000.0, "dir": "above"}}}
+    reconcile._recover_opening(eng, sym, pb_open)
+    open_ok = pb_open["status"] == "OPENING"
+
+    print("  inject: network down (all get_* throw)")
+    print(f"  ACTIVATED reconcile → {r1}/{pb_act['status']} (held={act_ok})")
+    print(f"  OPENING recover → {pb_open['status']} (held={open_ok})")
+    ok = act_ok and open_ok
+    print(f"  RESULT: {'✓ no crash, held state (no false terminal)' if ok else '✗ FAILED'}")
+    return ok
+
+
 def scenario_crash_tp1hit_be_removed(brokers, accts):
     """⑦ 崩溃在 TP1_HIT（半仓 + BE 单）+ BE 被撤 → reconcile 补挂 BE（§19/§22）。"""
     label, broker = _binance_broker(brokers)
@@ -331,6 +376,7 @@ SCENARIOS = {
     "drain_unknown_then_retry": scenario_drain_unknown_then_retry,
     "position_lag_grace": scenario_position_lag_grace,
     "crash_tp1hit_be_removed": scenario_crash_tp1hit_be_removed,
+    "network_down_no_crash": scenario_network_down_no_crash,
 }
 
 
