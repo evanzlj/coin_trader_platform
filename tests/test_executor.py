@@ -345,9 +345,26 @@ class TestReconcile(unittest.TestCase):
         b.orders["base_E"] = OrderStatus("base_E", "base_E", OrderState.FILLED, 0.027, 72700)
         eng = ExecutorEngine(None, {"a": b}, [])
         pb = self._opening_pb()
+        pb["exec"]["opening_at"] = "2020-01-01T00:00:00+00:00"   # grace 外 → 认已平
         _recover_opening(eng, "BTC/USDT", pb)
         self.assertEqual(pb["status"], "DONE_UNKNOWN")
         self.assertEqual(pb["result"], "opening_filled_then_flat")
+
+    def test_recover_opening_filled_no_pos_grace_then_adopt(self):
+        # 仓位最终一致性窗口：FILLED+暂无仓(grace内)→ 保持 OPENING；下次仓位出现 → adopt（§22 P0）
+        from live.reconcile import _recover_opening
+        import pandas as pd
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        b.orders["base_E"] = OrderStatus("base_E", "base_E", OrderState.FILLED, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        pb["exec"]["opening_at"] = pd.Timestamp.now("UTC").isoformat()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")            # grace 内保持，不判死
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "ACTIVATED")          # 仓位出现 → 接管补 SL
+        self.assertTrue(pb["exec"].get("adopted"))
 
     def test_recover_opening_entry_dead_aborts(self):
         # 无仓 + entry 单 CANCELED/REJECTED/EXPIRED → 作废（明确失败，不永久占 slot §22 P1）

@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import logging
 
+import pandas as pd
+
 from live.broker.base import Broker, PosSide, OrderState
 from live.playbook_fsm import PBStatus, TERMINAL
 from live import notify
+from live import exec_config as cfg
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +170,21 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
     if od_unknown:
         return                                          # 查单 API 异常 → 保持 OPENING（不臆测）
     if od is not None and od.state == OrderState.FILLED:
-        # entry 成交过但现在无仓 = 已平退出（无敞口）→ 安全终态
+        # entry 成交但当前查不到仓 → 可能是仓位最终一致性窗口（订单先于仓位可见）。
+        # grace 内保持 OPENING 等下 tick 再查；只有超过 grace 仍无仓才认已平退出（§22 P0：不靠一次查询判终态）。
+        opening_at = ex.get("opening_at")
+        within_grace = True                             # 缺 opening_at → 保守保持 OPENING（不误判孤儿）
+        if opening_at:
+            try:
+                age = (pd.Timestamp.now("UTC") - pd.Timestamp(opening_at)).total_seconds()
+                within_grace = age < cfg.OPENING_GRACE_SECONDS
+            except Exception:
+                within_grace = True
+        if within_grace:
+            return                                      # 保持 OPENING（仓位可能还没同步），下 tick 再查
         pb["status"] = PBStatus.DONE_UNKNOWN.value
         pb["result"] = "opening_filled_then_flat"
-        notify.feishu_alert(f"OPENING filled then flat ({symbol} {ex.get('account')})")
+        notify.feishu_alert(f"OPENING filled then flat after grace ({symbol} {ex.get('account')})")
         return
     if od is None or od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
         # entry 单不存在 / 明确失败（撤/拒/过期）+ 无仓 → 没开成，作废（明确失败，不永久占 slot §22）
