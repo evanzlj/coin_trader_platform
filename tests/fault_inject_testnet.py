@@ -311,7 +311,9 @@ def s_network_down_no_crash(label, broker, accts):
 
 
 def s_cancel_timeout_drains(label, broker, accts):
-    """⑨ #4 撤单超时半成功：drain 时 cancel 抛但实际已撤 → draining；_try_drain 重试见 gone → drained。"""
+    """⑨ #4 撤单超时半成功：drain 时 cancel 抛但实际已撤 → draining；_try_drain 重试见 gone → drained。
+    binance-only：OKX 平仓后自动清关联 algo/limit 单，drain 时无 resting order 可触发 cancel 超时
+    （OKX cancel 契约由 terminal_drains_orders[okx] + _check_cancel sCode-gone 覆盖）。"""
     base = f"fi9{broker.exchange[:1]}{int(time.time()) % 100000}"
     ex = _open_real(broker, base)
     pb = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED", "exec": ex}
@@ -343,7 +345,7 @@ SCENARIOS = {
     "crash_tp1hit_be_removed": (s_crash_tp1hit_be_removed, ("binance", "okx")),
     "market_open_timeout_recovers": (s_market_open_timeout_recovers, ("binance",)),
     "network_down_no_crash": (s_network_down_no_crash, ("binance", "okx")),
-    "cancel_timeout_drains": (s_cancel_timeout_drains, ("binance", "okx")),
+    "cancel_timeout_drains": (s_cancel_timeout_drains, ("binance",)),
 }
 
 
