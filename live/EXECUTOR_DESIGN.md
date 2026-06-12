@@ -1007,7 +1007,7 @@ btc-ml（新加坡）:
 | `market_open` Fill/avgPrice | price>0 → 接受 entry | — | price≤0 / 量未知 → 查 position 补；补不出 → 抛（保持 OPENING）|
 | `_enter` open_position 抛 | — | — | 不判死 → `_recover_opening`（查交易所实际）|
 | `_recover_opening` 有持仓 | entry_price>0 → adopt 补 SL/TP | — | entry_price≤0 → 用 od avg 补/保持；get_position 抛 → 保持；adopt 查 SL UNKNOWN → 保持 |
-| `_recover_opening` 无持仓（**统一 grace 门槛**）| 超 grace+FILLED → 已平 `DONE_UNKNOWN`；超 grace+无单/NEW → `opening_aborted` | entry CANCELED/REJECTED/EXPIRED → **立即** `opening_aborted`（交易所确认死单，非同步延迟）| **grace 内一律保持 `OPENING`**（od None/FILLED/NEW 都可能尚未同步，不逐个 od 判，统一过 grace）；od UNKNOWN → 保持 |
+| `_recover_opening` 无持仓（**grace 门槛 + 成交证据**）| 超 grace + 有成交证据(FILLED 或 dead+filled_qty>0) → 已平 `DONE_UNKNOWN`；超 grace + 无证据 → `opening_aborted` | 死单(CANCELED/REJECTED/EXPIRED) **且 filled_qty=0** → 立即 `opening_aborted` | **grace 内一律保持 `OPENING`**（含 dead+filled>0「有成交但仓位未现」、None/FILLED/NEW）；od UNKNOWN → 保持。判据是「成交证据」非「od 状态」|
 | adopt 补 SL | 挂上 → ACTIVATED | place 失败 → 平退出 `DONE_UNKNOWN` / 平不掉 → `recovering` | **查询 UNKNOWN → `AdoptUnknownError` → 保持 OPENING**（不重复挂、不平退出）|
 | manage get_order(TP) | FILLED → 推进 | NEW → 等 | UNKNOWN → 本轮跳过不臆测 |
 | manage SL/BE 触发判定 | — | pos None+TP未成交 → DONE_SL/BE | get_position 抛 → tick per-pb catch，保持 |

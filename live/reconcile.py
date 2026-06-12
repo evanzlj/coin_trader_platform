@@ -198,29 +198,32 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
             notify.feishu_alert(f"OPENING adopt naked, recovering ({symbol}): {e}")
         return
 
-    # 无持仓 —— 统一规则（§22）：grace 内一律保持 OPENING（订单/仓位都可能尚未同步，不靠一次查询判终态）；
-    # 只有「交易所明确返回失败终态」或「超 grace + 有证据」才终态化。
+    # 无持仓 —— 统一规则（§22）：grace 内一律保持；只有「死单 **且零成交**」立即作废；超 grace 才按
+    # 「是否有成交证据」终态化。关键维度 filled_qty：dead state（撤/拒/过期）也可能带已成交量。
     if od_unknown:
         return                                          # 查单 UNKNOWN → 保持 OPENING
 
-    # 例外：交易所明确返回失败终态（订单确实存在且死了，非同步延迟）→ 立即作废
-    if od is not None and od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED):
+    fill_evidence = od is not None and (od.state == OrderState.FILLED or (od.filled_qty or 0) > 0)
+
+    # 例外：交易所确认死单（撤/拒/过期）**且零成交** → 明确没开成，立即作废（非同步延迟）
+    if (od is not None and od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED)
+            and not fill_evidence):
         pb["status"] = PBStatus.DONE_CANCELLED.value
         pb["result"] = "opening_aborted"
-        notify.feishu_alert(f"OPENING aborted, entry order dead ({symbol} {ex.get('account')})")
+        notify.feishu_alert(f"OPENING aborted, entry dead+zero-fill ({symbol} {ex.get('account')})")
         return
 
-    # 其余（od FILLED 可能已平 / od None 可能没下成 / od NEW 未落实）grace 内都可能"尚未同步" → 保持 OPENING
+    # 其余（含 dead+filled>0「有成交但仓位未现」/ FILLED / None / NEW）grace 内都可能尚未同步 → 保持 OPENING
     if _within_opening_grace(ex):
-        return                                          # grace 内 → 保持 OPENING，下 tick 再查
+        return
 
-    # 超 grace 仍无仓 → 按证据终态化
-    if od is not None and od.state == OrderState.FILLED:
-        pb["status"] = PBStatus.DONE_UNKNOWN.value      # 开过仓但已平退出（无敞口）
+    # 超 grace 仍无仓 → 有成交证据→已平 `DONE_UNKNOWN`；无证据→没开成 `opening_aborted`
+    if fill_evidence:
+        pb["status"] = PBStatus.DONE_UNKNOWN.value
         pb["result"] = "opening_filled_then_flat"
         notify.feishu_alert(f"OPENING filled then flat after grace ({symbol} {ex.get('account')})")
         return
-    pb["status"] = PBStatus.DONE_CANCELLED.value        # od None/NEW + 超 grace → 没开成
+    pb["status"] = PBStatus.DONE_CANCELLED.value
     pb["result"] = "opening_aborted"
     notify.feishu_alert(f"OPENING aborted, no position/order after grace ({symbol} {ex.get('account')})")
     return

@@ -351,37 +351,42 @@ class TestReconcile(unittest.TestCase):
         from live.reconcile import _recover_opening
         now, old = pd.Timestamp.now("UTC").isoformat(), "2020-01-01T00:00:00+00:00"
         HASPOS = (0.027, 72700)                          # 有仓 entry>0
-        # (od_state, 有无仓, opening_at, 期望 status)
+        # (od_state, 有无仓, opening_at, od_filled_qty, 期望 status)
         cases = [
-            # 有持仓 entry>0 → adopt（不看 grace/od）
-            (OrderState.FILLED, HASPOS, now, "ACTIVATED"),
-            (OrderState.FILLED, HASPOS, old, "ACTIVATED"),
-            (None,              HASPOS, now, "ACTIVATED"),
-            # 无持仓 + 交易所确认死单 → 立即作废（不看 grace）
-            (OrderState.CANCELED, None, now, "DONE_CANCELLED"),
-            (OrderState.REJECTED, None, now, "DONE_CANCELLED"),
-            (OrderState.EXPIRED,  None, now, "DONE_CANCELLED"),
-            # 无持仓 + grace 内 → 一律保持 OPENING（不管 od）
-            (OrderState.FILLED, None, now, "OPENING"),
-            (None,              None, now, "OPENING"),
-            (OrderState.NEW,    None, now, "OPENING"),
-            # 无持仓 + grace 外 → 按证据终态化
-            (OrderState.FILLED, None, old, "DONE_UNKNOWN"),     # 开过已平
-            (None,              None, old, "DONE_CANCELLED"),   # 没开成
-            (OrderState.NEW,    None, old, "DONE_CANCELLED"),   # 未落实
+            # 有持仓 entry>0 → adopt（不看 grace/od/fill）
+            (OrderState.FILLED, HASPOS, now, 0.027, "ACTIVATED"),
+            (OrderState.FILLED, HASPOS, old, 0.027, "ACTIVATED"),
+            (None,              HASPOS, now, 0.0,   "ACTIVATED"),
+            # 无持仓 + 死单 + **零成交** → 立即作废
+            (OrderState.CANCELED, None, now, 0.0, "DONE_CANCELLED"),
+            (OrderState.REJECTED, None, now, 0.0, "DONE_CANCELLED"),
+            (OrderState.EXPIRED,  None, now, 0.0, "DONE_CANCELLED"),
+            # 无持仓 + 死单 + **有成交(filled>0)** → 有成交证据，grace 内保持（关键新增维度）
+            (OrderState.CANCELED, None, now, 0.01, "OPENING"),
+            (OrderState.EXPIRED,  None, now, 0.01, "OPENING"),
+            # 死单 + 有成交 + 超 grace → 已平 DONE_UNKNOWN（不是 aborted）
+            (OrderState.CANCELED, None, old, 0.01, "DONE_UNKNOWN"),
+            # 无持仓 + grace 内 → 一律保持（任何 od）
+            (OrderState.FILLED, None, now, 0.027, "OPENING"),
+            (None,              None, now, 0.0,   "OPENING"),
+            (OrderState.NEW,    None, now, 0.0,   "OPENING"),
+            # 无持仓 + grace 外 → 按成交证据终态化
+            (OrderState.FILLED, None, old, 0.027, "DONE_UNKNOWN"),   # 有成交→已平
+            (None,              None, old, 0.0,   "DONE_CANCELLED"), # 无单→没开成
+            (OrderState.NEW,    None, old, 0.0,   "DONE_CANCELLED"), # 未落实
         ]
-        for od_state, pos, oat, expected in cases:
+        for od_state, pos, oat, fq, expected in cases:
             b = MockBroker(spec=SPEC, fill_price=72700)
             if pos:
                 b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, pos[0], pos[1])
             if od_state is not None:
-                b.orders["base_E"] = OrderStatus("base_E", "base_E", od_state, 0.027, 72700)
+                b.orders["base_E"] = OrderStatus("base_E", "base_E", od_state, fq, 72700)
             eng = ExecutorEngine(None, {"a": b}, [])
             pb = self._opening_pb()
             pb["exec"]["opening_at"] = oat
             _recover_opening(eng, "BTC/USDT", pb)
             self.assertEqual(pb["status"], expected,
-                             f"od={od_state} haspos={bool(pos)} grace={'in' if oat == now else 'out'}")
+                             f"od={od_state} haspos={bool(pos)} fq={fq} grace={'in' if oat == now else 'out'}")
 
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
