@@ -998,6 +998,7 @@ btc-ml（新加坡）:
 4. **`OPENING` 是真实 slot 占用**，不是临时状态（slot_pool 计入；恢复完成前不释放）。
 5. **有仓但无 SL → 唯一闭环：补 SL；补不上就平；平不掉就 `recovering`**（每 tick 重试）。绝不留无保护仓、绝不靠人工（API-only 账户无人工出口）。
 6. **终态归档前必须确认没有未接管敞口**（reconcile 通过，或 `_recover_opening` 判明）。
+7. **`get_position` 成功返回的「无持仓」是最强证据**：无敞口优先于任何订单查询不确定 —— 有仓才等查清（UNKNOWN 保持），无仓直接诚实终态（`DONE_UNKNOWN`），不傻等 reconcile。
 
 ### 22.2 外部副作用点 × 三态 × 处理（状态转移表）
 
@@ -1009,7 +1010,7 @@ btc-ml（新加坡）:
 | `_recover_opening` 有持仓 | entry_price>0 → adopt 补 SL/TP | — | entry_price≤0 → 用 od avg 补/保持；get_position 抛 → 保持；adopt 查 SL UNKNOWN → 保持 |
 | `_recover_opening` 无持仓（**grace 门槛 + 成交证据**）| 超 grace + 有成交证据(FILLED 或 dead+filled_qty>0) → 已平 `DONE_UNKNOWN`；超 grace + 无证据 → `opening_aborted` | 死单(CANCELED/REJECTED/EXPIRED) **且 filled_qty=0** → 立即 `opening_aborted` | **grace 内一律保持 `OPENING`**（含 dead+filled>0「有成交但仓位未现」、None/FILLED/NEW）；od UNKNOWN → 保持。判据是「成交证据」非「od 状态」|
 | adopt 补 SL | 挂上 → ACTIVATED | place 失败 → 平退出 `DONE_UNKNOWN` / 平不掉 → `recovering` | **查询 UNKNOWN → `AdoptUnknownError` → 保持 OPENING**（不重复挂、不平退出）|
-| manage get_order(TP) | FILLED → 推进 | NEW → 等 | UNKNOWN → 本轮跳过不臆测 |
+| manage get_order(TP) | FILLED/降级到价 → 推进 | NEW → 等 | **UNKNOWN+有仓 → 保持；UNKNOWN+无仓 → `DONE_UNKNOWN`（无敞口优先，不傻等）** |
 | manage SL/BE 触发判定 | — | pos None+TP未成交 → DONE_SL/BE | get_position 抛 → tick per-pb catch，保持 |
 | reconcile_position get_position | 有仓 → 查/补 SL | 无仓+订单解释 → resolved | 抛 → 保持状态(ok)，下轮重试 |
 | reconcile SL 补挂 | 挂上 → ok | — | 补不上→平退出；平不掉→`recovering` |

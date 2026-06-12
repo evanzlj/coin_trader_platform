@@ -200,7 +200,14 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
         if ex.get("tp1_order_id"):
             tp1 = safe_get_order(broker, symbol, ex["tp1_order_id"])
             if tp1 and tp1.state == OrderState.UNKNOWN:
-                return None                                            # 查单异常，本轮不臆测（§19）
+                if pos is not None:
+                    return None                                        # 有仓 + 查询 UNKNOWN → 保持，等查清（§19）
+                # 无仓（get_position 可信）→ 无敞口优先于查询不确定 → 诚实终态，不臆测 SL/TP（§22）
+                _cancel(broker, symbol, ex.get("tp1_order_id"))
+                _cancel(broker, symbol, ex.get("tp2_order_id"))
+                pb["status"] = PBStatus.DONE_UNKNOWN.value
+                pb["result"] = "exit_unknown"
+                return pb["status"]
             if tp1 and tp1.state == OrderState.FILLED:
                 tp1_done = True
             elif tp1 is None or tp1.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
@@ -244,7 +251,13 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
         if ex.get("tp2_order_id"):
             tp2 = safe_get_order(broker, symbol, ex["tp2_order_id"])
             if tp2 and tp2.state == OrderState.UNKNOWN:
-                return None                                            # 查单异常，本轮不臆测（§19）
+                if pos is not None:
+                    return None                                        # 有仓 + 查询 UNKNOWN → 保持（§19）
+                # 无仓 → 无敞口优先于查询不确定 → 诚实终态（§22）
+                _cancel(broker, symbol, ex.get("tp2_order_id"))
+                pb["status"] = PBStatus.DONE_UNKNOWN.value
+                pb["result"] = "exit_unknown"
+                return pb["status"]
             if tp2 and tp2.state == OrderState.FILLED:
                 tp2_done = True
             elif tp2 is None or tp2.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):

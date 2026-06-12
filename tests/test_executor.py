@@ -651,17 +651,66 @@ class TestFaultInjection(unittest.TestCase):
         with self.assertRaises(Exception):
             open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
 
-    def test_get_order_unknown_no_premature_done(self):
-        # TP 查单 UNKNOWN（API 异常）+ 持仓没了 → 不臆测 DONE_SL，本轮跳过（§19 P0-6）
+    def test_get_order_unknown_with_position_holds(self):
+        # TP 查单 UNKNOWN + 有持仓 → 保持 ACTIVATED（有敞口，等查清，不臆测 §19）
         b = MockBroker(spec=SPEC, fill_price=72700)
         pb = self._pb()
         ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
         pb["exec"] = ex; pb["status"] = "ACTIVATED"
-        b.fail_on = {"get_order"}        # 查单返回 UNKNOWN
-        b.positions.clear()              # 持仓查不到
+        b.fail_on = {"get_order"}
         r = manage_open_position(b, "BTC/USDT", pb)
         self.assertIsNone(r)
-        self.assertEqual(pb["status"], "ACTIVATED")   # 没误判 DONE_SL
+        self.assertEqual(pb["status"], "ACTIVATED")
+
+    def test_get_order_unknown_no_position_done_unknown(self):
+        # TP 查单 UNKNOWN + 无持仓 → 无敞口优先，DONE_UNKNOWN（不臆测 DONE_SL，也不傻等 reconcile §22）
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        b.fail_on = {"get_order"}
+        b.positions.clear()
+        r = manage_open_position(b, "BTC/USDT", pb)
+        self.assertEqual(r, "DONE_UNKNOWN")
+        self.assertEqual(pb["result"], "exit_unknown")
+
+    def test_manage_activated_decision_table(self):
+        """manage ACTIVATED 的 (tp1 状态 × 有无仓 × ref 到价) 决策穷举（§22 热点封闭）。"""
+        def setup(tp1_state, has_pos, fail_order=False):
+            b = MockBroker(spec=SPEC, fill_price=72700)
+            pb = self._pb()
+            ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+            pb["exec"] = ex; pb["status"] = "ACTIVATED"
+            oid = ex["tp1_order_id"]
+            if tp1_state is None:
+                ex["tp1_order_id"] = None
+            elif tp1_state == "FILLED":
+                b.orders[oid].state = OrderState.FILLED
+            elif tp1_state == "dead":
+                b.orders[oid].state = OrderState.CANCELED
+            # "NEW" 保持 open_position 挂的 NEW
+            if not has_pos:
+                b.positions.clear()
+            if fail_order:
+                b.fail_on = {"get_order"}
+            return b, pb
+        # (tp1_state, has_pos, fail_order, ref_price, 期望)
+        cases = [
+            ("FILLED", True,  False, None,  "TP1_HIT"),        # 半仓止盈 → 移 BE
+            (None,     True,  False, 72300, "TP1_HIT"),        # 降级：无挂单 + 到价 → 市价平
+            (None,     True,  False, 72600, None),             # 降级：未到价 → 保持
+            ("dead",   True,  False, 72300, "TP1_HIT"),        # 死单 + 到价 → 降级平
+            ("dead",   True,  False, 72600, None),             # 死单 + 未到 → 保持
+            ("NEW",    True,  False, None,  None),             # 挂着 + 有仓 → 保持
+            ("NEW",    False, False, None,  "DONE_SL"),        # 无仓 + TP1 未成交 → SL 触发
+            ("NEW",    True,  True,  None,  None),             # UNKNOWN + 有仓 → 保持
+            ("NEW",    False, True,  None,  "DONE_UNKNOWN"),   # UNKNOWN + 无仓 → 无敞口终态
+        ]
+        for tp1_state, has_pos, fail_order, ref, expected in cases:
+            b, pb = setup(tp1_state, has_pos, fail_order)
+            r = manage_open_position(b, "BTC/USDT", pb, ref_price=ref)
+            self.assertEqual(r, expected,
+                             f"tp1={tp1_state} pos={has_pos} unknown={fail_order} ref={ref}")
 
     def test_tp1_degraded_market_close(self):
         # TP1 挂单缺失 + 价格到 tp1 → 市价平半仓 + 移 BE（§20 降级闭环）
