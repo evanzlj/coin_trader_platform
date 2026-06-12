@@ -138,10 +138,23 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
         # 有仓 / entry 已成交 → 接管：补 SL/TP，转 ACTIVATED
         qty = pos.qty if (pos is not None and pos.qty > 0) else od.filled_qty
         entry = pos.entry_price if (pos is not None and pos.qty > 0) else od.avg_price
-        from live.position_manager import adopt_position
-        pb["exec"] = adopt_position(broker, symbol, ex, qty, entry)
-        pb["status"] = PBStatus.ACTIVATED.value
-        notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={qty})")
+        from live.position_manager import adopt_position, SLPlacementError, NakedPositionError
+        try:
+            pb["exec"] = adopt_position(broker, symbol, ex, qty, entry)
+            pb["status"] = PBStatus.ACTIVATED.value
+            notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={qty})")
+        except SLPlacementError as e:
+            # adopt 补 SL 失败但已平退出 → 安全终态
+            pb["status"] = PBStatus.DONE_UNKNOWN.value
+            pb["result"] = "adopt_sl_failed_closed"
+            notify.feishu_alert(f"OPENING adopt SL failed, position closed ({symbol}): {e}")
+        except NakedPositionError as e:
+            # adopt 补 SL 失败且平不掉 → recovering（tick 重试平）
+            ex["recovering"] = True
+            pb["exec"] = ex
+            pb["status"] = PBStatus.ACTIVATED.value
+            pb["result"] = f"adopt_naked_recovering:{e}"
+            notify.feishu_alert(f"OPENING adopt naked, recovering ({symbol}): {e}")
         return
     if od is not None and od.state == OrderState.UNKNOWN:
         return                                          # 查单 API 异常 → 保持 OPENING，下轮再看（不臆测）

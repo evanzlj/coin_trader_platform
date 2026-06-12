@@ -23,7 +23,7 @@ from live import exec_config as cfg
 from live.playbook_fsm import (
     Bar, WaitEvent, step_waiting, compute_sizing, compute_sl_price, validate_levels,
 )
-from live.slot_pool import Occupancy, build_accounts, allocate
+from live.slot_pool import Occupancy, build_accounts, allocate, build_occupancy
 from live.position_manager import (
     open_position, manage_open_position, _cancel, SLPlacementError, NakedPositionError,
 )
@@ -105,9 +105,10 @@ class TestSlot(unittest.TestCase):
         self.assertNotIn("binance_0", landed)
 
     def test_c2_other_symbol_allowed(self):
+        # binance_0 已持 BTC，不同 symbol(ETH) 不被 C2 排除 → 单账户必分到（确定，不依赖随机覆盖）
         occ = Occupancy({"binance_0": [("BTC/USDT", 40)]})
-        landed = {allocate(self.accts, "ETH/USDT", 40, occ) for _ in range(50)}
-        self.assertIn("binance_0", landed)
+        one = [a for a in self.accts if a.label == "binance_0"]
+        self.assertEqual(allocate(one, "ETH/USDT", 40, occ), "binance_0")
 
     def test_c1_margin(self):
         occ = Occupancy({"okx_0": [("BNB/USDT", 70)]})
@@ -117,6 +118,18 @@ class TestSlot(unittest.TestCase):
 
     def test_max_per_account(self):
         occ = Occupancy({"binance_1": [("BTC/USDT", 40), ("ETH/USDT", 40)]})
+        landed = {allocate(self.accts, "SOL/USDT", 40, occ) for _ in range(50)}
+        self.assertNotIn("binance_1", landed)
+
+    def test_opening_occupies_slot(self):
+        # OPENING 也算占用：占满某账户 2 slot → allocate 不再分到它（§18）
+        states = [
+            {"symbol": "BTC/USDT", "playbooks": [{"status": "OPENING",
+             "exec": {"account": "binance_1", "pos_side": "SHORT", "margin": 40}}]},
+            {"symbol": "ETH/USDT", "playbooks": [{"status": "OPENING",
+             "exec": {"account": "binance_1", "pos_side": "SHORT", "margin": 40}}]},
+        ]
+        occ = build_occupancy(states)
         landed = {allocate(self.accts, "SOL/USDT", 40, occ) for _ in range(50)}
         self.assertNotIn("binance_1", landed)
 
@@ -279,6 +292,35 @@ class TestReconcile(unittest.TestCase):
                        "invalidation": {"level": 73000, "dir": "above"}}}
         _recover_opening(eng, "BTC/USDT", pb)
         self.assertEqual(pb["status"], "OPENING")
+
+    def _opening_pb(self):
+        return {"hypothesis": "X", "status": "OPENING",
+                "exec": {"account": "a", "exchange": "mock", "pos_side": "SHORT", "client_id_base": "base",
+                         "direction": "short", "margin": 40, "invalidation": {"level": 73000, "dir": "above"},
+                         "tp1_level": 72400, "tp2_level": 72000}}
+
+    def test_opening_adopt_sl_fail_closes(self):
+        # OPENING 接管时补 SL 失败 → 市价平退出（不留裸仓，§18 P0）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"place_stop_market"})
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertEqual(pb["result"], "adopt_sl_failed_closed")
+        self.assertTrue(any(c[0] == "market_close" for c in b.calls))
+
+    def test_opening_adopt_sl_and_close_fail_recovering(self):
+        # OPENING 接管补 SL 失败 + 平不掉 → recovering（tick 重试，§18/§21）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"place_stop_market", "market_close"})
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "ACTIVATED")
+        self.assertTrue(pb["exec"].get("recovering"))
 
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)

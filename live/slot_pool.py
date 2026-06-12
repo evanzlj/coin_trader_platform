@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from live import exec_config as cfg
 
-ACTIVE_STATUS = {"ACTIVATED", "TP1_HIT"}
+ACTIVE_STATUS = {"OPENING", "ACTIVATED", "TP1_HIT"}   # OPENING 也占 slot（恢复中不被重分配 §18）
 
 
 @dataclass

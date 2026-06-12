@@ -113,6 +113,13 @@ def adopt_position(broker: Broker, symbol: str, intent: dict, qty: float, entry:
     rest = broker.round_qty(symbol, qty - half)
 
     sl_oid = _ensure_protective(broker, symbol, ps, qty, sl_price, f"{base}_S", "stop")
+    if sl_oid is None:
+        # SL 是硬要求：补不上 → 立即市价平退出；平不掉 → 裸仓 recovering（绝不留无保护仓 §18/§16）
+        try:
+            broker.market_close(symbol, ps, qty, f"{base}_ADPSLFC")
+        except Exception as ce:
+            raise NakedPositionError(f"adopt SL failed AND close failed: {ce}")
+        raise SLPlacementError("adopt SL failed, position closed")
     tp1_oid = tp2_oid = None
     tp1 = intent.get("tp1_level")
     if tp1:
