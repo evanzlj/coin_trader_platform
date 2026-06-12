@@ -60,14 +60,18 @@ _CANCEL_GONE = {"51400", "51401", "51402", "51410", "51503"}
 
 def _check_cancel(resp: dict) -> None:
     """严格校验 OKX 撤单返回（§22.5：_drain 依赖 cancel 成功 = 交易所确认撤单）。
-    请求级 code 非0 → 抛；逐条 sCode 非0 且非「订单已不存在」→ 抛，让 drain 知道没撤成功。"""
+    有逐条 data → 看每条 sCode（外层 code 是批量级，单条失败就非0，不能据此判定）；
+    sCode 非0 且非「订单已不存在」(51400 等) → 抛。无 data → 看请求级 code。"""
+    data = resp.get("data") or []
+    if data:
+        for d in data:
+            scode = str(d.get("sCode"))
+            if scode in ("0", "None", "") or scode in _CANCEL_GONE:
+                continue
+            raise RuntimeError(f"okx cancel rejected {scode}: {d.get('sMsg')}")
+        return
     if str(resp.get("code")) not in ("0", "None", ""):
         raise RuntimeError(f"okx cancel error {resp.get('code')}: {resp.get('msg')}")
-    for d in (resp.get("data") or []):
-        scode = str(d.get("sCode"))
-        if scode in ("0", "None", "") or scode in _CANCEL_GONE:
-            continue
-        raise RuntimeError(f"okx cancel rejected {scode}: {d.get('sMsg')}")
 
 
 class OKXBroker(Broker):
