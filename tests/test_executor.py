@@ -441,6 +441,47 @@ class TestReconcile(unittest.TestCase):
         self.assertTrue(eng._try_drain(b, "BTC/USDT", pb))
         self.assertEqual(pb["status"], "DONE_SL")
 
+    def test_recover_opening_drains_deterministic_orphans(self):
+        # 崩在挂单后、exec 写回前 → exec 只有 client_id_base；超 grace 终态前 drain {base}_S/T1/T2（§22.5 P0）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC)
+        for sfx in ("_S", "_T1", "_T2"):                 # 已挂出的 deterministic 保护单（exec 没记 order_id）
+            oid = b._next_oid()
+            b.orders[oid] = OrderStatus(oid, f"base{sfx}", OrderState.NEW, 0, 0)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = {"hypothesis": "X", "status": "OPENING",
+              "exec": {"account": "a", "pos_side": "SHORT", "client_id_base": "base", "direction": "short",
+                       "opening_at": "2020-01-01T00:00:00+00:00",      # grace 外
+                       "invalidation": {"level": 73000, "dir": "above"}}}
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_CANCELLED")
+        self.assertEqual(len([c for c in b.calls if c[0] == "cancel_order"]), 3)  # 3 个孤儿保护单都撤了
+
+    def test_ensure_sl_close_drains_tp(self):
+        # SL 补挂失败 + market_close 成功 → terminalize drain 剩余 TP（§22.5 P0）
+        b = MockBroker(spec=SPEC, fail_on={"place_stop_market"})
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        pb = self._active()
+        ex = pb["exec"]
+        b.orders[ex["sl_order_id"]] = OrderStatus(ex["sl_order_id"], "x", OrderState.CANCELED, 0, 0)  # SL 没了
+        b.orders[ex["tp1_order_id"]] = OrderStatus(ex["tp1_order_id"], "x", OrderState.NEW, 0, 0)
+        b.orders[ex["tp2_order_id"]] = OrderStatus(ex["tp2_order_id"], "x", OrderState.NEW, 0, 0)
+        reconcile_position(b, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertEqual(len([c for c in b.calls if c[0] == "cancel_order"]), 2)  # tp1/tp2 撤
+
+    def test_try_recover_drains_orders(self):
+        # recovering 平仓后 pos None → terminalize drain 剩余订单（§22.5 P0）
+        b = MockBroker(spec=SPEC)                          # 无持仓（已平）
+        pb = self._active()
+        ex = pb["exec"]; ex["recovering"] = True
+        b.orders[ex["tp1_order_id"]] = OrderStatus(ex["tp1_order_id"], "x", OrderState.NEW, 0, 0)
+        b.orders[ex["tp2_order_id"]] = OrderStatus(ex["tp2_order_id"], "x", OrderState.NEW, 0, 0)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        eng._try_recover(b, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertEqual(len([c for c in b.calls if c[0] == "cancel_order"]), 2)
+
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
         from live.reconcile import _recover_opening

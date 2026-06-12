@@ -104,8 +104,8 @@ def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
             notify.feishu_alert(f"reconcile: SL replace FAILED, closing ({symbol}): {e}")
             try:
                 broker.market_close(symbol, ps, qty, f"{ex['client_id_base']}_SLFC")
-                pb["status"] = PBStatus.DONE_UNKNOWN.value
-                pb["result"] = "sl_unplaceable_closed"
+                from live.position_manager import terminalize
+                terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "sl_unplaceable_closed")
                 return True
             except Exception as ce:
                 ex["recovering"] = True
@@ -152,6 +152,7 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
         _flag_manual(pb, "manual_no_broker", symbol)
         return
     ps = PosSide(ex["pos_side"])
+    from live.position_manager import terminalize
     try:
         pos = broker.get_position(symbol, ps)
     except Exception as e:
@@ -180,9 +181,8 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
         except AdoptUnknownError:
             return                                      # 保护单查询 UNKNOWN → 保持 OPENING，下 tick 再 adopt（§22）
         except SLPlacementError as e:
-            pb["status"] = PBStatus.DONE_UNKNOWN.value
-            pb["result"] = "adopt_sl_failed_closed"
             notify.feishu_alert(f"OPENING adopt SL failed, position closed ({symbol}): {e}")
+            terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "adopt_sl_failed_closed")
         except NakedPositionError as e:
             ex["recovering"] = True
             pb["exec"] = ex
@@ -201,9 +201,8 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
     # 例外：交易所确认死单（撤/拒/过期）**且零成交** → 明确没开成，立即作废（非同步延迟）
     if (od is not None and od.state in (OrderState.CANCELED, OrderState.REJECTED, OrderState.EXPIRED)
             and not fill_evidence):
-        pb["status"] = PBStatus.DONE_CANCELLED.value
-        pb["result"] = "opening_aborted"
         notify.feishu_alert(f"OPENING aborted, entry dead+zero-fill ({symbol} {ex.get('account')})")
+        terminalize(broker, symbol, pb, PBStatus.DONE_CANCELLED.value, "opening_aborted")
         return
 
     # 其余（含 dead+filled>0「有成交但仓位未现」/ FILLED / None / NEW）grace 内都可能尚未同步 → 保持 OPENING
@@ -212,13 +211,11 @@ def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
 
     # 超 grace 仍无仓 → 有成交证据→已平 `DONE_UNKNOWN`；无证据→没开成 `opening_aborted`
     if fill_evidence:
-        pb["status"] = PBStatus.DONE_UNKNOWN.value
-        pb["result"] = "opening_filled_then_flat"
         notify.feishu_alert(f"OPENING filled then flat after grace ({symbol} {ex.get('account')})")
+        terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "opening_filled_then_flat")
         return
-    pb["status"] = PBStatus.DONE_CANCELLED.value
-    pb["result"] = "opening_aborted"
     notify.feishu_alert(f"OPENING aborted, no position/order after grace ({symbol} {ex.get('account')})")
+    terminalize(broker, symbol, pb, PBStatus.DONE_CANCELLED.value, "opening_aborted")
     return
 
 

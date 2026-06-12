@@ -127,9 +127,10 @@ class ExecutorEngine:
             notify.feishu_alert(f"recovering: get_position error, retry next tick {symbol}: {e}")
             return False
         if pos is None:
-            pb["status"] = PBStatus.DONE_UNKNOWN.value
-            pb["result"] = "recovered_flat"
+            ex.pop("recovering", None)                  # 平完了，不再 recovering
+            from live.position_manager import terminalize
             notify.feishu_alert(f"recovered (flat): {symbol} {ex.get('account')}")
+            terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "recovered_flat")
             return True
         try:
             broker.market_close(symbol, ps, pos.qty, f"{ex.get('client_id_base', 'rcv')}_RCV")

@@ -285,15 +285,26 @@ def _cancel(broker: Broker, symbol: str, oid: Optional[str], retries: int = 2) -
 
 
 def _drain_orders(broker: Broker, symbol: str, ex: dict) -> bool:
-    """撤本 playbook 所有活跃订单（sl/tp1/tp2）。全部撤掉/已不活跃 → True；有撤不掉/UNKNOWN → False（§22.5）。"""
+    """撤本 playbook 所有活跃订单。除 exec 里的 order_id，还按 deterministic {base}_S/_T1/_T2/_SBE 查
+    （崩溃恢复时 exec 可能只剩 client_id_base，§22.5/§22 七律7）。全撤掉/已不活跃 → True；撤不掉/UNKNOWN → False。"""
     clean = True
+    seen: set = set()
+    candidates: list = []
     for key in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
-        oid = ex.get(key)
-        if not oid:
-            continue
-        o = safe_get_order(broker, symbol, oid)
+        if ex.get(key):
+            candidates.append(("order_id", ex[key]))
+    base = ex.get("client_id_base")
+    if base:
+        for sfx in ("_S", "_T1", "_T2", "_SBE"):        # deterministic 保护单 client id
+            candidates.append(("client_id", f"{base}{sfx}"))
+    for by, ident in candidates:
+        o = safe_get_order(broker, symbol, **{by: ident})
         if o is None:
             continue                                    # 不存在 = 已不活跃
+        oid = o.order_id
+        if oid in seen:
+            continue                                    # 同一单经 order_id/client_id 查到两次
+        seen.add(oid)
         if o.state == OrderState.UNKNOWN:
             clean = False                               # 查不清 → 不能确认已撤
             continue
