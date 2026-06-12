@@ -43,8 +43,7 @@ def _drill_env(tmp: Path) -> dict:
     return env
 
 
-def _build_db(db: Path, P: float):
-    now = pd.Timestamp.now("UTC"); lc = now.floor("15min")
+def _build_db(db: Path, P: float, lc: pd.Timestamp):
     rows = []
     for dm, o, h, l, c in [(-60, 1.002, 1.003, 1.0015, 1.002), (-45, 1.001, 1.002, 0.9995, 1.000),
                            (-30, 1.000, 1.001, 0.998, 0.999), (-15, 0.999, 1.000, 0.996, 0.9965)]:
@@ -60,11 +59,10 @@ def _build_db(db: Path, P: float):
     return lc
 
 
-def _write_signal(active: Path, P: float):
+def _write_signal(active: Path, P: float, lc: pd.Timestamp):
     prim, inval, act = round(P, 1), round(P * 1.003, 1), round(P * 0.997, 1)
     tp1, tp2 = round(P * 0.99, 1), round(P * 0.985, 1)
     r_dist = abs(act - inval) / act * 100
-    now = pd.Timestamp.now("UTC"); lc = now.floor("15min")
     bar_time = (lc + pd.Timedelta(minutes=-60)).isoformat()
     state = {"signal_dir": PKG, "symbol": "BTC/USDT", "overall_status": "WATCHING", "bar_time": bar_time,
              "playbooks": [{"hypothesis": "DOWNSIDE", "direction": "short",
@@ -111,15 +109,23 @@ def main():
     tmp = Path(tempfile.mkdtemp())
     (tmp / "active").mkdir()
     env = _drill_env(tmp)
-    _build_db(tmp / "o.db", P)
-    _write_signal(tmp / "active", P)
+    now0 = pd.Timestamp.now("UTC"); lc = now0.floor("15min")
+    _build_db(tmp / "o.db", P, lc)
     print(f"drill setup: P={P}, isolated env at {tmp}")
 
-    # === 启 executor.py 子进程，等它激活开仓 ===
+    # === 启 executor.py，先等它进入运行态（首个 heartbeat），再在“运行期”写信号 ===
+    # startup_reconcile 会把启动时已存在的 WAITING 包丢弃（restart_discard，§21 #2）；
+    # 信号必须在 executor 运行中由 tick(b) 激活，才不会被启动丢弃。
     print("launching executor.py subprocess #1 ...")
     log1 = open(tmp / "exec1.log", "w")
     p1 = subprocess.Popen([sys.executable, "-m", "live.executor"], env=env, cwd=str(ROOT),
                           stdout=log1, stderr=subprocess.STDOUT)
+    if not _wait(lambda: (tmp / "hb.txt").exists(), timeout=40):
+        p1.kill(); p1.wait()
+        print("DRILL FAIL: executor never heartbeat. exec1.log tail:")
+        print((tmp / "exec1.log").read_text()[-2000:]); return
+    print("  executor running (first heartbeat) → writing signal during runtime")
+    _write_signal(tmp / "active", P, lc)
 
     def _opened():
         st = _read_state(tmp / "active", tmp / "done")
