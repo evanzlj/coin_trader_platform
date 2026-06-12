@@ -148,10 +148,18 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
     od_unknown = od is not None and od.state == OrderState.UNKNOWN
 
     if pos is not None and pos.qty > 0:
-        # 有**实际持仓** → 接管补 SL/TP（用持仓量，不靠 od.filled，避免接管已平掉的仓）
+        # 有**实际持仓** → 接管补 SL/TP（用持仓量，不靠 od.filled，避免接管已平掉的仓）。
+        # entry_price 也可能未同步（UNKNOWN）：用 entry 单 avg_price 补；补不出 → 保持 OPENING，绝不 adopt entry=0（污染 BE §22）。
+        entry = pos.entry_price
+        if entry <= 0:
+            if od is not None and od.state == OrderState.FILLED and od.avg_price > 0:
+                entry = od.avg_price
+            else:
+                logger.warning("recover_opening %s pos visible but entry_price<=0, hold OPENING", symbol)
+                return                                  # entry_price 未同步 → 保持 OPENING，下 tick 再查
         from live.position_manager import adopt_position, SLPlacementError, NakedPositionError
         try:
-            pb["exec"] = adopt_position(broker, symbol, ex, pos.qty, pos.entry_price)
+            pb["exec"] = adopt_position(broker, symbol, ex, pos.qty, entry)
             pb["status"] = PBStatus.ACTIVATED.value
             notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={pos.qty})")
         except SLPlacementError as e:

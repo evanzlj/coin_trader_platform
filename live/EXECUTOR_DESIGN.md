@@ -1005,7 +1005,7 @@ btc-ml（新加坡）:
 |---------|---------|---------|------------------|
 | `market_open` Fill/avgPrice | price>0 → 接受 entry | — | price≤0 / 量未知 → 查 position 补；补不出 → 抛（保持 OPENING）|
 | `_enter` open_position 抛 | — | — | 不判死 → `_recover_opening`（查交易所实际）|
-| `_recover_opening` get_position | 有仓 → adopt 补 SL/TP | 无仓 + entry CANCELED/REJECTED/EXPIRED/不存在 → `opening_aborted` | get_position 抛 → 保持 `OPENING` |
+| `_recover_opening` get_position | 有仓 **且 entry_price>0** → adopt 补 SL/TP | 无仓 + entry CANCELED/REJECTED/EXPIRED/不存在 → `opening_aborted` | get_position 抛 / 有仓但 **entry_price≤0** → 用 entry 单 avg_price 补，补不出保持 `OPENING` |
 | `_recover_opening` 无仓 + entry FILLED | 超 grace 仍无仓 → 已平 `DONE_UNKNOWN` | — | **grace 内 → 保持 `OPENING`**（仓位最终一致性窗口，订单先于仓位可见）；entry NEW → 保持 |
 | adopt 补 SL | 挂上 → ACTIVATED | — | 补不上→平退出 `DONE_UNKNOWN`；平不掉→`recovering` |
 | manage get_order(TP) | FILLED → 推进 | NEW → 等 | UNKNOWN → 本轮跳过不臆测 |

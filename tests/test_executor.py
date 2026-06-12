@@ -366,6 +366,28 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(pb["status"], "ACTIVATED")          # 仓位出现 → 接管补 SL
         self.assertTrue(pb["exec"].get("adopted"))
 
+    def test_recover_opening_pos_zero_entry_holds(self):
+        # 仓位可见但 entry_price 未同步 + entry 单也无均价 → 保持 OPENING，不 adopt entry=0（§22 P1-high）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 0.0)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")
+
+    def test_recover_opening_pos_zero_entry_backfilled(self):
+        # entry_price 未同步但 entry 单 FILLED 有均价 → 用均价补 → adopt
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 0.0)
+        b.orders["base_E"] = OrderStatus("base_E", "base_E", OrderState.FILLED, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "ACTIVATED")
+        self.assertEqual(pb["exec"]["entry_price"], 72700)
+
     def test_recover_opening_entry_dead_aborts(self):
         # 无仓 + entry 单 CANCELED/REJECTED/EXPIRED → 作废（明确失败，不永久占 slot §22 P1）
         from live.reconcile import _recover_opening
