@@ -138,6 +138,21 @@ class ExecutorEngine:
             notify.feishu_alert(f"recovering: market-close STILL failing {symbol}: {e}")
         return False
 
+    def _try_drain(self, broker: Broker, symbol: str, pb: dict) -> bool:
+        """draining（§22.5 Terminal Means Drained）：重试撤本 playbook 所有订单；撤干净 → 置 drain_target 终态。"""
+        from live.position_manager import _drain_orders
+        ex = pb["exec"]
+        if not _drain_orders(broker, symbol, ex):
+            return False                                # 还没撤干净 → 下 tick 再试
+        target = ex.get("drain_target") or PBStatus.DONE_UNKNOWN.value
+        result = ex.get("drain_result") or "drained"
+        for k in ("draining", "drain_target", "drain_result"):
+            ex.pop(k, None)
+        pb["status"] = target
+        pb["result"] = result
+        notify.feishu_alert(f"drained → {target} ({symbol} {ex.get('account')})")
+        return True
+
     # ── 主步骤 ────────────────────────────────────────────────────────────────
 
     def tick(self, now: Optional[pd.Timestamp] = None) -> None:
@@ -158,6 +173,10 @@ class ExecutorEngine:
                     ex0 = pb.get("exec") or {}
                     broker = self.brokers.get(ex0.get("account"))
                     if broker is None:
+                        continue
+                    if ex0.get("draining"):            # 终态前未撤干净 → 每轮重试 drain（§22.5）
+                        if self._try_drain(broker, symbol, pb):
+                            changed = True
                         continue
                     if ex0.get("recovering"):          # 裸仓恢复中：每轮重试平仓（§21）
                         if self._try_recover(broker, symbol, pb):

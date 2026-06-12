@@ -414,6 +414,33 @@ class TestReconcile(unittest.TestCase):
         for status, filled_keys, expected in cases:
             self.assertEqual(run(status, filled_keys), expected, f"{status} filled={filled_keys}")
 
+    def test_reconcile_terminal_drains_orders(self):
+        # reconcile 无持仓终态前撤所有剩余活跃订单（§22.5 P0-2：终态=无仓+无活跃挂单）
+        b = MockBroker(spec=SPEC)                             # 无持仓
+        pb = self._active()
+        ex = pb["exec"]
+        for key in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+            b.orders[ex[key]] = OrderStatus(ex[key], "x", OrderState.NEW, 0, 0)  # 都活着
+        reconcile_position(b, "BTC/USDT", pb)
+        self.assertTrue(pb["status"].startswith("DONE"))
+        self.assertEqual(len([c for c in b.calls if c[0] == "cancel_order"]), 3)  # 3 个活跃单都撤了
+
+    def test_drain_retry_then_terminal(self):
+        # 终态时撤单失败 → draining 保持非终态；恢复后 _try_drain → 撤干净 → 终态（§22.5）
+        from live.position_manager import terminalize
+        b = MockBroker(spec=SPEC, fail_on={"cancel_order"})  # 撤单失败
+        pb = self._active()
+        ex = pb["exec"]
+        for key in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+            b.orders[ex[key]] = OrderStatus(ex[key], "x", OrderState.NEW, 0, 0)
+        terminalize(b, "BTC/USDT", pb, "DONE_SL", "sl")
+        self.assertTrue(ex.get("draining"))
+        self.assertNotEqual(pb["status"], "DONE_SL")         # 没归档
+        b.fail_on = set()                                    # 撤单恢复
+        eng = ExecutorEngine(None, {"a": b}, [])
+        self.assertTrue(eng._try_drain(b, "BTC/USDT", pb))
+        self.assertEqual(pb["status"], "DONE_SL")
+
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
         from live.reconcile import _recover_opening
@@ -708,17 +735,17 @@ class TestFaultInjection(unittest.TestCase):
         self.assertIsNone(r)
         self.assertEqual(pb["status"], "ACTIVATED")
 
-    def test_get_order_unknown_no_position_done_unknown(self):
-        # TP 查单 UNKNOWN + 无持仓 → 无敞口优先，DONE_UNKNOWN（不臆测 DONE_SL，也不傻等 reconcile §22）
+    def test_get_order_unknown_no_position_drains(self):
+        # TP 查单 UNKNOWN + 无持仓：无敞口但订单查不清 → 不能归档，draining 等查清（§22.5 终态守恒 > §22.7 无敞口）
         b = MockBroker(spec=SPEC, fill_price=72700)
         pb = self._pb()
         ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
         pb["exec"] = ex; pb["status"] = "ACTIVATED"
         b.fail_on = {"get_order"}
         b.positions.clear()
-        r = manage_open_position(b, "BTC/USDT", pb)
-        self.assertEqual(r, "DONE_UNKNOWN")
-        self.assertEqual(pb["result"], "exit_unknown")
+        manage_open_position(b, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "ACTIVATED")     # 保持非终态
+        self.assertTrue(pb["exec"].get("draining"))     # 进入 drain 恢复，撤干净才终态
 
     def test_manage_activated_decision_table(self):
         """manage ACTIVATED 的 (tp1 状态 × 有无仓 × ref 到价) 决策穷举（§22 热点封闭）。"""
@@ -750,7 +777,7 @@ class TestFaultInjection(unittest.TestCase):
             ("NEW",    True,  False, None,  None),             # 挂着 + 有仓 → 保持
             ("NEW",    False, False, None,  "DONE_SL"),        # 无仓 + TP1 未成交 → SL 触发
             ("NEW",    True,  True,  None,  None),             # UNKNOWN + 有仓 → 保持
-            ("NEW",    False, True,  None,  "DONE_UNKNOWN"),   # UNKNOWN + 无仓 → 无敞口终态
+            ("NEW",    False, True,  None,  "ACTIVATED"),      # UNKNOWN + 无仓 → 订单查不清，draining 保持（§22.5）
         ]
         for tp1_state, has_pos, fail_order, ref, expected in cases:
             b, pb = setup(tp1_state, has_pos, fail_order)
@@ -789,13 +816,27 @@ class TestFaultInjection(unittest.TestCase):
             ("NEW",    True,  False, None,  None),            # 保持
             ("NEW",    False, False, None,  "DONE_BE"),       # 无仓 + TP2 未成交 → BE 触发
             ("NEW",    True,  True,  None,  None),            # UNKNOWN + 有仓 → 保持
-            ("NEW",    False, True,  None,  "DONE_UNKNOWN"),  # UNKNOWN + 无仓 → 无敞口终态
+            ("NEW",    False, True,  None,  "TP1_HIT"),       # UNKNOWN + 无仓 → 订单查不清，draining 保持（§22.5）
         ]
         for tp2_state, has_pos, fail_order, ref, expected in cases:
             b, pb = setup(tp2_state, has_pos, fail_order)
             r = manage_open_position(b, "BTC/USDT", pb, ref_price=ref)
             self.assertEqual(r, expected,
                              f"tp2={tp2_state} pos={has_pos} unknown={fail_order} ref={ref}")
+
+    def test_tp1_filled_no_position_no_orphan_be(self):
+        # tp1=FILLED + 全仓已无 → 不在空仓挂 BE（孤儿单），drain 撤剩余单后终态（§22.5 P0）
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        pb = self._pb()
+        ex = open_position(b, "BTC/USDT", pb, 72700, "a", 40, "base")
+        pb["exec"] = ex; pb["status"] = "ACTIVATED"
+        b.orders[ex["tp1_order_id"]].state = OrderState.FILLED
+        b.positions.clear()                                   # 全仓没了
+        r = manage_open_position(b, "BTC/USDT", pb)
+        self.assertEqual(r, "DONE_UNKNOWN")
+        self.assertEqual(pb["result"], "tp1_then_flat")
+        self.assertFalse(any("SBE" in str(c) for c in b.calls if c[0] == "place_stop_market"))  # 没挂孤儿 BE
+        self.assertTrue(any(c[0] == "cancel_order" for c in b.calls))                            # drain 撤了剩余单
 
     def test_tp1_degraded_market_close(self):
         # TP1 挂单缺失 + 价格到 tp1 → 市价平半仓 + 移 BE（§20 降级闭环）

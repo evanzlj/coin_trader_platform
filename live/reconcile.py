@@ -57,38 +57,31 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
             return "resolved"                          # 已平退出（status 变了）
         return "ok"
 
-    # 无持仓：宕机期间已被平，按订单成交定真实终态
+    # 无持仓：宕机期间已被平，按订单成交定真实终态。§22.5：终态前必须 drain 所有订单（撤干净才归档）。
+    from live.position_manager import terminalize
+
+    def resolve(target, result):
+        terminalize(broker, symbol, pb, target, result)   # drain 干净→target；撤不掉/查不清→draining（tick 重试）
+        return "resolved"
+
     if status == PBStatus.ACTIVATED.value:
         if filled(ex.get("sl_order_id")):
-            pb["status"] = PBStatus.DONE_SL.value
-            pb["result"] = "sl_reconciled"
-            return "resolved"
+            return resolve(PBStatus.DONE_SL.value, "sl_reconciled")
         if filled(ex.get("tp2_order_id")):
-            pb["status"] = PBStatus.DONE_TP2.value
-            pb["result"] = "tp2_reconciled"
-            return "resolved"
-        # TP1 成交但持仓已空 → BE 段在宕机期发生，无敞口 → 安全终态（§21）
-        if filled(ex.get("tp1_order_id")):
-            pb["status"] = PBStatus.DONE_UNKNOWN.value
-            pb["result"] = "tp1_then_unknown_exit"
+            return resolve(PBStatus.DONE_TP2.value, "tp2_reconciled")
+        if filled(ex.get("tp1_order_id")):         # TP1 成交但持仓已空 → BE 段宕机期发生，无敞口
             notify.feishu_alert(f"reconcile: TP1 filled then closed, unknown exit ({symbol})")
-            return "resolved"
+            return resolve(PBStatus.DONE_UNKNOWN.value, "tp1_then_unknown_exit")
 
     elif status == PBStatus.TP1_HIT.value:
         if filled(ex.get("sl_order_id")):          # 此时 sl_order_id 已是 BE 单
-            pb["status"] = PBStatus.DONE_BE.value
-            pb["result"] = "be_reconciled"
-            return "resolved"
+            return resolve(PBStatus.DONE_BE.value, "be_reconciled")
         if filled(ex.get("tp2_order_id")):
-            pb["status"] = PBStatus.DONE_TP2.value
-            pb["result"] = "tp2_reconciled"
-            return "resolved"
+            return resolve(PBStatus.DONE_TP2.value, "tp2_reconciled")
 
-    # 持仓没了但订单状态也对不上 → 无敞口，安全终态（API-only 账户无人工出口，不挂人工 §21）
-    pb["status"] = PBStatus.DONE_UNKNOWN.value
-    pb["result"] = "no_position_unknown_exit"
+    # 持仓没了但订单状态也对不上 → 无敞口，安全终态（§21/§22.5：drain 后归档）
     notify.feishu_alert(f"reconcile: no position, unknown exit ({symbol} {pb.get('hypothesis')})")
-    return "resolved"
+    return resolve(PBStatus.DONE_UNKNOWN.value, "no_position_unknown_exit")
 
 
 def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:

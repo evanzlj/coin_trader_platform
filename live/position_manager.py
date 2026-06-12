@@ -202,12 +202,8 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
             if tp1 and tp1.state == OrderState.UNKNOWN:
                 if pos is not None:
                     return None                                        # 有仓 + 查询 UNKNOWN → 保持，等查清（§19）
-                # 无仓（get_position 可信）→ 无敞口优先于查询不确定 → 诚实终态，不臆测 SL/TP（§22）
-                _cancel(broker, symbol, ex.get("tp1_order_id"))
-                _cancel(broker, symbol, ex.get("tp2_order_id"))
-                pb["status"] = PBStatus.DONE_UNKNOWN.value
-                pb["result"] = "exit_unknown"
-                return pb["status"]
+                # 无仓（get_position 可信）→ 无敞口优先于查询不确定 → 诚实终态（drain 后归档 §22.5）
+                return terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "exit_unknown")
             if tp1 and tp1.state == OrderState.FILLED:
                 tp1_done = True
             elif tp1 is None or tp1.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
@@ -218,8 +214,10 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
                 tp1_done = True
             except Exception as e:
                 notify.feishu_alert(f"TP1 degraded market-close failed: {symbol} — {e}")
-        if tp1_done:                                                   # 半仓止盈 → 移 SL 到 BE
-            rest = ex["qty"] - ex["half_qty"]
+        if tp1_done:                                                   # 半仓止盈
+            if pos is None:                                            # 全仓已无 → 不在空仓上挂 BE（孤儿单），drain 后终态（§22.5 P0）
+                return terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "tp1_then_flat")
+            rest = ex["qty"] - ex["half_qty"]                          # 有半仓 → 移 SL 到 BE
             try:                                                        # 先挂 BE
                 be_oid = broker.place_stop_market(symbol, ps, rest, ex["entry_price"], f"{base}_SBE")
             except Exception as e:                                      # BE 挂不上 → 保留原 SL（仍有止损）
@@ -238,11 +236,7 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
             pb["status"] = PBStatus.TP1_HIT.value
             return pb["status"]
         if pos is None:                                                # 全仓没了且 TP1 未成交 = SL 触发
-            _cancel(broker, symbol, ex.get("tp1_order_id"))
-            _cancel(broker, symbol, ex.get("tp2_order_id"))
-            pb["status"] = PBStatus.DONE_SL.value
-            pb["result"] = "sl"
-            return pb["status"]
+            return terminalize(broker, symbol, pb, PBStatus.DONE_SL.value, "sl")
         return None
 
     if status == PBStatus.TP1_HIT.value:
@@ -253,11 +247,8 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
             if tp2 and tp2.state == OrderState.UNKNOWN:
                 if pos is not None:
                     return None                                        # 有仓 + 查询 UNKNOWN → 保持（§19）
-                # 无仓 → 无敞口优先于查询不确定 → 诚实终态（§22）
-                _cancel(broker, symbol, ex.get("tp2_order_id"))
-                pb["status"] = PBStatus.DONE_UNKNOWN.value
-                pb["result"] = "exit_unknown"
-                return pb["status"]
+                # 无仓 → 无敞口优先 → 诚实终态（drain 后归档 §22.5）
+                return terminalize(broker, symbol, pb, PBStatus.DONE_UNKNOWN.value, "exit_unknown")
             if tp2 and tp2.state == OrderState.FILLED:
                 tp2_done = True
             elif tp2 is None or tp2.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
@@ -269,15 +260,9 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
             except Exception as e:
                 notify.feishu_alert(f"TP2 degraded market-close failed: {symbol} — {e}")
         if tp2_done:                                                   # TP2 全达成
-            _cancel(broker, symbol, ex.get("sl_order_id"))
-            pb["status"] = PBStatus.DONE_TP2.value
-            pb["result"] = "tp2"
-            return pb["status"]
+            return terminalize(broker, symbol, pb, PBStatus.DONE_TP2.value, "tp2")
         if pos is None:                                                # 剩余半仓没了且 TP2 未成交 = BE/SL 触发
-            _cancel(broker, symbol, ex.get("tp2_order_id"))
-            pb["status"] = PBStatus.DONE_BE.value
-            pb["result"] = "be"
-            return pb["status"]
+            return terminalize(broker, symbol, pb, PBStatus.DONE_BE.value, "be")
         return None
 
     return None
@@ -297,3 +282,41 @@ def _cancel(broker: Broker, symbol: str, oid: Optional[str], retries: int = 2) -
             time.sleep(0.2)
     notify.feishu_alert(f"cancel FAILED (orphan order risk): {symbol} {oid} — {last}")
     notify.trade_log("ERROR_CANCEL_FAILED", symbol=symbol, order_id=oid, error=str(last))
+
+
+def _drain_orders(broker: Broker, symbol: str, ex: dict) -> bool:
+    """撤本 playbook 所有活跃订单（sl/tp1/tp2）。全部撤掉/已不活跃 → True；有撤不掉/UNKNOWN → False（§22.5）。"""
+    clean = True
+    for key in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+        oid = ex.get(key)
+        if not oid:
+            continue
+        o = safe_get_order(broker, symbol, oid)
+        if o is None:
+            continue                                    # 不存在 = 已不活跃
+        if o.state == OrderState.UNKNOWN:
+            clean = False                               # 查不清 → 不能确认已撤
+            continue
+        if o.state in (OrderState.NEW, OrderState.PARTIALLY_FILLED):
+            try:
+                broker.cancel_order(symbol, order_id=oid)
+            except Exception:
+                clean = False                           # 撤不掉
+    return clean
+
+
+def terminalize(broker: Broker, symbol: str, pb: dict, target: str, result: str) -> str:
+    """进入终态前必须 drain 本 playbook 所有订单（§22.5 Terminal Means Drained：终态=无仓+无活跃挂单）。
+    撤干净 → 置 target 终态；有撤不掉/UNKNOWN → 标 draining，保持非终态，由 tick 每轮重试 drain。"""
+    ex = pb["exec"]
+    if _drain_orders(broker, symbol, ex):
+        for k in ("draining", "drain_target", "drain_result"):
+            ex.pop(k, None)
+        pb["status"] = target
+        pb["result"] = result
+        return target
+    ex["draining"] = True                               # 没撤干净 → 保持非终态，tick 重试
+    ex["drain_target"] = target
+    ex["drain_result"] = result
+    notify.feishu_alert(f"terminalize draining (orders not drained): {symbol} {ex.get('account')} → {target}")
+    return pb["status"]

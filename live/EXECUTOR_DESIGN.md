@@ -1031,3 +1031,27 @@ btc-ml（新加坡）:
 | `open_position` market_open Fill | market_open结果 × price有效性 | `test_open_position_fill_decision_table` |
 
 决策表化时发现并修的漏格：`manage` 的 TP-UNKNOWN+无仓「无敞口优先」(§22.7)、`_recover_opening` 的 od=None grace 与 filled_qty 维度。
+
+### 22.5 Terminal Means Drained + executor 七律（Codex 复审收敛的最终纲领）
+
+**终态不是「无仓」，终态是「无仓 + 无本系统活跃挂单」。** 进入任何 `DONE_*`/归档前，必须 drain 本 playbook 所有订单（`terminalize()` → `_drain_orders()`）：撤干净才置终态；撤不掉/查不清 → 标 `ex["draining"]`，保持非终态，tick 每轮 `_try_drain` 重试，撤干净才归档。
+
+**executor 七律（最高层不变量）：**
+
+1. **Intent Before Effect** — 任何可能到交易所的副作用，下单前先持久化意图（OPENING）。
+2. **Exchange Is Truth** — 仓位/订单以交易所为准，本地 state 只是缓存与意图。
+3. **Unknown Is Not Failure** — API 抛错 / 查单 UNKNOWN / 仓位延迟同步，都不能直接推终态。
+4. **No Naked Exposure** — 有仓必有 SL；补不上就平；平不掉就 recovering。
+5. **Terminal Means Drained** — 进 `DONE_*` 前必证明：无持仓 **且** 无本系统活跃订单（或撤单失败显式留在 draining 恢复流程）。
+6. **Slot Released Only After Drained** — OPENING/ACTIVATED/TP1_HIT/recovering/draining 都占 slot；仓位与订单都收干净才释放。
+7. **Every Order Must Be Owned** — 每个交易所订单都能经 deterministic `client_id_base` 回到唯一 playbook；playbook 归档前必清理名下所有订单。
+
+**总纲（终极不变量）：**
+
+> 一个 playbook 只允许处在两种安全世界之一：
+> - **活跃态**：本地 state 明确拥有交易所仓位/订单，并持续管理。
+> - **终态**：交易所上已无该 playbook 拥有的仓位和活跃订单。
+>
+> 中间任何查不清、撤不掉、平不掉，都不能归档，只能保持恢复态（OPENING / recovering / draining）。
+
+**优先级**：§22.5 终态守恒 **>** §22.7 无敞口及时终态 —— 无仓但订单查不清，仍 `draining`，不归档。
