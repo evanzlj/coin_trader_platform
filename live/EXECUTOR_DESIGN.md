@@ -1019,3 +1019,15 @@ btc-ml（新加坡）:
 ### 22.3 自查与维护
 
 按此表**主动复审**（非被动等 Codex），已发现并修复 `reconcile_position` 的 get_position 未容错（startup/periodic 会被 transient API error 打崩，与 #21 同源）。**后续每新增一个外部副作用点，必须先在 22.2 表登记其三态处理，并配一条 UNKNOWN 故障注入测试。**
+
+### 22.4 已决策表穷举封闭的热点（漏格在本地暴露，不等复审）
+
+| 热点 | 决策维度 | 测试 |
+|------|---------|------|
+| `_recover_opening` | od状态 × 有无仓 × grace内外 × filled_qty | `test_recover_opening_decision_table` |
+| `manage` ACTIVATED | tp1状态 × 有无仓 × ref到价 | `test_manage_activated_decision_table` |
+| `manage` TP1_HIT | tp2状态 × 有无仓 × ref到价 | `test_manage_tp1hit_decision_table` |
+| `reconcile_position` 无持仓 | status × 各订单 filled | `test_reconcile_no_position_decision_table` |
+| `open_position` market_open Fill | market_open结果 × price有效性 | `test_open_position_fill_decision_table` |
+
+决策表化时发现并修的漏格：`manage` 的 TP-UNKNOWN+无仓「无敞口优先」(§22.7)、`_recover_opening` 的 od=None grace 与 filled_qty 维度。

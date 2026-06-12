@@ -677,6 +677,26 @@ class TestFaultInjection(unittest.TestCase):
         with self.assertRaises(Exception):
             open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
 
+    def test_open_position_fill_decision_table(self):
+        """open_position 入口 Fill 的 (market_open 结果 × price 有效性) 决策穷举（§22 热点封闭）。
+        判据：成交价必须>0，否则查 position 补，补不出 → raise（保持 OPENING，绝不接受 entry=0）。"""
+        def attempt(fail=None, fp=72700):
+            b = MockBroker(spec=SPEC, fill_price=fp, fail_on=fail or set())
+            try:
+                open_position(b, "BTC/USDT", self._pb(), 72700, "a", 40, "base")
+                return "ok"
+            except Exception:
+                return "raise"
+        cases = [
+            (None,                    72700, "ok"),      # 正常成交价 → 开仓
+            (None,                    0.0,   "raise"),   # price=0 + 补不出 → raise
+            ({"market_open_timeout"}, 72700, "ok"),      # 超时但成交(price>0) → 接管
+            ({"market_open_timeout"}, 0.0,   "raise"),   # 超时成交但 price=0 → 补不出 raise
+            ({"market_open"},         72700, "raise"),   # 下单失败 + 无持仓 → raise
+        ]
+        for fail, fp, expected in cases:
+            self.assertEqual(attempt(fail, fp), expected, f"fail={fail} fp={fp}")
+
     def test_get_order_unknown_with_position_holds(self):
         # TP 查单 UNKNOWN + 有持仓 → 保持 ACTIVATED（有敞口，等查清，不臆测 §19）
         b = MockBroker(spec=SPEC, fill_price=72700)
