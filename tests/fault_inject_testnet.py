@@ -179,6 +179,49 @@ class _TimeoutOnceBroker:
         return fill
 
 
+class _UnknownGetOrderBroker:
+    """包装：get_order 前 n 次返回 UNKNOWN（模拟查单 API 抖），之后透传。"""
+    def __init__(self, inner, n=99):
+        self._inner = inner
+        self._left = n
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_order(self, symbol, order_id=None, client_id=None):
+        if self._left > 0:
+            self._left -= 1
+            from live.broker.base import OrderStatus, OrderState as _OS
+            return OrderStatus(order_id or "", client_id or "", _OS.UNKNOWN, 0.0, 0.0)
+        return self._inner.get_order(symbol, order_id=order_id, client_id=client_id)
+
+
+def scenario_drain_unknown_then_retry(brokers, accts):
+    """⑤ 终态 drain 时查单 UNKNOWN → draining 保持非终态；恢复后 _try_drain 重试 → DONE（§22.5）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi5{int(time.time()) % 1000000}"
+    ex = _open_real(broker, base); ex["account"] = label
+    pb = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED", "exec": ex}
+    broker.market_close(sym, ps, 0.002, f"{base}_FLAT"); time.sleep(2)
+    print(f"  setup: opened + closed (FLAT), orders resting")
+
+    # —— 注入：drain 时 get_order 全 UNKNOWN（查不清）→ 不能归档 ——
+    fb = _UnknownGetOrderBroker(broker)
+    reconcile.reconcile_position(fb, sym, pb)
+    print(f"  inject: get_order UNKNOWN → status={pb['status']} draining={pb['exec'].get('draining')}")
+    draining_ok = pb["status"] != "DONE_UNKNOWN" and pb["exec"].get("draining")
+
+    # —— 恢复：get_order 正常 → _try_drain 撤干净 → DONE ——
+    eng = ExecutorEngine(None, {label: broker}, accts)
+    drained = eng._try_drain(broker, sym, pb)
+    print(f"  recover: _try_drain → status={pb['status']} (drained={drained})")
+    ok = bool(draining_ok) and pb["status"].startswith("DONE")
+    print(f"  RESULT: {'✓ held draining then drained' if ok else '✗ FAILED'}")
+    _cleanup(broker, ex)
+    return ok
+
+
 def scenario_market_open_timeout_recovers(brokers, accts):
     """④ market_open 超时但实际成交 → open_position 查持仓接管，**不重发** → 不翻倍开仓（§18 真实验证）。
     重要发现：binance MARKET 单 client_id 不防重复（成交即完成 → 同 id 重发 = 新仓），所以幂等
@@ -207,6 +250,7 @@ SCENARIOS = {
     "crash_opening_adopts": scenario_crash_opening_adopts,
     "terminal_drains_orders": scenario_terminal_drains_orders,
     "market_open_timeout_recovers": scenario_market_open_timeout_recovers,
+    "drain_unknown_then_retry": scenario_drain_unknown_then_retry,
 }
 
 
