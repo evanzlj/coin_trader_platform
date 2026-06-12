@@ -54,6 +54,22 @@ def _fmt(x: float) -> str:
     return s if s else "0"
 
 
+# 撤单返回里「订单已不存在/已撤/已完成」= 等价撤成功（已无活跃单，drain 视为干净）。
+_CANCEL_GONE = {"51400", "51401", "51402", "51410", "51503"}
+
+
+def _check_cancel(resp: dict) -> None:
+    """严格校验 OKX 撤单返回（§22.5：_drain 依赖 cancel 成功 = 交易所确认撤单）。
+    请求级 code 非0 → 抛；逐条 sCode 非0 且非「订单已不存在」→ 抛，让 drain 知道没撤成功。"""
+    if str(resp.get("code")) not in ("0", "None", ""):
+        raise RuntimeError(f"okx cancel error {resp.get('code')}: {resp.get('msg')}")
+    for d in (resp.get("data") or []):
+        scode = str(d.get("sCode"))
+        if scode in ("0", "None", "") or scode in _CANCEL_GONE:
+            continue
+        raise RuntimeError(f"okx cancel rejected {scode}: {d.get('sMsg')}")
+
+
 class OKXBroker(Broker):
     def __init__(self, label: str, api_key: str, secret: str, passphrase: str,
                  flag: str) -> None:
@@ -209,10 +225,11 @@ class OKXBroker(Broker):
     def cancel_order(self, symbol, order_id=None, client_id=None) -> None:
         inst = _inst(symbol)
         if order_id and order_id.startswith("algo:"):
-            self.trade.cancel_algo_order([{"instId": inst, "algoId": order_id.split(":", 1)[1]}])
+            resp = self.trade.cancel_algo_order([{"instId": inst, "algoId": order_id.split(":", 1)[1]}])
         else:
             oid = order_id.split(":", 1)[1] if order_id and ":" in order_id else order_id
             if oid:
-                self.trade.cancel_order(instId=inst, ordId=oid)
+                resp = self.trade.cancel_order(instId=inst, ordId=oid)
             else:
-                self.trade.cancel_order(instId=inst, clOrdId=_cl(client_id))
+                resp = self.trade.cancel_order(instId=inst, clOrdId=_cl(client_id))
+        _check_cancel(resp)                             # 严格校验：业务失败 → 抛，让 drain 知道没撤成功（§22.5）

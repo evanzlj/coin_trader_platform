@@ -217,11 +217,16 @@ class BinanceBroker(Broker):
     def cancel_order(self, symbol: str, order_id: Optional[str] = None,
                      client_id: Optional[str] = None) -> None:
         sym = _sym(symbol)
-        if order_id and order_id.startswith("algo:"):
-            self.client.sign_request("DELETE", "/fapi/v1/algoOrder",
-                                     {"symbol": sym, "algoId": int(order_id.split(":", 1)[1])})
-        elif order_id is not None:
-            oid = order_id.split(":", 1)[1] if order_id.startswith("ord:") else order_id
-            self.client.cancel_order(symbol=sym, orderId=int(oid))
-        else:
-            self.client.cancel_order(symbol=sym, origClientOrderId=client_id)
+        try:
+            if order_id and order_id.startswith("algo:"):
+                self.client.sign_request("DELETE", "/fapi/v1/algoOrder",
+                                         {"symbol": sym, "algoId": int(order_id.split(":", 1)[1])})
+            elif order_id is not None:
+                oid = order_id.split(":", 1)[1] if order_id.startswith("ord:") else order_id
+                self.client.cancel_order(symbol=sym, orderId=int(oid))
+            else:
+                self.client.cancel_order(symbol=sym, origClientOrderId=client_id)
+        except ClientError as e:
+            if getattr(e, "error_code", None) == -2011:   # Unknown order（已不存在/已撤）= 等价撤成功
+                return
+            raise                                         # 真失败 → 抛，让 drain 知道没撤成功（§22.5）
