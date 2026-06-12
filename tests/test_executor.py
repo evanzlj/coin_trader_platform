@@ -344,6 +344,45 @@ class TestReconcile(unittest.TestCase):
         _recover_opening(eng, "BTC/USDT", pb)
         self.assertEqual(pb["status"], "OPENING")
 
+    def test_recover_opening_decision_table(self):
+        """穷举 _recover_opening 的 (od 状态 × 有无仓 × grace内外) 决策组合，
+        把状态空间显式化为一张会失败的表（§22：不靠枚举 if，靠 grace 门槛+证据）。"""
+        import pandas as pd
+        from live.reconcile import _recover_opening
+        now, old = pd.Timestamp.now("UTC").isoformat(), "2020-01-01T00:00:00+00:00"
+        HASPOS = (0.027, 72700)                          # 有仓 entry>0
+        # (od_state, 有无仓, opening_at, 期望 status)
+        cases = [
+            # 有持仓 entry>0 → adopt（不看 grace/od）
+            (OrderState.FILLED, HASPOS, now, "ACTIVATED"),
+            (OrderState.FILLED, HASPOS, old, "ACTIVATED"),
+            (None,              HASPOS, now, "ACTIVATED"),
+            # 无持仓 + 交易所确认死单 → 立即作废（不看 grace）
+            (OrderState.CANCELED, None, now, "DONE_CANCELLED"),
+            (OrderState.REJECTED, None, now, "DONE_CANCELLED"),
+            (OrderState.EXPIRED,  None, now, "DONE_CANCELLED"),
+            # 无持仓 + grace 内 → 一律保持 OPENING（不管 od）
+            (OrderState.FILLED, None, now, "OPENING"),
+            (None,              None, now, "OPENING"),
+            (OrderState.NEW,    None, now, "OPENING"),
+            # 无持仓 + grace 外 → 按证据终态化
+            (OrderState.FILLED, None, old, "DONE_UNKNOWN"),     # 开过已平
+            (None,              None, old, "DONE_CANCELLED"),   # 没开成
+            (OrderState.NEW,    None, old, "DONE_CANCELLED"),   # 未落实
+        ]
+        for od_state, pos, oat, expected in cases:
+            b = MockBroker(spec=SPEC, fill_price=72700)
+            if pos:
+                b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, pos[0], pos[1])
+            if od_state is not None:
+                b.orders["base_E"] = OrderStatus("base_E", "base_E", od_state, 0.027, 72700)
+            eng = ExecutorEngine(None, {"a": b}, [])
+            pb = self._opening_pb()
+            pb["exec"]["opening_at"] = oat
+            _recover_opening(eng, "BTC/USDT", pb)
+            self.assertEqual(pb["status"], expected,
+                             f"od={od_state} haspos={bool(pos)} grace={'in' if oat == now else 'out'}")
+
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
         from live.reconcile import _recover_opening
