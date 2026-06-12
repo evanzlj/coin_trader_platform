@@ -132,6 +132,21 @@ class _AllThrowBroker:
         raise RuntimeError("injected network down (get_order)")
 
 
+class _TimeoutOnceCancel:
+    """cancel_order 真撤后抛一次（模拟撤单超时但实际已撤）→ drain 重试见 gone → drained。"""
+    def __init__(self, inner):
+        self._inner, self._fired = inner, False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def cancel_order(self, symbol, order_id=None, client_id=None):
+        self._inner.cancel_order(symbol, order_id=order_id, client_id=client_id)   # 真撤成功
+        if not self._fired:
+            self._fired = True
+            raise RuntimeError("injected cancel timeout (order already cancelled)")
+
+
 # ── 场景 ─────────────────────────────────────────────────────────────────────
 def s_crash_activated_sl_removed(label, broker, accts):
     """① crash@ACTIVATED + SL 被撤 → reconcile 补挂 SL。"""
@@ -295,6 +310,29 @@ def s_network_down_no_crash(label, broker, accts):
     return ok
 
 
+def s_cancel_timeout_drains(label, broker, accts):
+    """⑨ #4 撤单超时半成功：drain 时 cancel 抛但实际已撤 → draining；_try_drain 重试见 gone → drained。"""
+    base = f"fi9{broker.exchange[:1]}{int(time.time()) % 100000}"
+    ex = _open_real(broker, base)
+    pb = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED", "exec": ex}
+    sl, t1, t2 = ex["sl_order_id"], ex["tp1_order_id"], ex["tp2_order_id"]
+    broker.market_close(SYM, PS, ex["qty"], f"{base}_FLAT"); time.sleep(2)
+    # drain 时撤单超时一次（实际撤成功）→ drain 视为没撤干净 → draining（非终态）
+    reconcile.reconcile_position(_TimeoutOnceCancel(broker), SYM, pb)
+    draining = pb["exec"].get("draining")
+    eng = ExecutorEngine(None, {label: broker}, accts)
+    if draining:
+        eng._try_drain(broker, SYM, pb)        # 重试：order 已撤 → cancel gone → drained
+
+    def gone(oid):
+        o = broker.get_order(SYM, oid)
+        return o is None or o.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.FILLED)
+    ok = bool(draining) and pb["status"].startswith("DONE") and gone(sl) and gone(t1) and gone(t2)
+    print(f"  inject: cancel timeout → draining={draining} → status={pb['status']}  {'✓ drained' if ok else '✗'}")
+    _cleanup(broker, ex)
+    return ok
+
+
 # 场景 → 适用交易所
 SCENARIOS = {
     "crash_activated_sl_removed": (s_crash_activated_sl_removed, ("binance", "okx")),
@@ -305,54 +343,57 @@ SCENARIOS = {
     "crash_tp1hit_be_removed": (s_crash_tp1hit_be_removed, ("binance", "okx")),
     "market_open_timeout_recovers": (s_market_open_timeout_recovers, ("binance",)),
     "network_down_no_crash": (s_network_down_no_crash, ("binance", "okx")),
+    "cancel_timeout_drains": (s_cancel_timeout_drains, ("binance", "okx")),
 }
 
 
 def _active_fi_orders(b):
-    """查 fi* 前缀的活跃订单（普通 + algo），用于全局收尾审计。"""
+    """查 fi* 前缀的活跃订单（普通 + algo）。查询异常**向上抛**，由审计判 UNKNOWN→DIRTY
+    （§22 哲学：查不清绝不吞成空 = 干净）。"""
     out = []
-    try:
-        if b.exchange == "binance":
-            for o in b.client.get_orders(symbol="BTCUSDT"):
-                if o.get("status") in ("NEW", "PARTIALLY_FILLED") and str(o.get("clientOrderId", "")).startswith("fi"):
-                    out.append(o["clientOrderId"])
-            algos = b.client.sign_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": "BTCUSDT"})
-            for a in (algos if isinstance(algos, list) else algos.get("orders", [])):
-                if str(a.get("clientAlgoId", "")).startswith("fi"):
-                    out.append(a["clientAlgoId"])
-        else:
-            for o in b._data(b.trade.get_order_list(instType="SWAP", instId="BTC-USDT-SWAP")):
-                if str(o.get("clOrdId", "")).startswith("fi"):
-                    out.append(o["clOrdId"])
-            try:
-                for a in b._data(b.trade.order_algos_list(ordType="conditional", instId="BTC-USDT-SWAP")):
-                    if str(a.get("algoClOrdId", "")).startswith("fi"):
-                        out.append(a["algoClOrdId"])
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"  (audit query error {b.exchange}: {str(e)[:60]})")
+    if b.exchange == "binance":
+        for o in b.client.get_orders(symbol="BTCUSDT"):
+            if o.get("status") in ("NEW", "PARTIALLY_FILLED") and str(o.get("clientOrderId", "")).startswith("fi"):
+                out.append(o["clientOrderId"])
+        algos = b.client.sign_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": "BTCUSDT"})
+        for a in (algos if isinstance(algos, list) else algos.get("orders", [])):
+            if str(a.get("clientAlgoId", "")).startswith("fi"):
+                out.append(a["clientAlgoId"])
+    else:
+        for o in b._data(b.trade.get_order_list(instType="SWAP", instId="BTC-USDT-SWAP")):
+            if str(o.get("clOrdId", "")).startswith("fi"):
+                out.append(o["clOrdId"])
+        for a in b._data(b.trade.order_algos_list(ordType="conditional", instId="BTC-USDT-SWAP")):
+            if str(a.get("algoClOrdId", "")).startswith("fi"):
+                out.append(a["algoClOrdId"])
     return out
 
 
 def _final_audit(test_brokers):
-    """全局收尾审计：每账户无持仓 + 无 fi* 活跃单（_cleanup 吞异常不算数）。"""
+    """全局收尾审计（§22：查不清 ≠ 干净）：每账户无持仓 + 无 fi* 活跃单；
+    任一查询异常 → UNKNOWN → 审计 DIRTY（绝不把查询失败当 CLEAN）。_cleanup 吞异常不算数。"""
     print("=== FINAL AUDIT (no position + no fi* active orders) ===")
     clean = True
     for label, b in test_brokers:
+        unknown = False
         for ps in (PosSide.SHORT, PosSide.LONG):
             try:
                 pos = b.get_position(SYM, ps)
-            except Exception:
-                pos = None
+            except Exception as e:
+                print(f"  ✗ {label} {ps.value} POSITION QUERY FAILED → UNKNOWN ({str(e)[:50]})")
+                clean = False; unknown = True; continue
             if pos:
                 print(f"  ✗ {label} {ps.value} RESIDUAL POSITION qty={pos.qty}")
                 clean = False
-        left = _active_fi_orders(b)
+        try:
+            left = _active_fi_orders(b)
+        except Exception as e:
+            print(f"  ✗ {label} ORDER QUERY FAILED → UNKNOWN ({str(e)[:50]})")
+            clean = False; unknown = True; left = None
         if left:
             print(f"  ✗ {label} RESIDUAL fi* ORDERS: {left}")
             clean = False
-        if not (left):
+        elif not unknown:
             print(f"  ✓ {label} clean")
     print(f"=== AUDIT {'CLEAN ✓' if clean else 'DIRTY ✗ (round FAILED)'} ===")
     return clean
@@ -395,9 +436,15 @@ def main():
                 results[key] = False
     audit_clean = _final_audit(tb)
     print("=== summary ===")
+    all_pass = all(results.values()) if results else False
     for key, ok in results.items():
         print(f"  {key}: {'PASS' if ok else 'FAIL'}")
     print(f"  FINAL AUDIT: {'CLEAN' if audit_clean else 'DIRTY'}")
+    # 门禁（可交给 watchdog/CI/部署）：任一场景 FAIL 或 audit DIRTY → 非零退出
+    if not (all_pass and audit_clean):
+        print("RESULT: FAILED ✗")
+        sys.exit(1)
+    print("RESULT: ALL PASS ✓")
 
 
 if __name__ == "__main__":

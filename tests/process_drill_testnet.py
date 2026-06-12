@@ -99,6 +99,18 @@ def _wait(cond_fn, timeout=70, poll=2):
     return None
 
 
+def _emergency_cleanup(brokers):
+    """drill 失败路径兜底：平掉两家 BTC 残留持仓（防 OPENING 卡住留仓）。"""
+    for b in brokers.values():
+        for ps in (PosSide.SHORT, PosSide.LONG):
+            try:
+                pos = b.get_position(SYM, ps)
+                if pos:
+                    b.market_close(SYM, ps, pos.qty, f"drillEMG{int(time.time()) % 100000}")
+            except Exception:
+                pass
+
+
 def main():
     keys = load_keys("testnet")
     brokers = build_brokers(keys)
@@ -123,7 +135,8 @@ def main():
     if not _wait(lambda: (tmp / "hb.txt").exists(), timeout=40):
         p1.kill(); p1.wait()
         print("DRILL FAIL: executor never heartbeat. exec1.log tail:")
-        print((tmp / "exec1.log").read_text()[-2000:]); return
+        print((tmp / "exec1.log").read_text()[-2000:])
+        _emergency_cleanup(brokers); sys.exit(1)
     print("  executor running (first heartbeat) → writing signal during runtime")
     _write_signal(tmp / "active", P, lc)
 
@@ -142,7 +155,7 @@ def main():
               f" last_bar={st.get('last_bar') if st else None}")
         print("  exec1.log tail:")
         print((tmp / "exec1.log").read_text()[-2000:])
-        return
+        _emergency_cleanup(brokers); sys.exit(1)
     acct, exch, sl_oid = ex["account"], ex["exchange"], ex.get("sl_order_id")
     broker = next(b for b in brokers.values() if b.exchange == exch)
     print(f"  opened: ACTIVATED on {acct}({exch}) sl={sl_oid}")
@@ -192,7 +205,10 @@ def main():
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"  cleanup: {flat}")
-    print(f"DRILL (process kill -9 + restart recover): {'PASS ✓' if ok and flat == 'FLAT' else 'FAIL ✗'}")
+    passed = bool(ok) and flat == "FLAT"
+    print(f"DRILL (process kill -9 + restart recover): {'PASS ✓' if passed else 'FAIL ✗'}")
+    if not passed:
+        _emergency_cleanup(brokers); sys.exit(1)
 
 
 if __name__ == "__main__":
