@@ -80,19 +80,20 @@ def scenario_crash_activated_sl_removed(brokers, accts):
     ex = _open_real(broker, base)
     ex["account"] = label
     pb = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED", "exec": ex}
-    print(f"  setup: opened, sl={ex['sl_order_id']}")
+    old_sl_id = ex["sl_order_id"]                        # 保存字符串（reconcile 会改 ex["sl_order_id"]）
+    print(f"  setup: opened, sl={old_sl_id}")
 
     # —— 注入：崩溃期 SL 被撤 ——
-    broker.cancel_order(sym, order_id=ex["sl_order_id"])
+    broker.cancel_order(sym, order_id=old_sl_id)
     print("  inject: SL cancelled (simulating crash-window loss)")
 
     # —— 重启对账 ——
     eng = ExecutorEngine(None, brokers, accts)
     reconcile.reconcile_position(broker, sym, pb)        # startup 对单个 pb 的核对
     new_sl = pb["exec"].get("sl_order_id")
-    print(f"  recover: new sl={new_sl} (changed={new_sl != ex['sl_order_id']})")
+    print(f"  recover: new sl={new_sl} (changed={new_sl != old_sl_id})")
     st = broker.get_order(sym, new_sl) if new_sl else None
-    ok = new_sl and new_sl != ex["sl_order_id"] and st and st.state == OrderState.NEW
+    ok = new_sl and new_sl != old_sl_id and st and st.state == OrderState.NEW
     print(f"  RESULT: {'✓ SL re-armed' if ok else '✗ FAILED'}  (new SL state={st.state.value if st else None})")
 
     _cleanup(broker, pb["exec"])
