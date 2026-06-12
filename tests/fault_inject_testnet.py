@@ -162,10 +162,36 @@ def scenario_terminal_drains_orders(brokers, accts):
     return ok
 
 
+def scenario_duplicate_client_id_idempotent(brokers, accts):
+    """④ 重复 client id：同 {base}_E 第二次下单 → 交易所拒（幂等保证，防超时重试重复开仓 §18）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi4{int(time.time()) % 1000000}"
+    broker.set_leverage(sym, ps, 10)
+    broker.market_open(sym, ps, 0.002, f"{base}_E")
+    print("  setup: first open ok (qty=0.002)")
+    dup_rejected = False
+    try:
+        broker.market_open(sym, ps, 0.002, f"{base}_E")      # 同 client id 再下
+        print("  inject: SECOND open with SAME client id — NOT rejected (risk!)")
+    except Exception as e:
+        dup_rejected = True
+        print(f"  inject: second open rejected ✓ ({str(e)[:70]})")
+    pos = broker.get_position(sym, ps)
+    qty = pos.qty if pos else 0
+    ok = dup_rejected and abs(qty - 0.002) < 1e-6            # 没翻倍
+    print(f"  RESULT: {'✓ idempotent (pos=0.002, no double-open)' if ok else '✗ FAILED'} pos={qty}")
+    if pos:
+        broker.market_close(sym, ps, pos.qty, f"{base}_C")
+        time.sleep(2)
+    return ok
+
+
 SCENARIOS = {
     "crash_activated_sl_removed": scenario_crash_activated_sl_removed,
     "crash_opening_adopts": scenario_crash_opening_adopts,
     "terminal_drains_orders": scenario_terminal_drains_orders,
+    "duplicate_client_id_idempotent": scenario_duplicate_client_id_idempotent,
 }
 
 
