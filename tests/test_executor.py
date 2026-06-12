@@ -388,6 +388,32 @@ class TestReconcile(unittest.TestCase):
             self.assertEqual(pb["status"], expected,
                              f"od={od_state} haspos={bool(pos)} fq={fq} grace={'in' if oat == now else 'out'}")
 
+    def test_reconcile_no_position_decision_table(self):
+        """reconcile_position 无持仓的 (status × sl/tp1/tp2 filled) 决策穷举（§22 封闭）。
+        无持仓=无敞口→必终态；具体标签按哪个单 filled。"""
+        def run(status, filled_keys):
+            b = MockBroker(spec=SPEC)                     # 无持仓
+            pb = self._active()
+            pb["status"] = status
+            ex = pb["exec"]
+            for key in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+                st = OrderState.FILLED if key in filled_keys else OrderState.NEW
+                b.orders[ex[key]] = OrderStatus(ex[key], "x", st, 0, 0)
+            reconcile_position(b, "BTC/USDT", pb)
+            return pb["status"]
+        # (status, 哪些单 filled, 期望终态)
+        cases = [
+            ("ACTIVATED", {"sl_order_id"},  "DONE_SL"),       # SL 成交
+            ("ACTIVATED", {"tp2_order_id"}, "DONE_TP2"),      # TP2 成交
+            ("ACTIVATED", {"tp1_order_id"}, "DONE_UNKNOWN"),  # 仅 TP1 成交 + 无仓 → 不确定终态
+            ("ACTIVATED", set(),            "DONE_UNKNOWN"),  # 都没 + 无仓 → 不确定
+            ("TP1_HIT",   {"sl_order_id"},  "DONE_BE"),       # BE 单成交
+            ("TP1_HIT",   {"tp2_order_id"}, "DONE_TP2"),      # TP2 成交
+            ("TP1_HIT",   set(),            "DONE_UNKNOWN"),  # 都没 → 不确定
+        ]
+        for status, filled_keys, expected in cases:
+            self.assertEqual(run(status, filled_keys), expected, f"{status} filled={filled_keys}")
+
     def test_opening_recover_unknown_holds(self):
         # OPENING + 查单 UNKNOWN（API 异常）→ 保持 OPENING，不臆测（§18）
         from live.reconcile import _recover_opening
