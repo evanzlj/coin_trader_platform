@@ -124,47 +124,57 @@ def _flag_manual(pb: dict, result: str, symbol: str) -> str:
 
 
 def _recover_opening(engine, symbol: str, pb: dict) -> None:
-    """OPENING（开仓中崩溃）恢复（§18）：查 {base}_E 订单/实际持仓 → 接管 / 作废 / 保持。"""
+    """OPENING（开仓中崩溃）恢复（§18 P0-2）：查 {base}_E 订单/实际持仓 → 接管 / 平退出 / 作废 / 保持。
+    任何查询 API 异常（get_position 抛 / get_order UNKNOWN）→ 保持 OPENING，绝不武断判死。"""
     ex = pb.get("exec") or {}
     broker = engine.brokers.get(ex.get("account"))
     if broker is None:
         _flag_manual(pb, "manual_no_broker", symbol)
         return
     ps = PosSide(ex["pos_side"])
-    pos = broker.get_position(symbol, ps)
+    try:
+        pos = broker.get_position(symbol, ps)
+    except Exception as e:
+        logger.warning("recover_opening %s get_position error, hold OPENING: %s", symbol, e)
+        return                                          # 持仓查询 API 异常 → 保持 OPENING（不臆测）
     od = broker.get_order(symbol, client_id=f"{ex['client_id_base']}_E")
-    filled = od is not None and od.state == OrderState.FILLED
-    if (pos is not None and pos.qty > 0) or filled:
-        # 有仓 / entry 已成交 → 接管：补 SL/TP，转 ACTIVATED
-        qty = pos.qty if (pos is not None and pos.qty > 0) else od.filled_qty
-        entry = pos.entry_price if (pos is not None and pos.qty > 0) else od.avg_price
+    od_unknown = od is not None and od.state == OrderState.UNKNOWN
+
+    if pos is not None and pos.qty > 0:
+        # 有**实际持仓** → 接管补 SL/TP（用持仓量，不靠 od.filled，避免接管已平掉的仓）
         from live.position_manager import adopt_position, SLPlacementError, NakedPositionError
         try:
-            pb["exec"] = adopt_position(broker, symbol, ex, qty, entry)
+            pb["exec"] = adopt_position(broker, symbol, ex, pos.qty, pos.entry_price)
             pb["status"] = PBStatus.ACTIVATED.value
-            notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={qty})")
+            notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={pos.qty})")
         except SLPlacementError as e:
-            # adopt 补 SL 失败但已平退出 → 安全终态
             pb["status"] = PBStatus.DONE_UNKNOWN.value
             pb["result"] = "adopt_sl_failed_closed"
             notify.feishu_alert(f"OPENING adopt SL failed, position closed ({symbol}): {e}")
         except NakedPositionError as e:
-            # adopt 补 SL 失败且平不掉 → recovering（tick 重试平）
             ex["recovering"] = True
             pb["exec"] = ex
             pb["status"] = PBStatus.ACTIVATED.value
             pb["result"] = f"adopt_naked_recovering:{e}"
             notify.feishu_alert(f"OPENING adopt naked, recovering ({symbol}): {e}")
         return
-    if od is not None and od.state == OrderState.UNKNOWN:
-        return                                          # 查单 API 异常 → 保持 OPENING，下轮再看（不臆测）
-    if pos is None and od is None:
-        # 无仓且订单明确不存在 → 作废
+
+    # 无持仓
+    if od_unknown:
+        return                                          # 查单 API 异常 → 保持 OPENING（不臆测）
+    if od is not None and od.state == OrderState.FILLED:
+        # entry 成交过但现在无仓 = 已平退出（无敞口）→ 安全终态
+        pb["status"] = PBStatus.DONE_UNKNOWN.value
+        pb["result"] = "opening_filled_then_flat"
+        notify.feishu_alert(f"OPENING filled then flat ({symbol} {ex.get('account')})")
+        return
+    if od is None:
+        # 无仓且订单明确不存在 → 没开成，作废
         pb["status"] = PBStatus.DONE_CANCELLED.value
         pb["result"] = "opening_aborted"
-        notify.feishu_alert(f"OPENING aborted, no position ({symbol} {ex.get('account')})")
+        notify.feishu_alert(f"OPENING aborted, no position/order ({symbol} {ex.get('account')})")
         return
-    # 其他不确定（od 存在但未成交、无仓）→ 保持 OPENING
+    # od 存在但未成交（NEW）+ 无仓 → 保持 OPENING
 
 
 def startup_reconcile(engine) -> None:

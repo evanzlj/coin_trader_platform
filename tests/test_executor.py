@@ -322,6 +322,26 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(pb["status"], "ACTIVATED")
         self.assertTrue(pb["exec"].get("recovering"))
 
+    def test_recover_opening_position_api_error_holds(self):
+        # get_position 抛(API error) → 保持 OPENING，不判死（§18 P0-2 UNKNOWN 语义）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fail_on={"get_position"})
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")
+
+    def test_recover_opening_filled_then_flat(self):
+        # 无仓 + entry 订单 FILLED（开过已平）→ DONE_UNKNOWN（无敞口安全终态）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC)
+        b.orders["base_E"] = OrderStatus("base_E", "base_E", OrderState.FILLED, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "DONE_UNKNOWN")
+        self.assertEqual(pb["result"], "opening_filled_then_flat")
+
     def test_startup_discards_waiting_keeps_active(self):
         b = MockBroker("binance_0", "binance", spec=SPEC)
         b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)

@@ -121,7 +121,11 @@ class ExecutorEngine:
         """裸仓恢复：重试市价平；平掉 → DONE_UNKNOWN（API-only 无人工出口，自动收口 §21）。"""
         ex = pb["exec"]
         ps = PosSide(ex["pos_side"])
-        pos = broker.get_position(symbol, ps)
+        try:
+            pos = broker.get_position(symbol, ps)
+        except Exception as e:                          # 查询异常 → 不臆测，下 tick 再试（§18 P0-2）
+            notify.feishu_alert(f"recovering: get_position error, retry next tick {symbol}: {e}")
+            return False
         if pos is None:
             pb["status"] = PBStatus.DONE_UNKNOWN.value
             pb["result"] = "recovered_flat"
@@ -146,6 +150,10 @@ class ExecutorEngine:
             changed = False
             ref_price = None
             for pb in state["playbooks"]:
+                if pb["status"] == PBStatus.OPENING.value:    # OPENING 每 tick 重试恢复（§18 P0-2，不等 periodic）
+                    reconcile._recover_opening(self, symbol, pb)
+                    changed = True
+                    continue
                 if pb["status"] in OPEN_STATUSES:
                     ex0 = pb.get("exec") or {}
                     broker = self.brokers.get(ex0.get("account"))
@@ -223,10 +231,7 @@ class ExecutorEngine:
                 symbol = state["symbol"]
                 rec_changed = False
                 for pb in state["playbooks"]:
-                    if pb["status"] == PBStatus.OPENING.value:          # startup 留下的 OPENING → 继续恢复（§18）
-                        reconcile._recover_opening(self, symbol, pb)
-                        rec_changed = True
-                    elif pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):
+                    if pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):  # OPENING 已由 (a) 每 tick 处理
                         broker = self.brokers.get(pb["exec"]["account"])
                         if broker and reconcile.reconcile_position(broker, symbol, pb) != "ok":
                             rec_changed = True
@@ -285,22 +290,15 @@ class ExecutorEngine:
             notify.trade_log("ACTIVATED", symbol=symbol, hypothesis=pb.get("hypothesis"),
                              account=account, exchange=ex["exchange"], entry=ex["entry_price"],
                              qty=ex["qty"], actual_r=ex["actual_r_usdt"])
-        except NakedPositionError as e:
-            # 有仓、无 SL、平不掉 → recovering（tick 每轮重试平仓，不永久挂人工 §21）
-            pb["exec"] = {"account": account, "exchange": broker.exchange,
-                          "pos_side": pos_side_of(pb["direction"]).value,
-                          "margin": margin, "recovering": True, "client_id_base": base}
-            pb["status"] = PBStatus.ACTIVATED.value
-            pb["result"] = f"NAKED_recovering:{e}"
-            logger.error("NAKED POSITION recovering %s %s acc=%s: %s", symbol, pb.get("hypothesis"), account, e)
-            notify.trade_log("ERROR_NAKED_POSITION", symbol=symbol, account=account, error=str(e))
-            notify.feishu_alert(f"NAKED POSITION recovering {symbol} {account}: {e}")
         except Exception as e:
-            pb["status"] = PBStatus.DONE_CANCELLED.value
-            pb["result"] = f"entry_failed:{e}"
-            logger.error("ENTRY FAILED %s %s: %s", symbol, pb.get("hypothesis"), e)
-            notify.trade_log("ERROR_ENTRY_FAILED", symbol=symbol, hypothesis=pb.get("hypothesis"), error=str(e))
-            notify.feishu_alert(f"ENTRY FAILED {symbol} {pb.get('hypothesis')}: {e}")
+            # 已写 OPENING 且真实下过单 → 不武断终态（可能已成交）。统一走 OPENING 恢复查交易所实际（§18 P0-2）：
+            # NakedPositionError→有仓 adopt 补 SL→recovering；SLPlacementError→已平→DONE_UNKNOWN；
+            # transient API error（get_position 抛）→保持 OPENING，tick 下轮重试。
+            logger.error("open_position raised, recovering OPENING %s %s acc=%s: %s",
+                         symbol, pb.get("hypothesis"), account, e)
+            notify.trade_log("ERROR_ENTRY_RAISED", symbol=symbol, hypothesis=pb.get("hypothesis"), error=str(e))
+            notify.feishu_alert(f"open_position raised, recover OPENING {symbol} {account}: {e}")
+            reconcile._recover_opening(self, symbol, pb)
 
     def _heartbeat(self, now: pd.Timestamp) -> None:
         cfg.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)

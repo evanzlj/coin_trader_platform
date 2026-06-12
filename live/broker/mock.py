@@ -50,6 +50,8 @@ class MockBroker(Broker):
 
     # ── 查询 ──
     def get_position(self, symbol: str, pos_side: PosSide) -> Optional[Position]:
+        if "get_position" in self.fail_on:             # 模拟持仓查询 API 异常
+            raise RuntimeError("injected get_position fail")
         return self.positions.get((symbol, pos_side))
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,
