@@ -35,7 +35,11 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
         # 裸仓恢复中：exec 信息不完整（无 qty/sl_price），交给 tick 的 _try_recover 用持仓量平，不走普通对账（§21）
         return "ok"
     ps = PosSide(ex["pos_side"])
-    pos = broker.get_position(symbol, ps)
+    try:
+        pos = broker.get_position(symbol, ps)
+    except Exception as e:
+        logger.warning("reconcile %s get_position error, hold state: %s", symbol, e)
+        return "ok"                                     # 查询异常 → 保持当前状态，不臆测（UNKNOWN 不判死）
     status = pb["status"]
 
     def filled(oid) -> bool:

@@ -977,3 +977,42 @@ btc-ml（新加坡）:
 | 单实例锁 | 两实例同时跑重复下单 | **新增，写 executor 时实现** |
 | 启动 + 每 15min 对账 | 强平 / 漂移 / 孤儿仓 | §11.3 + #5 |
 | SL 挂不上 → 平退 + 人工 | 无止损裸仓 | §10.3 |
+
+---
+
+## 22. 外部交易副作用后的 UNKNOWN 语义（全局不变量）
+
+**根问题**（Codex 复审收敛）：executor 与交易所交互面对的是**三态**，不是二态：
+
+1. **明确成功**：订单/仓位确认存在
+2. **明确失败**：订单不存在 **且** 仓位不存在
+3. **不确定（UNKNOWN）**：请求超时、查询失败、交易所返回 UNKNOWN、进程崩溃
+
+此前多个 P0（#18 孤儿仓、#20 死单、#21 重启崩、adopt 裸仓、_enter 覆盖 OPENING）**同源**：把第 3 类「不确定」误当第 2 类「明确失败」处理。普通业务里只是状态错；实盘里就是孤儿仓 / 裸仓 / 重复开仓。这不是逐个打补丁能根治的，必须提升为全局不变量 + 按状态转移表复审。
+
+### 22.1 六条全局不变量（所有状态转移必须满足）
+
+1. **只要下单请求可能已发到交易所，就不能直接 `DONE_CANCELLED`**。激活前（validate/slot 失败、未下单）可以；写过 `OPENING` 后不行。
+2. **`DONE_*` 必须有证明**：交易所无持仓，或订单状态能解释退出（filled/canceled）。不能凭异常推断终态。
+3. **查询异常（get_position 抛 / get_order UNKNOWN）只能保持 `OPENING/ACTIVATED/recovering`**，不臆测、不打崩流程。
+4. **`OPENING` 是真实 slot 占用**，不是临时状态（slot_pool 计入；恢复完成前不释放）。
+5. **有仓但无 SL → 唯一闭环：补 SL；补不上就平；平不掉就 `recovering`**（每 tick 重试）。绝不留无保护仓、绝不靠人工（API-only 账户无人工出口）。
+6. **终态归档前必须确认没有未接管敞口**（reconcile 通过，或 `_recover_opening` 判明）。
+
+### 22.2 外部副作用点 × 三态 × 处理（状态转移表）
+
+| 副作用点 | 明确成功 | 明确失败 | 不确定（UNKNOWN） |
+|---------|---------|---------|------------------|
+| `_enter` open_position 抛 | — | — | 不判死 → `_recover_opening`（查交易所实际）|
+| `_recover_opening` get_position | 有仓 → adopt 补 SL/TP | 无仓+订单不存在 → `opening_aborted` | 抛 → 保持 `OPENING`，下 tick 重试 |
+| `_recover_opening` 无仓+entry FILLED | — | — | 已平退出 → `DONE_UNKNOWN`(filled_then_flat) |
+| adopt 补 SL | 挂上 → ACTIVATED | — | 补不上→平退出 `DONE_UNKNOWN`；平不掉→`recovering` |
+| manage get_order(TP) | FILLED → 推进 | NEW → 等 | UNKNOWN → 本轮跳过不臆测 |
+| manage SL/BE 触发判定 | — | pos None+TP未成交 → DONE_SL/BE | get_position 抛 → tick per-pb catch，保持 |
+| reconcile_position get_position | 有仓 → 查/补 SL | 无仓+订单解释 → resolved | 抛 → 保持状态(ok)，下轮重试 |
+| reconcile SL 补挂 | 挂上 → ok | — | 补不上→平退出；平不掉→`recovering` |
+| recovering `_try_recover` | 平掉 → `DONE_UNKNOWN` | — | get_position 抛 → 保持 recovering，下 tick 重试 |
+
+### 22.3 自查与维护
+
+按此表**主动复审**（非被动等 Codex），已发现并修复 `reconcile_position` 的 get_position 未容错（startup/periodic 会被 transient API error 打崩，与 #21 同源）。**后续每新增一个外部副作用点，必须先在 22.2 表登记其三态处理，并配一条 UNKNOWN 故障注入测试。**

@@ -211,6 +211,13 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
         self.assertEqual(pb["status"], "DONE_SL")
 
+    def test_reconcile_position_api_error_holds(self):
+        # get_position 抛(API error) → 保持状态，不判死（UNKNOWN 不臆测，§21 全局不变量）
+        b = MockBroker(spec=SPEC, fail_on={"get_position"})
+        pb = self._active()
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")
+        self.assertEqual(pb["status"], "ACTIVATED")
+
     def test_no_position_unknown_exit(self):
         # 无持仓 + 订单状态对不上 → 无敞口安全终态（不挂人工，§21）
         b = MockBroker(spec=SPEC)
