@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from live import exec_config as cfg
@@ -101,8 +103,39 @@ def scenario_crash_activated_sl_removed(brokers, accts):
     return ok
 
 
+def scenario_crash_opening_adopts(brokers, accts):
+    """② 进程崩溃在 OPENING（market_open 成交但 SL 未挂、exec 未写回）→ 重启 _recover_opening 接管补 SL/TP（§18）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi2{int(time.time()) % 1000000}"
+    P = float(broker.client.ticker_price(symbol="BTCUSDT")["price"])
+    broker.set_leverage(sym, ps, 10)
+    fill = broker.market_open(sym, ps, 0.002, f"{base}_E")    # 只开仓，不挂 SL/TP（崩溃在 arming 前）
+    inval = round(fill.price * 1.003, 1)
+    print(f"  setup: market_open filled @ {fill.price}, no SL/TP yet (crash before arming)")
+    ex = {"account": label, "exchange": broker.exchange, "pos_side": ps.value,
+          "client_id_base": base, "direction": "short", "margin": 40,
+          "opening_at": pd.Timestamp.now("UTC").isoformat(),
+          "invalidation": {"level": inval, "dir": "above"},
+          "tp1_level": round(fill.price * 0.99, 1), "tp2_level": round(fill.price * 0.985, 1)}
+    pb = {"hypothesis": "X", "direction": "short", "status": "OPENING", "exec": ex}
+
+    eng = ExecutorEngine(None, brokers, accts)
+    reconcile._recover_opening(eng, sym, pb)                  # 崩溃恢复：查 {base}_E + 持仓 → adopt
+    new_sl = pb["exec"].get("sl_order_id")
+    print(f"  recover: status={pb['status']} sl={new_sl} tp1={pb['exec'].get('tp1_order_id')} adopted={pb['exec'].get('adopted')}")
+    sl_st = broker.get_order(sym, new_sl) if new_sl else None
+    ok = (pb["status"] == "ACTIVATED" and pb["exec"].get("adopted")
+          and sl_st and sl_st.state == OrderState.NEW)
+    print(f"  RESULT: {'✓ adopted + SL armed on exchange' if ok else '✗ FAILED'}")
+    _cleanup(broker, pb["exec"])
+    print(f"  cleanup: {broker.get_position(sym, ps) or 'FLAT'}")
+    return ok
+
+
 SCENARIOS = {
     "crash_activated_sl_removed": scenario_crash_activated_sl_removed,
+    "crash_opening_adopts": scenario_crash_opening_adopts,
 }
 
 
