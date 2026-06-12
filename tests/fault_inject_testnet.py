@@ -133,9 +133,39 @@ def scenario_crash_opening_adopts(brokers, accts):
     return ok
 
 
+def scenario_terminal_drains_orders(brokers, accts):
+    """③ 仓位被平（模拟 SL 触发/手动）但 TP/SL 仍挂 → reconcile 终态前 terminalize drain，交易所确认无活跃单（§22.5）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi3{int(time.time()) % 1000000}"
+    ex = _open_real(broker, base); ex["account"] = label
+    pb = {"hypothesis": "X", "direction": "short", "status": "ACTIVATED", "exec": ex}
+    sl_id, tp1_id, tp2_id = ex["sl_order_id"], ex["tp1_order_id"], ex["tp2_order_id"]
+    print(f"  setup: opened, sl/tp1/tp2 = {sl_id}/{tp1_id}/{tp2_id}")
+
+    # —— 注入：平仓（模拟 SL 触发/手动平），保护单仍挂 ——
+    broker.market_close(sym, ps, 0.002, f"{base}_FLAT")
+    time.sleep(2)
+    print(f"  inject: position closed (pos={broker.get_position(sym, ps) or 'FLAT'}), orders still resting")
+
+    # —— 对账：无仓终态 → terminalize drain ——
+    eng = ExecutorEngine(None, brokers, accts)
+    reconcile.reconcile_position(broker, sym, pb)
+    print(f"  recover: status={pb['status']} draining={pb['exec'].get('draining')}")
+
+    def _gone(oid):
+        o = broker.get_order(sym, oid)
+        return o is None or o.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.FILLED)
+    ok = pb["status"].startswith("DONE") and _gone(sl_id) and _gone(tp1_id) and _gone(tp2_id)
+    print(f"  RESULT: {'✓ all orders drained on exchange' if ok else '✗ FAILED'}")
+    _cleanup(broker, ex)
+    return ok
+
+
 SCENARIOS = {
     "crash_activated_sl_removed": scenario_crash_activated_sl_removed,
     "crash_opening_adopts": scenario_crash_opening_adopts,
+    "terminal_drains_orders": scenario_terminal_drains_orders,
 }
 
 
