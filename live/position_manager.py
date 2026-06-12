@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from live.broker.base import Broker, PosSide, OrderState, Fill, open_side
+from live.broker.base import Broker, PosSide, OrderState, Fill, open_side, safe_get_order
 from live.playbook_fsm import PBStatus, compute_sizing, compute_sl_price
 from live import notify
 
@@ -22,6 +22,10 @@ class SLPlacementError(Exception):
 
 class NakedPositionError(Exception):
     """SL 挂单失败且平仓也失败 —— 裸仓，需人工接管。"""
+
+
+class AdoptUnknownError(Exception):
+    """接管时保护单查询 UNKNOWN，无法确认是否已挂 → 保持 OPENING（不重复挂、不平退出，§22）。"""
 
 
 def pos_side_of(direction: str) -> PosSide:
@@ -45,7 +49,7 @@ def open_position(broker: Broker, symbol: str, pb: dict, entry_estimate: float,
         time.sleep(1.0)
         pos = broker.get_position(symbol, ps)
         if pos is not None and pos.qty > 0:
-            od = broker.get_order(symbol, client_id=f"{client_id_base}_E")
+            od = safe_get_order(broker, symbol, client_id=f"{client_id_base}_E")
             fill = Fill(od.order_id if od else "RECOVERED", f"{client_id_base}_E",
                         symbol, ps, open_side(ps), pos.entry_price, pos.qty)
             notify.feishu_alert(f"market_open timeout but position found, recovered: {symbol} {account}")
@@ -159,14 +163,11 @@ def adopt_position(broker: Broker, symbol: str, intent: dict, qty: float, entry:
 def _ensure_protective(broker: Broker, symbol: str, ps: PosSide, qty: float, price: float,
                        cid: str, kind: str) -> Optional[str]:
     """先按 client id 查保护单是否已活跃，存在则复用；否则挂（确定性 id，重启幂等 §18）。"""
-    try:
-        existing = broker.get_order(symbol, client_id=cid)
-    except Exception:
-        existing = None
-    if existing is not None and existing.state in (OrderState.NEW, OrderState.PARTIALLY_FILLED):
-        return existing.order_id                       # 已挂着 → 复用，不重复挂
+    existing = safe_get_order(broker, symbol, client_id=cid)   # 不抛，UNKNOWN 归一
     if existing is not None and existing.state == OrderState.UNKNOWN:
-        return None                                    # 查单异常，不臆测（下轮 reconcile 再补）
+        raise AdoptUnknownError(cid)                   # 查询不确定是否已挂 → 保持 OPENING（不重复挂、不平退出 §22）
+    if existing is not None and existing.state in (OrderState.NEW, OrderState.PARTIALLY_FILLED):
+        return existing.order_id                       # 已挂着 → 复用
     try:
         if kind == "stop":
             return broker.place_stop_market(symbol, ps, qty, price, cid)
@@ -197,7 +198,7 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
         tp1_done = False
         tp1_dead = ex.get("tp1_order_id") is None                     # 无挂单 → 需降级
         if ex.get("tp1_order_id"):
-            tp1 = broker.get_order(symbol, ex["tp1_order_id"])
+            tp1 = safe_get_order(broker, symbol, ex["tp1_order_id"])
             if tp1 and tp1.state == OrderState.UNKNOWN:
                 return None                                            # 查单异常，本轮不臆测（§19）
             if tp1 and tp1.state == OrderState.FILLED:
@@ -241,7 +242,7 @@ def manage_open_position(broker: Broker, symbol: str, pb: dict,
         tp2_done = False
         tp2_dead = ex.get("tp2_order_id") is None
         if ex.get("tp2_order_id"):
-            tp2 = broker.get_order(symbol, ex["tp2_order_id"])
+            tp2 = safe_get_order(broker, symbol, ex["tp2_order_id"])
             if tp2 and tp2.state == OrderState.UNKNOWN:
                 return None                                            # 查单异常，本轮不臆测（§19）
             if tp2 and tp2.state == OrderState.FILLED:

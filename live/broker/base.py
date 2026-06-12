@@ -114,6 +114,17 @@ def round_to_step(x: float, step: float) -> float:
 
 # ── 接口 ───────────────────────────────────────────────────────────────────────
 
+def safe_get_order(broker: "Broker", symbol: str,
+                   order_id: Optional[str] = None,
+                   client_id: Optional[str] = None) -> Optional["OrderStatus"]:
+    """get_order 的安全封装：任何异常（含 adapter 内部 _inst_meta / public API 抖动）
+    归一为 UNKNOWN，**绝不抛**（§22 不变量3：查询异常只能保持态，不打崩流程）。"""
+    try:
+        return broker.get_order(symbol, order_id=order_id, client_id=client_id)
+    except Exception:
+        return OrderStatus(order_id or "", client_id or "", OrderState.UNKNOWN, 0.0, 0.0)
+
+
 class Broker(ABC):
     """统一下单接口。executor 只调这些方法；两家 adapter 各实现。"""
 

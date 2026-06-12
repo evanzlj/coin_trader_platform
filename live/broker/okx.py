@@ -126,9 +126,10 @@ class OKXBroker(Broker):
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,
                   client_id: Optional[str] = None) -> Optional[OrderStatus]:
-        inst = _inst(symbol)
-        m = self._inst_meta(symbol)
+        m = None
         try:
+            inst = _inst(symbol)
+            m = self._inst_meta(symbol)            # 纳入 try：public instruments 抖动 → UNKNOWN，不外抛（§22）
             if order_id and order_id.startswith("algo:"):
                 oid = order_id.split(":", 1)[1]
                 d = self._data(self.trade.get_algo_order_details(algoId=oid))[0]

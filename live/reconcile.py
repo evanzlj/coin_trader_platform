@@ -14,7 +14,7 @@ import logging
 
 import pandas as pd
 
-from live.broker.base import Broker, PosSide, OrderState
+from live.broker.base import Broker, PosSide, OrderState, safe_get_order
 from live.playbook_fsm import PBStatus, TERMINAL
 from live import notify
 from live import exec_config as cfg
@@ -48,7 +48,7 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
     def filled(oid) -> bool:
         if not oid:
             return False
-        o = broker.get_order(symbol, oid)
+        o = safe_get_order(broker, symbol, oid)
         return o is not None and o.state == OrderState.FILLED
 
     # 有持仓 → 检查 SL 还在否，缺则补挂；补不上则平退出（防无保护裸持 §19/§21）
@@ -96,7 +96,7 @@ def _ensure_sl(broker: Broker, symbol: str, pb: dict) -> bool:
     返回 True = 已平退出（status 改为 DONE_UNKNOWN）。"""
     ex = pb["exec"]
     ps = PosSide(ex["pos_side"])
-    sl = broker.get_order(symbol, ex.get("sl_order_id"))
+    sl = safe_get_order(broker, symbol, ex.get("sl_order_id"))
     if sl is not None and sl.state == OrderState.UNKNOWN:
         return False                                    # 查单异常，本轮不动
     if sl is None or sl.state in (OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED):
@@ -144,7 +144,7 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
     except Exception as e:
         logger.warning("recover_opening %s get_position error, hold OPENING: %s", symbol, e)
         return                                          # 持仓查询 API 异常 → 保持 OPENING（不臆测）
-    od = broker.get_order(symbol, client_id=f"{ex['client_id_base']}_E")
+    od = safe_get_order(broker, symbol, client_id=f"{ex['client_id_base']}_E")
     od_unknown = od is not None and od.state == OrderState.UNKNOWN
 
     if pos is not None and pos.qty > 0:
@@ -157,11 +157,15 @@ def _recover_opening(engine, symbol: str, pb: dict) -> None:
             else:
                 logger.warning("recover_opening %s pos visible but entry_price<=0, hold OPENING", symbol)
                 return                                  # entry_price 未同步 → 保持 OPENING，下 tick 再查
-        from live.position_manager import adopt_position, SLPlacementError, NakedPositionError
+        from live.position_manager import (
+            adopt_position, SLPlacementError, NakedPositionError, AdoptUnknownError,
+        )
         try:
             pb["exec"] = adopt_position(broker, symbol, ex, pos.qty, entry)
             pb["status"] = PBStatus.ACTIVATED.value
             notify.feishu_alert(f"OPENING recovered → adopted ({symbol} {ex.get('account')} qty={pos.qty})")
+        except AdoptUnknownError:
+            return                                      # 保护单查询 UNKNOWN → 保持 OPENING，下 tick 再 adopt（§22）
         except SLPlacementError as e:
             pb["status"] = PBStatus.DONE_UNKNOWN.value
             pb["result"] = "adopt_sl_failed_closed"

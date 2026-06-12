@@ -218,6 +218,36 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")
         self.assertEqual(pb["status"], "ACTIVATED")
 
+    def test_safe_get_order_normalizes_raise(self):
+        # adapter get_order 抛（如 OKX _inst_meta 抖）→ safe_get_order 归一 UNKNOWN，不外抛（§22 不变量3）
+        from live.broker.base import safe_get_order
+        b = MockBroker(spec=SPEC)
+        def boom(*a, **k):
+            raise RuntimeError("order api down")
+        b.get_order = boom
+        o = safe_get_order(b, "BTC/USDT", "x")
+        self.assertEqual(o.state, OrderState.UNKNOWN)
+
+    def test_reconcile_get_order_raise_no_crash(self):
+        # broker.get_order 抛 → reconcile_position 经 safe wrapper 不崩（防 startup/periodic 被打崩 §22 P0）
+        b = MockBroker(spec=SPEC)
+        def boom(*a, **k):
+            raise RuntimeError("order api down")
+        b.get_order = boom
+        pb = self._active()                          # 无持仓 → filled() 经 safe_get_order(UNKNOWN)，不抛
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
+
+    def test_recover_opening_adopt_sl_unknown_holds(self):
+        # adopt 补 SL 时保护单查询 UNKNOWN → 保持 OPENING（不重复挂、不平退出 §22 P1）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700, fail_on={"get_order"})
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)
+        self.assertEqual(pb["status"], "OPENING")
+        self.assertFalse(any(c[0] == "market_close" for c in b.calls))   # 没平退出
+
     def test_no_position_unknown_exit(self):
         # 无持仓 + 订单状态对不上 → 无敞口安全终态（不挂人工，§21）
         b = MockBroker(spec=SPEC)
