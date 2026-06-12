@@ -131,8 +131,17 @@ def _flag_manual(pb: dict, result: str, symbol: str) -> str:
 
 
 def _recover_opening(engine, symbol: str, pb: dict) -> None:
-    """OPENING（开仓中崩溃）恢复（§18 P0-2）：查 {base}_E 订单/实际持仓 → 接管 / 平退出 / 作废 / 保持。
-    任何查询 API 异常（get_position 抛 / get_order UNKNOWN）→ 保持 OPENING，绝不武断判死。"""
+    """OPENING 恢复包装：**永不抛**——任何未预期异常（get_symbol_spec/round 抖等）→ 保持 OPENING，
+    下 tick 重试，绝不打崩 startup/tick/periodic（§22 不变量3）。"""
+    try:
+        _recover_opening_impl(engine, symbol, pb)
+    except Exception as e:
+        logger.warning("recover_opening %s unexpected error, hold OPENING: %s", symbol, e)
+
+
+def _recover_opening_impl(engine, symbol: str, pb: dict) -> None:
+    """查 {base}_E 订单/实际持仓 → 接管 / 平退出 / 作废 / 保持（§18 P0-2）。
+    查询 API 异常（get_position 抛 / get_order UNKNOWN）→ 保持 OPENING，绝不武断判死。"""
     ex = pb.get("exec") or {}
     broker = engine.brokers.get(ex.get("account"))
     if broker is None:

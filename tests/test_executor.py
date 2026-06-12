@@ -248,6 +248,19 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(pb["status"], "OPENING")
         self.assertFalse(any(c[0] == "market_close" for c in b.calls))   # 没平退出
 
+    def test_recover_opening_unexpected_error_holds(self):
+        # _recover_opening 内任何未预期异常（如 get_symbol_spec 抖，adopt round 用到）→ 保持 OPENING，不打崩（§22）
+        from live.reconcile import _recover_opening
+        b = MockBroker(spec=SPEC, fill_price=72700)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        def boom(*a, **k):
+            raise RuntimeError("spec api down")
+        b.get_symbol_spec = boom
+        eng = ExecutorEngine(None, {"a": b}, [])
+        pb = self._opening_pb()
+        _recover_opening(eng, "BTC/USDT", pb)        # 不抛
+        self.assertEqual(pb["status"], "OPENING")
+
     def test_no_position_unknown_exit(self):
         # 无持仓 + 订单状态对不上 → 无敞口安全终态（不挂人工，§21）
         b = MockBroker(spec=SPEC)
