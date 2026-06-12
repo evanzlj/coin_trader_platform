@@ -292,6 +292,37 @@ def scenario_market_open_timeout_recovers(brokers, accts):
     return ok
 
 
+def scenario_crash_tp1hit_be_removed(brokers, accts):
+    """⑦ 崩溃在 TP1_HIT（半仓 + BE 单）+ BE 被撤 → reconcile 补挂 BE（§19/§22）。"""
+    label, broker = _binance_broker(brokers)
+    sym, ps = "BTC/USDT", PosSide.SHORT
+    base = f"fi7{int(time.time()) % 1000000}"
+    broker.set_leverage(sym, ps, 10)
+    fill = broker.market_open(sym, ps, 0.001, f"{base}_E")        # 剩半仓
+    be_price = round(fill.price * 1.001, 1)
+    be = broker.place_stop_market(sym, ps, 0.001, be_price, f"{base}_SBE")
+    tp2 = broker.place_reduce_limit(sym, ps, 0.001, round(fill.price * 0.985, 1), f"{base}_T2")
+    ex = {"account": label, "exchange": "binance", "pos_side": ps.value, "client_id_base": base,
+          "direction": "short", "qty": 0.002, "qty_remaining": 0.001, "half_qty": 0.001,
+          "sl_order_id": be, "tp2_order_id": tp2, "tp1_order_id": None,
+          "sl_price": be_price, "entry_price": fill.price,
+          "tp1": round(fill.price * 0.99, 1), "tp2": round(fill.price * 0.985, 1)}
+    pb = {"hypothesis": "X", "direction": "short", "status": "TP1_HIT", "exec": ex}
+    old_be = ex["sl_order_id"]
+    print(f"  setup: TP1_HIT (half pos + BE={old_be})")
+    broker.cancel_order(sym, order_id=old_be)
+    print("  inject: BE cancelled")
+    reconcile.reconcile_position(broker, sym, pb)
+    new_be = pb["exec"].get("sl_order_id")
+    st = broker.get_order(sym, new_be) if new_be else None
+    ok = bool(new_be) and new_be != old_be and st and st.state == OrderState.NEW
+    print(f"  recover: new BE={new_be} state={st.state.value if st else None}")
+    print(f"  RESULT: {'✓ BE re-armed' if ok else '✗ FAILED'}")
+    _cleanup(broker, ex)
+    print(f"  cleanup: {broker.get_position(sym, ps) or 'FLAT'}")
+    return ok
+
+
 SCENARIOS = {
     "crash_activated_sl_removed": scenario_crash_activated_sl_removed,
     "crash_opening_adopts": scenario_crash_opening_adopts,
@@ -299,6 +330,7 @@ SCENARIOS = {
     "market_open_timeout_recovers": scenario_market_open_timeout_recovers,
     "drain_unknown_then_retry": scenario_drain_unknown_then_retry,
     "position_lag_grace": scenario_position_lag_grace,
+    "crash_tp1hit_be_removed": scenario_crash_tp1hit_be_removed,
 }
 
 
