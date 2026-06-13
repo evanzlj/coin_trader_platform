@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 def _atomic_write(path: Path, data: str) -> None:
     """写临时文件 → os.replace 原子替换（#22 P1：防崩溃半写 CSV）。"""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data)
+    tmp.write_text(data, encoding="utf-8")
     os.replace(tmp, path)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -147,11 +147,20 @@ def export_delta_remote(dataset: str, since_map: dict[tuple[str, str], Optional[
     since_repr = repr({f"{s}|{tf}": v for (s, tf), v in since_map.items()})
 
     script = textwrap.dedent(f"""
-        import sqlite3, csv, pathlib
+        import sqlite3, csv, io as _io, os, pathlib, shutil
 
         DB    = "{REMOTE_DB}"
         OUT   = pathlib.Path("{REMOTE_TMP}/{dataset}")
+
+        # Clear old delta CSVs so stale files are never re-transferred
+        if OUT.exists():
+            shutil.rmtree(OUT)
         OUT.mkdir(parents=True, exist_ok=True)
+
+        def _atomic_write(path, data):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(data, encoding="utf-8")
+            os.replace(tmp, path)
 
         SINCE_MAP = {since_repr}
 
@@ -178,12 +187,12 @@ def export_delta_remote(dataset: str, since_map: dict[tuple[str, str], Optional[
             if not rows:
                 print(f"  [skip] {{symbol}} {{tf}} — no new rows", flush=True)
                 continue
-            import io as _io, csv as _csv
             buf = _io.StringIO()
+            import csv as _csv
             w = _csv.writer(buf)
             w.writerow([d[0] for d in cur.description])
             w.writerows(rows)
-            _atomic_write(out_file, buf.getvalue())                           # #22 P1 原子写
+            _atomic_write(out_file, buf.getvalue())
             print(f"  {{symbol}} {{tf}} → {{len(rows)}} new rows", flush=True)
 
         db.close()
