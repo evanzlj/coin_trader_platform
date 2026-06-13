@@ -1,18 +1,18 @@
 """
-单实例锁（§21.4）—— 防两个 executor 同时跑导致重复下单。
+单实例锁（§21.4）—— 防两个进程同时跑（executor / monitor / openclaw / pusher）。
 
-用 fcntl 排他文件锁；进程退出（正常/崩溃）锁自动释放，无 stale pidfile 问题。
-executor 只在 unix（btc-ml / Mac 开发）跑，不在 Windows 跑。
+Unix：fcntl 排他文件锁。
+Windows：msvcrt.locking 字节范围锁（同样进程退出自动释放，无 stale pidfile）。
 """
 from __future__ import annotations
 
-import fcntl
 import os
+import sys
 from pathlib import Path
 
 
 class AlreadyRunning(RuntimeError):
-    """已有 executor 实例持锁。"""
+    """已有同名实例持锁。"""
 
 
 class SingleInstance:
@@ -22,23 +22,50 @@ class SingleInstance:
 
     def acquire(self) -> None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            self._acquire_win()
+        else:
+            self._acquire_unix()
+
+    def _acquire_unix(self) -> None:
+        import fcntl
         self._fd = open(self.lock_path, "w")
         try:
             fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
             self._fd.close()
             self._fd = None
-            raise AlreadyRunning(
-                f"已有 executor 实例在运行（lock: {self.lock_path}）"
-            ) from e
+            raise AlreadyRunning(f"已有实例在运行（lock: {self.lock_path}）") from e
         self._fd.seek(0)
         self._fd.truncate()
         self._fd.write(str(os.getpid()))
         self._fd.flush()
 
+    def _acquire_win(self) -> None:
+        import msvcrt
+        self._fd = open(self.lock_path, "w")
+        try:
+            # 锁第 0 字节；进程退出时 OS 自动释放
+            msvcrt.locking(self._fd.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            self._fd.close()
+            self._fd = None
+            raise AlreadyRunning(f"已有实例在运行（lock: {self.lock_path}）") from e
+        self._fd.write(str(os.getpid()))
+        self._fd.flush()
+
     def release(self) -> None:
         if self._fd is not None:
-            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    self._fd.seek(0)
+                    msvcrt.locking(self._fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
             self._fd.close()
             self._fd = None
 

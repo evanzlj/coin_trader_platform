@@ -38,10 +38,11 @@ from live import exec_config as cfg
 
 logger = logging.getLogger("signal_pusher")
 
-REMOTE_HOST = "evan@btc-ml"
-REMOTE_ROOT = "/home/evan/repo/coin_trader_platform"
-PUSHED_DIR  = cfg.ROOT / ".signal_pushed"          # 本地去重标记
-HEARTBEAT   = cfg.ROOT / "live" / "heartbeat" / "signal_pusher_last_run.txt"   # watchdog 监控（#13）
+REMOTE_HOST  = "evan@btc-ml"
+REMOTE_ROOT  = "/home/evan/repo/coin_trader_platform"
+PUSHED_DIR   = cfg.ROOT / ".signal_pushed"          # 本地去重标记
+HEARTBEAT    = cfg.ROOT / "live" / "heartbeat" / "signal_pusher_last_run.txt"   # watchdog 监控（#13）
+LOCK_FILE    = cfg.ROOT / "live" / "pusher.lock"
 POLL_SECONDS = 10
 SSH_TIMEOUT  = 60
 
@@ -151,7 +152,16 @@ def push_round() -> tuple[int, int]:
 
 
 def main() -> None:
+    import sys
+    from live.single_instance import SingleInstance, AlreadyRunning
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        _lock = SingleInstance(LOCK_FILE)
+        _lock.acquire()
+    except AlreadyRunning as e:
+        logger.error("signal_pusher already running: %s", e)
+        sys.exit(1)
+
     ap = argparse.ArgumentParser(description="signal_pusher: 中国 signal_active → btc-ml（#11）")
     ap.add_argument("--once", action="store_true", help="推一轮即退出（测试用）")
     args = ap.parse_args()

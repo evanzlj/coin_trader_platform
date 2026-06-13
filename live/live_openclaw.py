@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 SIGNAL_PENDING  = ROOT / "signal_pending"
 SIGNAL_ACTIVE   = ROOT / "signal_active"
 HEARTBEAT_FILE  = ROOT / "live" / "heartbeat" / "openclaw_last_run.txt"
+LOCK_FILE       = ROOT / "live" / "openclaw.lock"
 CDP_URL         = "http://127.0.0.1:18800"
 TIMEOUT        = 360      # per-signal wait timeout (seconds)
 MAX_RETRIES    = 1
@@ -583,13 +584,17 @@ def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
         if not (d / ".ready").exists():
             continue
 
-        # Already processed?
+        # vlm done?  Only skip if package already landed in signal_active/.
+        # If still in signal_pending/, vlm was written but move_to_active crashed —
+        # return it so the cached branch can complete the move.
         vlm = d / "vlm_response.json"
         if vlm.exists():
             try:
                 ex = json.loads(vlm.read_text())
                 if ex.get("watch_summary") and not ex.get("error"):
-                    continue
+                    if (SIGNAL_ACTIVE / d.name).exists():
+                        continue   # fully done
+                    # otherwise: fall through → process_one returns "cached" → move_to_active
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -645,6 +650,14 @@ def resolve_cdp_url(http_url: str) -> str:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    from live.single_instance import SingleInstance, AlreadyRunning
+    try:
+        _lock = SingleInstance(LOCK_FILE)
+        _lock.acquire()
+    except AlreadyRunning as e:
+        logger.error("openclaw already running: %s", e)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="live_openclaw: signal_pending → ChatGPT → vlm_response.json")
     parser.add_argument("--cdp-url", default=CDP_URL)
     parser.add_argument("--delay-min", type=float, default=COOLDOWN_MIN)

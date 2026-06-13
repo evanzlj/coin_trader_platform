@@ -56,7 +56,9 @@ DEDUP_STATE      = ROOT / "live" / "state" / "dedup_state.json"
 BUFFER_STATE_DIR = ROOT / "live" / "state" / "buffer"
 HEARTBEAT_FILE   = ROOT / "live" / "heartbeat" / "monitor_last_run.txt"
 SIGNAL_PENDING   = ROOT / "signal_pending"
+SIGNAL_REJECTED  = ROOT / "signal_rejected"
 CHARTS_DIR       = ROOT / "live" / "charts"
+LOCK_FILE        = ROOT / "live" / "monitor.lock"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 
@@ -150,10 +152,11 @@ def _load_frames(sig: SignalEvent) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
 
 # ── Signal package writer ─────────────────────────────────────────────────────
 
-def write_signal_pending(sig: SignalEvent) -> Path:
+def write_signal_pending(sig: SignalEvent) -> "Path | None":
     """
     Write signal package to signal_pending/{sym}_{grade}_{ts}/.
-    Returns the package directory path.
+    Returns the package directory path, or None if prompt/charts failed
+    (incomplete packages are moved to signal_rejected/ instead).
     """
     sym_slug  = sig.symbol.replace("/", "").lower()
     grade_str = sig.grade.replace("+", "plus")
@@ -163,7 +166,7 @@ def write_signal_pending(sig: SignalEvent) -> Path:
 
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    # signal.json
+    # signal.json — always written (useful for diagnostics in rejected/ too)
     signal_data = {
         "symbol":                 sig.symbol,
         "grade":                  sig.grade,
@@ -179,7 +182,10 @@ def write_signal_pending(sig: SignalEvent) -> Path:
     }
     (pkg_dir / "signal.json").write_text(json.dumps(signal_data, indent=2))
 
-    # prompt — same format as generate_replay_materials.py
+    prompt_ok = False
+    charts_ok = False
+
+    # prompt
     try:
         df15m, df4h, df_flow = _load_frames(sig)
         bundle = build_prompt(sig, df15m, df4h, df_flow)
@@ -188,9 +194,9 @@ def write_signal_pending(sig: SignalEvent) -> Path:
             f.write(bundle.system_text)
             f.write("\n\n=== USER TEXT ===\n")
             f.write(bundle.user_text)
+        prompt_ok = True
     except Exception as e:
         logger.warning("prompt generation failed for %s: %s", pkg_name, e)
-        (pkg_dir / "prompt.txt").write_text(f"[prompt generation error: {e}]")
 
     # charts
     try:
@@ -198,10 +204,24 @@ def write_signal_pending(sig: SignalEvent) -> Path:
         path_4h, path_15m = render(sig, data_dir=DATA_DIR, out_dir=CHARTS_DIR)
         shutil.copy(path_4h,  pkg_dir / path_4h.name)
         shutil.copy(path_15m, pkg_dir / path_15m.name)
+        charts_ok = True
     except Exception as e:
         logger.warning("chart rendering failed for %s: %s", pkg_name, e)
 
-    # .ready marker — openclaw polls for this
+    if not prompt_ok or not charts_ok:
+        # Package is incomplete — move to signal_rejected/ rather than touching .ready
+        SIGNAL_REJECTED.mkdir(parents=True, exist_ok=True)
+        dest = SIGNAL_REJECTED / pkg_name
+        try:
+            if not dest.exists():
+                pkg_dir.rename(dest)
+        except Exception as mv_err:
+            logger.warning("could not move rejected package %s: %s", pkg_name, mv_err)
+        logger.warning("signal rejected (prompt_ok=%s charts_ok=%s): %s",
+                       prompt_ok, charts_ok, pkg_name)
+        return None
+
+    # .ready marker — only written when package is complete
     (pkg_dir / ".ready").touch()
 
     logger.info("signal_pending written: %s", pkg_name)
@@ -278,6 +298,14 @@ async def run_cycle(gen: SignalGenerator, last_bar_time: pd.Timestamp | None,
 
 
 async def main() -> None:
+    from live.single_instance import SingleInstance, AlreadyRunning
+    try:
+        _lock = SingleInstance(LOCK_FILE)
+        _lock.acquire()
+    except AlreadyRunning as e:
+        logger.error("monitor already running: %s", e)
+        sys.exit(1)
+
     SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
 
     dedup, buffer_saved_at_str = load_dedup_state()
