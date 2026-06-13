@@ -5,9 +5,10 @@
 本地维护 state.json（唯一 writer），pusher 只投递**初始包**、绝不覆盖 executor 已接管的。
 
 完整性（取代同机原子 rename，§20.2）：
-  Python tarfile 打包整个包（含 .ready，跨平台、Windows 无需 rsync）
-  → ssh stdin → btc-ml 解到 `.signal_incoming/{pkg}`（signal_active 外）
-  → btc-ml 本地原子 `mv` 到 `signal_active/{pkg}`。
+  Python tarfile 打包 `.ready` + 必要 json（state.json/signal.json/vlm_response.json，
+  跨平台、Windows 无需 rsync）→ ssh stdin → btc-ml 解到 `.signal_incoming/{pkg}`
+  → btc-ml 先校验 `.ready` + `state.json` 存在且 JSON 可读（BAD_PACKAGE=不落 pushed）
+  → `mv -T`（no-clobber）到 `signal_active/{pkg}`。
 executor `load_states` 只认带 .ready 的完整包，mv 完成前看不到 → 绝不读半包。
 
 去重 / 幂等：
@@ -65,24 +66,37 @@ def _mark_pushed(pkg_name: str) -> None:
     (PUSHED_DIR / pkg_name).touch()
 
 
+_PACK_FILES = {".ready", "state.json", "signal.json", "vlm_response.json"}  # 只传必要 json，不传 PNG（缩小带宽/超时窗口）
+
+
 def _tar_bytes(pkg_dir: Path) -> bytes:
-    """把整个包打包成 .tar.gz 字节（含 .ready；arcname=包名，解包后即 {pkg}/...）。"""
+    """只打包必要的元文件（.ready + 几个 json），不传无关大文件（PNG 等）；arcname 带包名前缀。"""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(pkg_dir, arcname=pkg_dir.name)
+        for fn in _PACK_FILES:
+            fp = pkg_dir / fn
+            if fp.exists():
+                tar.add(fp, arcname=f"{pkg_dir.name}/{fn}")
     return buf.getvalue()
 
 
 def _remote_script(pkg_name: str) -> str:
-    """btc-ml 侧：解到 .signal_incoming → 已存在则丢弃(不覆盖) → 否则原子 mv 到 signal_active。"""
+    """btc-ml 侧：解到 .signal_incoming → 校验包完整性 → mv -T no-clobber 到 signal_active。
+    远端失败输出 BAD_PACKAGE（不落 pushed，下轮重试），竞态/已存在输出 SKIP_EXISTS。"""
     return (
         f"set -e; cd {REMOTE_ROOT}; "
         f"mkdir -p .signal_incoming signal_active; "
         f"rm -rf .signal_incoming/{pkg_name}; "
         f"tar -xzf - -C .signal_incoming; "
+        f"# 远端校验：.ready + state.json 存在且 JSON 可读（防源端半坏包，§11 P1）\n"
+        f"p=.signal_incoming/{pkg_name}; "
+        f"if [ ! -f \"$p/.ready\" ] || [ ! -f \"$p/state.json\" ]; then "
+        f"  rm -rf \"$p\"; echo BAD_PACKAGE; exit 0; fi; "
+        f"python3 -c \"import json; json.loads(open('$p/state.json').read())\" 2>/dev/null || "
+        f"  {{ rm -rf \"$p\"; echo BAD_PACKAGE; exit 0; }}; "
         f"if [ -e signal_active/{pkg_name} ] || [ -e signal_done/{pkg_name} ]; then "
-        f"  rm -rf .signal_incoming/{pkg_name}; echo SKIP_EXISTS; "
-        f"else mv .signal_incoming/{pkg_name} signal_active/{pkg_name}; echo MOVED; fi"
+        f"  rm -rf \"$p\"; echo SKIP_EXISTS; "
+        f"else mv -T \"$p\" signal_active/{pkg_name}; echo MOVED; fi"
     )
 
 
@@ -109,6 +123,10 @@ def push_one(pkg_dir: Path) -> bool:
     if out.endswith("SKIP_EXISTS"):
         logger.info("skip %s — already on btc-ml (executor took over)", pkg)
         return True
+    if out.endswith("BAD_PACKAGE"):
+        logger.warning("push %s → BAD_PACKAGE (remote rejected: missing/broken .ready/state.json), "
+                       "will retry next round", pkg)
+        return False
     logger.warning("push %s unexpected remote output: %r / %r", pkg, out, err[:200])
     return False
 
