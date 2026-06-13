@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -79,18 +80,19 @@ async def run(start: str, end: str) -> None:
     # Save buffer state (BarBuffers + state machine bar counts)
     gen.save_buffer_state(BUFFER_STATE_DIR)
 
-    # Save dedup state + buffer_saved_at (end of replay = freshest bar processed)
+    # Save dedup state + buffer_saved_at (end of replay = freshest bar processed).
+    # Atomic write (tmp + os.replace): monitor refuses to start on a corrupt dedup
+    # file, so the producer of that file must never leave a half-written one.
     state = gen.get_dedup_state()
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_PATH, "w") as f:
-        json.dump(
-            {
-                "saved_at":        now.isoformat(),
-                "buffer_saved_at": end,
-                "dedup":           state,
-            },
-            f, indent=2,
-        )
+    payload = {
+        "saved_at":        now.isoformat(),
+        "buffer_saved_at": end,
+        "dedup":           state,
+    }
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
     logger.info("dedup state saved → %s", STATE_PATH)
     logger.info("buffer_saved_at = %s", end)
     for sym, t in state.items():

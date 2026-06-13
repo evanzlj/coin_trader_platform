@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -44,6 +45,7 @@ SIGNAL_ACTIVE   = ROOT / "signal_active"
 SIGNAL_REJECTED = ROOT / "signal_rejected"
 SIGNAL_STALE    = ROOT / "signal_stale"
 HEARTBEAT_FILE  = ROOT / "live" / "heartbeat" / "openclaw_last_run.txt"
+STATUS_FILE     = ROOT / "live" / "heartbeat" / "openclaw_status.json"
 LOCK_FILE       = ROOT / "live" / "openclaw.lock"
 CDP_URL         = "http://127.0.0.1:18800"
 TIMEOUT        = 360      # per-signal wait timeout (seconds)
@@ -282,7 +284,7 @@ async def process_one(page, pkg_dir: Path, retry_budget: int) -> dict:
     # Already done?
     if vlm_path.exists():
         try:
-            existing = json.loads(vlm_path.read_text())
+            existing = json.loads(vlm_path.read_text(encoding="utf-8"))
             if existing.get("watch_summary") and not existing.get("error"):
                 return {"dir": dir_name, "status": "cached"}
         except (json.JSONDecodeError, OSError):
@@ -400,23 +402,31 @@ async def process_one(page, pkg_dir: Path, retry_budget: int) -> dict:
 
 # ── Package archival helper ───────────────────────────────────────────────────
 
-def _archive_package(pkg_dir: Path, dest_dir: Path, reason: str) -> None:
-    """Write reject_reason.txt then rename pkg_dir → dest_dir/. Silent on race / already-exists."""
+def _archive_package(pkg_dir: Path, dest_dir: Path, reason: str) -> bool:
+    """Write reject_reason.txt then rename pkg_dir → dest_dir/. Returns True if the
+    source left signal_pending/.
+
+    Idempotency (#22 P1): if the destination already exists we must STILL move the
+    source out of signal_pending — otherwise the same package is re-scanned and
+    re-rejected every poll forever. On conflict we append a microsecond timestamp
+    suffix (the reject_reason is preserved inside the dir either way).
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
         (pkg_dir / "reject_reason.txt").write_text(reason, encoding="utf-8")
     except Exception:
         pass
     dest = dest_dir / pkg_dir.name
+    if dest.exists():
+        suffix = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        dest = dest_dir / f"{pkg_dir.name}__dup_{suffix}"
     try:
-        if not dest.exists():
-            pkg_dir.rename(dest)
-            logger.info("archived → %s/ (%s): %s", dest_dir.name, reason, pkg_dir.name)
-        else:
-            logger.warning("dest already exists, skipping archive: %s → %s/",
-                           pkg_dir.name, dest_dir.name)
+        pkg_dir.rename(dest)
+        logger.info("archived → %s/ (%s): %s", dest_dir.name, reason, dest.name)
+        return True
     except Exception as e:
         logger.warning("archive failed for %s: %s", pkg_dir.name, e)
+        return False
 
 
 # ── Post-VLM filter + signal_active/ move ────────────────────────────────────
@@ -564,31 +574,35 @@ def _build_state(signal: dict, valid_playbooks: list[dict], pkg_name: str) -> di
     }
 
 
-def move_to_active(pkg_dir: Path, signal: dict, vlm: dict) -> bool:
+def move_to_active(pkg_dir: Path, signal: dict, vlm: dict) -> str:
     """
     Apply post-VLM filter, build state.json, move pkg_dir → signal_active/.
-    Returns True if moved, False if filtered out (no valid playbooks).
+    Returns one of: "moved" (handed to executor), "rejected" (no valid playbooks),
+    "exists" (executor already had it; pending copy archived).
     """
     valid_pbs = _filter_playbooks(signal, vlm)
     if not valid_pbs:
         logger.info("all playbooks filtered for %s → signal_rejected/", pkg_dir.name)
         _archive_package(pkg_dir, SIGNAL_REJECTED, "filtered_no_valid_playbooks")
-        return False
+        return "rejected"
 
     state = _build_state(signal, valid_pbs, pkg_dir.name)
     (pkg_dir / "state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=2)
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     SIGNAL_ACTIVE.mkdir(parents=True, exist_ok=True)
     dest = SIGNAL_ACTIVE / pkg_dir.name
     if dest.exists():
-        logger.warning("signal_active/%s already exists — skipping move", pkg_dir.name)
-        return True
+        # Executor already owns this package — don't clobber its authoritative copy,
+        # but DO get the redundant pending copy out of signal_pending/ (idempotency).
+        logger.warning("signal_active/%s already exists — archiving pending copy", pkg_dir.name)
+        _archive_package(pkg_dir, SIGNAL_REJECTED, "already_in_signal_active")
+        return "exists"
 
     pkg_dir.rename(dest)
     logger.info("moved to signal_active/: %s (%d playbooks)", pkg_dir.name, len(valid_pbs))
-    return True
+    return "moved"
 
 
 # ── Pending queue helpers ─────────────────────────────────────────────────────
@@ -614,10 +628,14 @@ def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
         vlm = d / "vlm_response.json"
         if vlm.exists():
             try:
-                ex = json.loads(vlm.read_text())
+                ex = json.loads(vlm.read_text(encoding="utf-8"))
                 if ex.get("watch_summary") and not ex.get("error"):
                     if (SIGNAL_ACTIVE / d.name).exists():
-                        continue   # fully done
+                        # Executor already owns it. Don't just `continue` (that leaves a
+                        # residual pending dir re-scanned every poll) — archive the
+                        # redundant pending copy out of signal_pending/ (F8).
+                        _archive_package(d, SIGNAL_REJECTED, "already_in_signal_active")
+                        continue
                     # otherwise: fall through → process_one returns "cached" → move_to_active
             except (json.JSONDecodeError, OSError):
                 pass
@@ -626,7 +644,7 @@ def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
         sig_file = d / "signal.json"
         if sig_file.exists():
             try:
-                sig = json.loads(sig_file.read_text())
+                sig = json.loads(sig_file.read_text(encoding="utf-8"))
                 if sig.get("grade") == "A+":
                     _archive_package(d, SIGNAL_STALE, "a_plus_not_live")
                     continue
@@ -652,7 +670,24 @@ def extract_symbol(dir_name: str) -> str:
 def update_heartbeat() -> None:
     """Write current timestamp to heartbeat file for watchdog."""
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat())
+    HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat(), encoding="utf-8")
+
+
+def write_openclaw_status(stats: dict) -> None:
+    """Atomically write functional-health status for the watchdog (#13).
+
+    Tracks cumulative processed/moved/rejected/blocked/move_failures plus
+    consecutive_rejections (resets to 0 on any successful move). The watchdog
+    --role china alerts when consecutive_rejections / move_failures / parse_errs
+    breach thresholds — a producer that parses/moves nothing is functionally
+    dead even though its heartbeat is fresh.
+    """
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(stats)
+    payload["updated_at"] = pd.Timestamp.now("UTC").isoformat()
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATUS_FILE)
 
 
 def resolve_cdp_url(http_url: str) -> str:
@@ -716,12 +751,28 @@ async def main() -> None:
         current_symbol = None
         needs_fresh_chat = True
 
+        # Cumulative functional-health counters (process lifetime). consecutive_rejections
+        # resets to 0 on any successful move → it's the "producer is alive AND productive"
+        # signal the watchdog keys off.
+        stats = {
+            "processed":              0,
+            "moved":                  0,
+            "rejected":               0,
+            "blocked":                0,
+            "move_failures":          0,
+            "parse_errs":             0,
+            "consecutive_rejections": 0,
+            "last_success_at":        None,
+            "last_error":             None,
+        }
+
         while True:
             stale_cutoff = pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS)
             pending = get_pending(stale_cutoff)
 
             if not pending:
                 update_heartbeat()
+                write_openclaw_status(stats)
                 logger.debug("no pending packages — sleeping %ds", POLL_INTERVAL)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
@@ -729,6 +780,10 @@ async def main() -> None:
             logger.info("%d package(s) pending", len(pending))
 
             for pkg_dir in pending:
+                # Heartbeat per package: a batch of 3 × 360s timeout could otherwise
+                # approach the watchdog's 20-min stale threshold (#13).
+                update_heartbeat()
+                stats["processed"] += 1
                 sym = extract_symbol(pkg_dir.name)
 
                 if needs_fresh_chat or current_symbol is None or sym != current_symbol:
@@ -751,26 +806,34 @@ async def main() -> None:
                 result = await process_one(page, pkg_dir, MAX_RETRIES)
                 s = result["status"]
 
-                if s == "ok":
-                    logger.info("ok: %s  (%d chars, %d playbooks)",
-                                result["dir"], result["chars"], result["pbs"])
+                if s in ("ok", "cached"):
+                    if s == "ok":
+                        logger.info("ok: %s  (%d chars, %d playbooks)",
+                                    result["dir"], result["chars"], result["pbs"])
+                    else:
+                        logger.info("cached: %s", result["dir"])
                     try:
-                        signal = json.loads((pkg_dir / "signal.json").read_text())
-                        vlm    = json.loads((pkg_dir / "vlm_response.json").read_text())
-                        move_to_active(pkg_dir, signal, vlm)
+                        signal = json.loads((pkg_dir / "signal.json").read_text(encoding="utf-8"))
+                        vlm    = json.loads((pkg_dir / "vlm_response.json").read_text(encoding="utf-8"))
+                        outcome = move_to_active(pkg_dir, signal, vlm)   # #22 P1：有 playbooks → executor 接管
+                        if outcome in ("moved", "exists"):
+                            stats["moved"] += 1
+                            stats["consecutive_rejections"] = 0
+                            stats["last_success_at"] = pd.Timestamp.now("UTC").isoformat()
+                        else:  # "rejected": all playbooks filtered
+                            stats["rejected"] += 1
+                            stats["consecutive_rejections"] += 1
                     except Exception as e:
                         logger.warning("move_to_active failed for %s: %s", pkg_dir.name, e)
-                elif s == "cached":
-                    logger.info("cached: %s", result["dir"])
-                    try:
-                        signal = json.loads((pkg_dir / "signal.json").read_text())
-                        vlm    = json.loads((pkg_dir / "vlm_response.json").read_text())
-                        move_to_active(pkg_dir, signal, vlm)    # #22 P1：有 playbooks → executor 接管
-                    except Exception as e:
-                        logger.warning("move_to_active failed for cached %s: %s", pkg_dir.name, e)
+                        stats["move_failures"] += 1
+                        stats["consecutive_rejections"] += 1
+                        stats["last_error"] = f"move_to_active: {str(e)[:120]}"
                 elif s == "blocked":
                     logger.error("BLOCKED: %s — %s", result["dir"], result.get("error", ""))
                     logger.error("pausing — please resolve and restart")
+                    stats["blocked"] += 1
+                    stats["last_error"] = f"blocked: {result.get('error', '')[:120]}"
+                    write_openclaw_status(stats)
                     await browser.close()
                     return
                 else:
@@ -779,9 +842,17 @@ async def main() -> None:
                         pkg_dir, SIGNAL_REJECTED,
                         f"{s}:{result.get('error', '')[:100]}",
                     )
+                    stats["rejected"] += 1
+                    stats["consecutive_rejections"] += 1
+                    if s == "parse_err":
+                        stats["parse_errs"] += 1
+                    stats["last_error"] = f"{s}: {result.get('error', '')[:120]}"
 
                 if s not in ("ok", "cached"):
                     needs_fresh_chat = True
+
+                update_heartbeat()
+                write_openclaw_status(stats)
 
                 # Cooldown between signals (skip after last in batch)
                 remaining = get_pending(pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS))
@@ -791,6 +862,7 @@ async def main() -> None:
                     await asyncio.sleep(delay)
 
             update_heartbeat()
+            write_openclaw_status(stats)
 
             # Brief pause before next poll
             await asyncio.sleep(POLL_INTERVAL)

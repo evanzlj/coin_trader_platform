@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -170,8 +171,18 @@ class SignalGenerator:
         Serialize all BarBuffers to parquet files in state_dir.
         One file per (symbol, timeframe): buf_{slug}_{tf}.parquet
         Also saves state machine bar counts and a saved_at timestamp.
+
+        Every file is written atomically (tmp + os.replace): monitor calls this
+        periodically while running, and a crash mid-write must never leave a
+        half-written parquet/json that the next startup's load_buffer_state chokes on.
+        saved_at.txt is written *last* so it only appears once all buffers are durable.
         """
         state_dir.mkdir(parents=True, exist_ok=True)
+
+        def _atomic(path: Path, write_fn) -> None:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            write_fn(tmp)
+            os.replace(tmp, path)
 
         for (sym, tf), buf in self._bufs.items():
             bars = list(buf._bars)
@@ -193,13 +204,15 @@ class SignalGenerator:
             df = pd.DataFrame(rows)
             df["open_time"]  = pd.to_datetime(df["open_time"],  utc=True)
             df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
-            df.to_parquet(state_dir / f"buf_{slug}_{tf}.parquet", index=False)
+            _atomic(state_dir / f"buf_{slug}_{tf}.parquet",
+                    lambda p, _df=df: _df.to_parquet(p, index=False))
 
         sm_counts = {sym: self._sm[sym]._bar_count for sym in self.symbols}
-        with open(state_dir / "sm_bar_counts.json", "w") as f:
-            json.dump(sm_counts, f)
+        _atomic(state_dir / "sm_bar_counts.json",
+                lambda p: p.write_text(json.dumps(sm_counts), encoding="utf-8"))
 
-        (state_dir / "saved_at.txt").write_text(pd.Timestamp.utcnow().isoformat())
+        _atomic(state_dir / "saved_at.txt",
+                lambda p: p.write_text(pd.Timestamp.utcnow().isoformat(), encoding="utf-8"))
         logger.info("buffer state saved → %s (%d symbol×tf buffers)", state_dir,
                     sum(1 for buf in self._bufs.values() if buf._bars))
 
@@ -207,48 +220,60 @@ class SignalGenerator:
         """
         Load BarBuffers from parquet files in state_dir via BarBuffer.seed().
         Returns the saved_at timestamp if successful, else None.
+
+        Corruption-tolerant: a bad parquet / json / saved_at (e.g. a crash that
+        slipped past the atomic write, or a truncated file) must NOT take monitor
+        down — it logs a warning and returns None so the caller falls back to a full
+        warmup instead of starting with partial/garbage buffers.
         """
         if not state_dir.exists():
             return None
 
-        loaded = 0
-        for (sym, tf), buf in self._bufs.items():
-            slug = sym.replace("/", "").lower()
-            path = state_dir / f"buf_{slug}_{tf}.parquet"
-            if not path.exists():
-                continue
-            df = pd.read_parquet(path)
-            bars = [
-                Bar(
-                    symbol    = row.symbol,
-                    timeframe = row.timeframe,
-                    open_time = pd.Timestamp(row.open_time).tz_convert("UTC"),
-                    close_time= pd.Timestamp(row.close_time).tz_convert("UTC"),
-                    open      = float(row.open),
-                    high      = float(row.high),
-                    low       = float(row.low),
-                    close     = float(row.close),
-                    volume    = float(row.volume),
-                    is_closed = bool(row.is_closed),
-                )
-                for row in df.itertuples(index=False)
-            ]
-            buf.seed(bars)
-            loaded += 1
+        try:
+            loaded = 0
+            for (sym, tf), buf in self._bufs.items():
+                slug = sym.replace("/", "").lower()
+                path = state_dir / f"buf_{slug}_{tf}.parquet"
+                if not path.exists():
+                    continue
+                df = pd.read_parquet(path)
+                bars = [
+                    Bar(
+                        symbol    = row.symbol,
+                        timeframe = row.timeframe,
+                        open_time = pd.Timestamp(row.open_time).tz_convert("UTC"),
+                        close_time= pd.Timestamp(row.close_time).tz_convert("UTC"),
+                        open      = float(row.open),
+                        high      = float(row.high),
+                        low       = float(row.low),
+                        close     = float(row.close),
+                        volume    = float(row.volume),
+                        is_closed = bool(row.is_closed),
+                    )
+                    for row in df.itertuples(index=False)
+                ]
+                buf.seed(bars)
+                loaded += 1
 
-        sm_path = state_dir / "sm_bar_counts.json"
-        if sm_path.exists():
-            with open(sm_path) as f:
-                counts = json.load(f)
-            for sym, count in counts.items():
-                if sym in self._sm:
-                    self._sm[sym]._bar_count = int(count)
+            sm_path = state_dir / "sm_bar_counts.json"
+            if sm_path.exists():
+                counts = json.loads(sm_path.read_text(encoding="utf-8"))
+                for sym, count in counts.items():
+                    if sym in self._sm:
+                        self._sm[sym]._bar_count = int(count)
 
-        sat_path = state_dir / "saved_at.txt"
-        if loaded == 0 or not sat_path.exists():
+            sat_path = state_dir / "saved_at.txt"
+            if loaded == 0 or not sat_path.exists():
+                return None
+
+            saved_at = pd.Timestamp(sat_path.read_text(encoding="utf-8").strip(), tz="UTC")
+        except Exception as e:
+            # Reset any partially-seeded buffers so we don't run on a half-loaded state.
+            for buf in self._bufs.values():
+                buf._bars.clear()
+            logger.warning("buffer state load failed (%s) — falling back to full warmup", e)
             return None
 
-        saved_at = pd.Timestamp(sat_path.read_text().strip(), tz="UTC")
         logger.info("buffer state loaded from %s (saved_at=%s)", state_dir, saved_at)
         return saved_at
 

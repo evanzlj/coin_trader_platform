@@ -20,6 +20,7 @@ Usage (standalone):
 
 from __future__ import annotations
 
+import ast
 import csv
 import io
 import logging
@@ -77,6 +78,15 @@ class GapError(Exception):
 
 def _slug(symbol: str) -> str:
     return symbol.replace("/", "").lower()
+
+
+def _parse_remote_literal(stdout: str):
+    """Parse a remote python `print(repr(...))` payload safely (F3).
+
+    Uses ast.literal_eval — only Python literals (lists/tuples/str/num/None) are
+    accepted; arbitrary remote stdout can never be *executed* as code.
+    """
+    return ast.literal_eval(stdout.strip())
 
 
 def _ssh_run(cmd: list[str], check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
@@ -205,10 +215,51 @@ def export_delta_remote(dataset: str, since_map: dict[tuple[str, str], Optional[
 
 # ── Transfer + append ─────────────────────────────────────────────────────────
 
+def _merge_dedup_sort(local_csv: Path, delta_text: str) -> tuple[int, int]:
+    """Merge delta CSV text into local_csv: union → dedup on open_time → sort → atomic write.
+
+    Returns (delta_new_count, duplicates_dropped):
+      - delta_new_count = number of distinct delta open_times NOT already in the local
+        CSV. This is the count of genuinely-new bars — *not* the net row delta. The two
+        differ when the merge also cleans pre-existing duplicate rows out of the local
+        file: net rows could be 0 while new bars were in fact added. Using the net would
+        make the caller skip the continuity check on a file that just grew (F3 follow-up).
+      - duplicates_dropped = rows removed by dedup (existing dups + delta repeats).
+
+    Idempotent: replaying the same delta after a partial-success retry adds nothing.
+    """
+    delta = pd.read_csv(io.StringIO(delta_text))
+    if delta.empty:
+        return 0, 0
+
+    delta_keys = pd.to_datetime(delta["open_time"], utc=True)
+    if local_csv.exists():
+        existing = pd.read_csv(local_csv)
+        existing_keys = set(pd.to_datetime(existing["open_time"], utc=True))
+        combined = pd.concat([existing, delta], ignore_index=True)
+    else:
+        existing_keys = set()
+        combined = delta
+
+    # Genuinely-new bars = distinct delta open_times absent from the existing file.
+    distinct_delta = delta_keys.drop_duplicates()
+    delta_new_count = int((~distinct_delta.isin(existing_keys)).sum())
+
+    total_rows = len(combined)
+    # Dedup keeping the last (freshest) copy, then sort chronologically.
+    key = pd.to_datetime(combined["open_time"], utc=True)
+    combined = combined.assign(_k=key).sort_values("_k").drop_duplicates(
+        "_k", keep="last").drop(columns="_k").reset_index(drop=True)
+
+    duplicates = total_rows - len(combined)
+    _atomic_write(local_csv, combined.to_csv(index=False))
+    return delta_new_count, duplicates
+
+
 def transfer_and_append(dataset: str) -> dict[Path, int]:
     """
-    ssh+tar the remote delta dir, append new rows to local CSVs.
-    Returns {csv_path: rows_appended}.
+    ssh+tar the remote delta dir, merge new rows into local CSVs (dedup + sort, atomic).
+    Returns {csv_path: rows_added}.
     """
     import tarfile
 
@@ -227,47 +278,67 @@ def transfer_and_append(dataset: str) -> dict[Path, int]:
                 logger.warning("local CSV not found, skipping append: %s", local_csv)
                 continue
 
-            raw = tar.extractfile(member).read().decode()
-            lines = raw.splitlines()
+            delta_text = tar.extractfile(member).read().decode("utf-8")
+            lines = delta_text.splitlines()
             if len(lines) <= 1:
                 continue  # header only, no data
 
-            # Skip header row, append data rows
-            data_rows = lines[1:]
-            existing = local_csv.read_text()
-            _atomic_write(local_csv, existing.rstrip("\n") + "\n" + "\n".join(data_rows) + "\n")  # #22 P1
-
-            appended[local_csv] = len(data_rows)
-            logger.info("  appended %d rows → %s", len(data_rows), local_csv.name)
+            new_bars, duplicates = _merge_dedup_sort(local_csv, delta_text)
+            appended[local_csv] = new_bars
+            if duplicates:
+                # Not silent: a retry re-delivering already-stored rows lands here.
+                logger.warning("  %s: dropped %d duplicate open_time row(s) on merge",
+                               local_csv.name, duplicates)
+            logger.info("  merged %d new bar(s) → %s", new_bars, local_csv.name)
 
     return appended
 
 
 # ── Gap detection ─────────────────────────────────────────────────────────────
 
-def check_gap(csv_path: Path, tf: str) -> Optional[tuple[str, str]]:
+def check_gap(csv_path: Path, tf: str, n_rows: int = 0) -> Optional[tuple[str, str, str]]:
     """
-    Check the last ~10 rows of csv_path for continuity.
-    Returns (gap_start, gap_end) as ISO strings if a gap is found, else None.
+    Check the tail of csv_path for continuity over at least the freshly-appended range.
+
+    Window = last max(10, n_rows + 10) rows so a gap *inside* a large append block (e.g.
+    the first fetch after an outage) is not missed by a fixed tail(10).
+
+    Returns (kind, a, b) where kind is one of:
+      - "gap"        : a→b spans more than 1.5× the bar interval (fillable)
+      - "duplicate"  : a==b open_time appears twice (data integrity — not fillable)
+      - "reverse"    : open_time goes backwards a→b (data integrity — not fillable)
+    Returns None if the tail is clean. Never silently passes a corrupt tail.
     """
     interval = pd.Timedelta(minutes=INTERVAL_MINUTES.get(tf, 15))
     try:
         df = pd.read_csv(csv_path, usecols=["open_time"])
         if len(df) < 2:
             return None
-        # Check last 10 rows for efficiency
-        tail = pd.to_datetime(df["open_time"].tail(10), utc=True)
+        window = max(10, int(n_rows) + 10)
+        tail = pd.to_datetime(df["open_time"].tail(window), utc=True).reset_index(drop=True)
         diffs = tail.diff().dropna()
+
+        # Duplicate open_time (diff == 0)
+        dup = diffs[diffs == pd.Timedelta(0)]
+        if not dup.empty:
+            i = dup.index[0]
+            return "duplicate", tail.iloc[i - 1].isoformat(), tail.iloc[i].isoformat()
+
+        # Out-of-order / reverse (diff < 0)
+        rev = diffs[diffs < pd.Timedelta(0)]
+        if not rev.empty:
+            i = rev.index[0]
+            return "reverse", tail.iloc[i - 1].isoformat(), tail.iloc[i].isoformat()
+
+        # Gap (diff > 1.5× interval)
         bad = diffs[diffs > interval * 1.5]
-        if bad.empty:
-            return None
-        # First gap found
-        idx = bad.index[0]
-        gap_start = tail.iloc[tail.index.get_loc(idx) - 1].isoformat()
-        gap_end   = tail.loc[idx].isoformat()
-        return gap_start, gap_end
+        if not bad.empty:
+            i = bad.index[0]
+            return "gap", tail.iloc[i - 1].isoformat(), tail.iloc[i].isoformat()
+
+        return None
     except Exception as e:
-        logger.warning("gap check failed for %s: %s", csv_path.name, e)
+        logger.warning("continuity check failed for %s: %s", csv_path.name, e)
         return None
 
 
@@ -303,7 +374,7 @@ def fill_gap_remote(dataset: str, symbol: str, tf: str,
     """)
 
     result = _ssh_python(script)
-    raw_rows = eval(result.stdout.strip())  # list of lists
+    raw_rows = _parse_remote_literal(result.stdout)  # list of lists — literal_eval, never exec remote stdout
     if not raw_rows:
         return
 
@@ -319,7 +390,7 @@ def fill_gap_remote(dataset: str, symbol: str, tf: str,
         f"cur=db.execute('SELECT {cols} FROM {table} LIMIT 0'); "
         f"print([d[0] for d in cur.description])"
     )
-    header = eval(header_cur.stdout.strip())
+    header = _parse_remote_literal(header_cur.stdout)
     gap_df = pd.DataFrame(raw_rows, columns=header)
     gap_df["open_time"] = pd.to_datetime(gap_df["open_time"], utc=True)
 
@@ -343,20 +414,23 @@ def fetch_delta(datasets: Optional[list[str]] = None) -> None:
 
     for dataset in datasets:
         tfs = OHLCV_TFS if dataset == "ohlcv" else FLOW_TFS
-        since_map = _build_since_map(dataset)
 
-        # Log what we're fetching
-        for (sym, tf), since in since_map.items():
-            logger.debug("  %s %s %s: since=%s", dataset, sym, tf, since or "beginning")
-
-        # Retry loop
+        # Retry loop. since_map is recomputed *inside* each attempt from the current CSV
+        # tails (F1): if a previous attempt partially appended before failing, the next
+        # attempt's `since` already reflects the new tail, so it never re-fetches rows
+        # that already landed. (transfer_and_append also dedups as a second line of
+        # defence.)
         last_exc: Optional[Exception] = None
+        appended: dict[Path, int] = {}
         for attempt, delay in enumerate([0] + RETRY_DELAYS):
             if delay:
                 logger.warning("fetch attempt %d failed, retrying in %ds: %s",
                                attempt, delay, last_exc)
                 time.sleep(delay)
             try:
+                since_map = _build_since_map(dataset)
+                for (sym, tf), since in since_map.items():
+                    logger.debug("  %s %s %s: since=%s", dataset, sym, tf, since or "beginning")
                 export_delta_remote(dataset, since_map)
                 appended = transfer_and_append(dataset)
                 break
@@ -365,19 +439,27 @@ def fetch_delta(datasets: Optional[list[str]] = None) -> None:
         else:
             raise FetchError(f"fetch_delta failed after retries: {last_exc}")
 
-        # Gap check for each appended file
+        # Continuity check for each appended file (covers the appended range, F4)
         for csv_path, n_rows in appended.items():
             if n_rows == 0:
                 continue
             # Determine timeframe from filename (e.g. btcusdt_15m.csv → 15m)
             tf = csv_path.stem.rsplit("_", 1)[-1]
-            gap = check_gap(csv_path, tf)
-            if gap is None:
+            issue = check_gap(csv_path, tf, n_rows=n_rows)
+            if issue is None:
                 continue
 
-            gap_start, gap_end = gap
+            kind, a, b = issue
+
+            # Duplicate / reverse = data-integrity corruption — filling won't help.
+            if kind in ("duplicate", "reverse"):
+                raise GapError(
+                    f"{kind} open_time in {csv_path.name} ({a} → {b}) — "
+                    "data integrity violation, not fetching"
+                )
+
             logger.warning("gap detected in %s: %s → %s — attempting fill",
-                           csv_path.name, gap_start, gap_end)
+                           csv_path.name, a, b)
 
             # Identify symbol from filename
             slug_tf = csv_path.stem           # e.g. "btcusdt_15m"
@@ -387,11 +469,11 @@ def fetch_delta(datasets: Optional[list[str]] = None) -> None:
                 raise GapError(f"gap in {csv_path.name}: unknown symbol slug '{slug}'")
 
             try:
-                fill_gap_remote(dataset, sym, tf, gap_start, gap_end)
-                # Re-check after fill
-                if check_gap(csv_path, tf) is not None:
+                fill_gap_remote(dataset, sym, tf, a, b)
+                # Re-check after fill (full tail incl. the filled range)
+                if check_gap(csv_path, tf, n_rows=n_rows) is not None:
                     raise GapError(
-                        f"gap in {csv_path.name} ({gap_start} → {gap_end}) "
+                        f"gap in {csv_path.name} ({a} → {b}) "
                         "persists after fill attempt — btc-ml may have missing data"
                     )
             except GapError:

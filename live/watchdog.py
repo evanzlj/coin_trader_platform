@@ -47,11 +47,15 @@ class ProcSpec:
 
 @dataclass(frozen=True)
 class StatusSpec:
-    """Check functional-health status JSON (monitor/pusher write these every cycle)."""
+    """Check functional-health status JSON (monitor/openclaw/pusher write these every cycle).
+
+    `thresholds` maps a status field → alert-if-value-is >= threshold. This is generic
+    so each producer reports its own health metrics (fetch failures, write failures,
+    consecutive rejections, parse errors, backlog) without a bespoke check per process.
+    """
     name: str
     status_file: Path
-    max_consecutive_failures: int   # alert if >= this
-    max_backlog: int                # alert if >= this
+    thresholds: tuple[tuple[str, int], ...]
 
 
 def _hb(name: str) -> Path:
@@ -71,13 +75,25 @@ SPECS: dict[str, list[ProcSpec]] = {
     ],
 }
 
-# Functional-health status specs (written by monitor/pusher each cycle)
+# Functional-health status specs (written by monitor/openclaw/pusher each cycle).
+# A process whose heartbeat is fresh can still be functionally dead (fetching but never
+# writing packages, parsing nothing, rejecting everything) — these catch that.
 STATUS_SPECS: dict[str, list[StatusSpec]] = {
     "china": [
-        StatusSpec("monitor",       HEARTBEAT_DIR / "monitor_status.json",  3, 10),
-        StatusSpec("signal_pusher", HEARTBEAT_DIR / "pusher_status.json",   3,  5),
+        StatusSpec("monitor", HEARTBEAT_DIR / "monitor_status.json",
+                   (("consecutive_failures", 3), ("backlog_count", 10),
+                    ("package_write_failures", 3))),
+        StatusSpec("signal_pusher", HEARTBEAT_DIR / "pusher_status.json",
+                   (("consecutive_failures", 3), ("backlog_count", 5))),
+        StatusSpec("openclaw", HEARTBEAT_DIR / "openclaw_status.json",
+                   (("consecutive_rejections", 5), ("move_failures", 3),
+                    ("parse_errs", 5))),
     ],
 }
+
+# Fields whose alert line should append last_error for context.
+_ERR_CONTEXT_FIELDS = {"consecutive_failures", "consecutive_rejections",
+                       "move_failures", "package_write_failures"}
 
 
 def check_status(spec: StatusSpec) -> str | None:
@@ -85,17 +101,21 @@ def check_status(spec: StatusSpec) -> str | None:
     if not spec.status_file.exists():
         return None  # process hasn't written a full cycle yet — don't alarm
     try:
-        data = json.loads(spec.status_file.read_text())
+        data = json.loads(spec.status_file.read_text(encoding="utf-8"))
     except Exception as e:
         return f"{spec.name}: status file unreadable ({e})"
-    failures = int(data.get("consecutive_failures", 0))
-    backlog  = int(data.get("backlog_count", 0))
     last_err = str(data.get("last_error") or "")
     alerts = []
-    if failures >= spec.max_consecutive_failures:
-        alerts.append(f"consecutive_failures={failures}: {last_err[:80]}")
-    if backlog >= spec.max_backlog:
-        alerts.append(f"backlog={backlog}")
+    for field, threshold in spec.thresholds:
+        try:
+            val = int(data.get(field, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if val >= threshold:
+            if field in _ERR_CONTEXT_FIELDS and last_err:
+                alerts.append(f"{field}={val}: {last_err[:80]}")
+            else:
+                alerts.append(f"{field}={val}")
     return f"{spec.name}: {'; '.join(alerts)}" if alerts else None
 
 

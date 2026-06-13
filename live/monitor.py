@@ -64,8 +64,9 @@ STATUS_FILE      = ROOT / "live" / "heartbeat" / "monitor_status.json"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 
-POLL_INTERVAL   = 30   # seconds between new-bar checks
-SIGNAL_TTL_BARS = 2    # discard signal_pending entries older than this many bars (30 min)
+POLL_INTERVAL        = 30    # seconds between new-bar checks
+SIGNAL_TTL_BARS      = 2     # discard signal_pending entries older than this many bars (30 min)
+BUFFER_SAVE_SECONDS  = 600   # F6: persist buffer state at most this often during operation
 
 # ── Per-symbol live filters ───────────────────────────────────────────────────
 # Matches research findings; applied after VLM response but pre-scored here
@@ -100,45 +101,105 @@ def _passes_filter(sig: SignalEvent) -> tuple[bool, str]:
 
 # ── Dedup state I/O ───────────────────────────────────────────────────────────
 
+class DedupStateError(RuntimeError):
+    """dedup_state.json exists but is corrupt/unreadable — refuse to start blind."""
+
+
 def load_dedup_state() -> tuple[dict, str | None]:
-    """Returns (dedup_dict, buffer_saved_at_str | None)."""
+    """Returns (dedup_dict, buffer_saved_at_str | None).
+
+    A missing file → empty state (first run / pre-warmup). A *corrupt* file
+    (half-written / invalid JSON) raises DedupStateError instead of being
+    silently swallowed: starting with unknown dedup state would replay old
+    signals. Caller (main) turns this into an explicit status + non-zero exit.
+    """
     if not DEDUP_STATE.exists():
         logger.warning("dedup_state.json not found — run warmup_replay.py first")
         return {}, None
-    with open(DEDUP_STATE) as f:
-        data = json.load(f)
+    try:
+        data = json.loads(DEDUP_STATE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        raise DedupStateError(
+            f"dedup_state.json corrupt/unreadable ({e}); refusing to start with "
+            f"unknown dedup state — fix the file or rerun warmup_replay.py"
+        ) from e
     return data.get("dedup", {}), data.get("buffer_saved_at")
 
 
-def save_dedup_state(gen: SignalGenerator, buffer_saved_at: str | None = None) -> None:
+def _cursor_iso(cursors: "dict[str, pd.Timestamp | None] | None") -> dict:
+    if not cursors:
+        return {}
+    return {s: (t.isoformat() if t is not None else None) for s, t in cursors.items()}
+
+
+def save_dedup_state(gen: SignalGenerator,
+                     cursors: "dict[str, pd.Timestamp | None] | None" = None) -> None:
+    """Atomically persist dedup state + per-symbol cursors.
+
+    buffer_saved_at is the *minimum* cursor across symbols (a safe lower watermark:
+    every symbol has been processed at least up to it), not a single BTC time (F6).
+    per_symbol carries each symbol's own cursor for observability / debugging.
+    """
     state = gen.get_dedup_state()
     DEDUP_STATE.parent.mkdir(parents=True, exist_ok=True)
     payload: dict = {"saved_at": pd.Timestamp.utcnow().isoformat(), "dedup": state}
-    if buffer_saved_at is not None:
-        payload["buffer_saved_at"] = buffer_saved_at
-    with open(DEDUP_STATE, "w") as f:
-        json.dump(payload, f, indent=2)
+    per_symbol = _cursor_iso(cursors)
+    if per_symbol:
+        payload["per_symbol"] = per_symbol
+        watermarks = [t for t in (cursors or {}).values() if t is not None]
+        if watermarks:
+            payload["buffer_saved_at"] = min(watermarks).isoformat()
+    # Atomic write: tmp + os.replace so a crash mid-write can't leave a half
+    # JSON that the next startup's load_dedup_state would choke on.
+    tmp = DEDUP_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, DEDUP_STATE)
 
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 def update_heartbeat() -> None:
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT_FILE.write_text(pd.Timestamp.utcnow().isoformat())
+    HEARTBEAT_FILE.write_text(pd.Timestamp.utcnow().isoformat(), encoding="utf-8")
 
 
 def _write_status(consecutive_failures: int, last_success_at: "str | None",
-                  last_error: "str | None", backlog_count: int) -> None:
+                  last_error: "str | None", backlog_count: int,
+                  package_write_failures: int = 0,
+                  per_symbol: "dict | None" = None) -> None:
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATUS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps({
-        "last_success_at":      last_success_at,
-        "consecutive_failures": consecutive_failures,
-        "last_error":           last_error,
-        "backlog_count":        backlog_count,
-        "updated_at":           pd.Timestamp.utcnow().isoformat(),
+        "last_success_at":        last_success_at,
+        "consecutive_failures":   consecutive_failures,
+        "last_error":             last_error,
+        "backlog_count":          backlog_count,
+        "package_write_failures": package_write_failures,
+        "per_symbol":             per_symbol or {},
+        "updated_at":             pd.Timestamp.utcnow().isoformat(),
     }, indent=2), encoding="utf-8")
     os.replace(tmp, STATUS_FILE)
+
+
+def _build_per_symbol_status(cursors: "dict[str, pd.Timestamp | None]",
+                             latest: "dict[str, pd.Timestamp | None]") -> dict:
+    """Per-symbol {cursor, latest_bar, staleness_min} so a single-symbol data outage
+    is visible to ops / watchdog even when the others keep flowing (F5)."""
+    now = pd.Timestamp.utcnow()
+    out: dict = {}
+    for sym in SYMBOLS:
+        lt = latest.get(sym)
+        # latest is an open_time; the bar closes 15m later.
+        staleness = None
+        if lt is not None:
+            staleness = round((now - (lt + pd.Timedelta(minutes=15))).total_seconds() / 60, 1)
+        cur = cursors.get(sym)
+        out[sym] = {
+            "cursor":        cur.isoformat() if cur is not None else None,
+            "latest_bar":    lt.isoformat() if lt is not None else None,
+            "staleness_min": staleness,
+        }
+    return out
 
 
 # ── Data loaders for prompt builder ──────────────────────────────────────────
@@ -196,7 +257,8 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
         "h4_support":             sig.h4_support,
         "h4_resistance":          sig.h4_resistance,
     }
-    (pkg_dir / "signal.json").write_text(json.dumps(signal_data, indent=2))
+    (pkg_dir / "signal.json").write_text(
+        json.dumps(signal_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     prompt_ok = False
     charts_ok = False
@@ -205,7 +267,7 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
     try:
         df15m, df4h, df_flow = _load_frames(sig)
         bundle = build_prompt(sig, df15m, df4h, df_flow)
-        with open(pkg_dir / "prompt.txt", "w") as f:
+        with open(pkg_dir / "prompt.txt", "w", encoding="utf-8") as f:
             f.write("=== SYSTEM ===\n")
             f.write(bundle.system_text)
             f.write("\n\n=== USER TEXT ===\n")
@@ -246,9 +308,10 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
 
 # ── New-bar detector ──────────────────────────────────────────────────────────
 
-def get_latest_bar_time() -> pd.Timestamp | None:
-    """Read the last open_time from the BTC 15m CSV (proxy for all symbols)."""
-    csv_path = DATA_DIR / "ohlcv" / "btcusdt_15m.csv"
+def _latest_for_symbol(symbol: str) -> pd.Timestamp | None:
+    """Last open_time in this symbol's 15m CSV, or None."""
+    slug = symbol.replace("/", "").lower()
+    csv_path = DATA_DIR / "ohlcv" / f"{slug}_15m.csv"
     if not csv_path.exists():
         return None
     try:
@@ -260,35 +323,60 @@ def get_latest_bar_time() -> pd.Timestamp | None:
         return None
 
 
+def get_latest_bar_times() -> dict[str, pd.Timestamp | None]:
+    """Per-symbol latest 15m open_time. Each symbol is tracked independently so a
+    late-arriving bar on ETH/BNB/SOL is not skipped just because BTC's cursor already
+    advanced (F5)."""
+    return {sym: _latest_for_symbol(sym) for sym in SYMBOLS}
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-async def run_cycle(gen: SignalGenerator, last_bar_time: pd.Timestamp | None,
-                    ) -> tuple[list[SignalEvent], pd.Timestamp | None]:
+async def run_cycle(gen: SignalGenerator,
+                    cursors: "dict[str, pd.Timestamp | None]",
+                    ) -> tuple[list[SignalEvent], dict[str, pd.Timestamp | None],
+                               dict[str, pd.Timestamp | None]]:
     """
     Run one monitor cycle:
       1. fetch delta
-      2. replay new bars through gen
-      3. return detected signals + new last_bar_time
+      2. replay new bars (per-symbol cursors) through gen
+      3. return (detected signals, new cursors, latest-bar map)
+
+    Per-symbol cursors (F5): the replay window starts at the *earliest* lagging
+    symbol's cursor (min) and ends at the latest bar seen. All symbols are replayed
+    over that window; symbols already ahead simply re-feed bars they've buffered, and
+    BarBuffer.update is idempotent on open_time so those are skipped (no duplicate
+    bars, no re-fired signals). A symbol that fell behind (late T2) is caught up.
     """
     # Step 1: fetch delta — FetchError/GapError propagate to main loop for counter tracking
     fetch_delta()
 
-    new_bar_time = get_latest_bar_time()
-    if new_bar_time is None or new_bar_time == last_bar_time:
-        return [], last_bar_time
+    latest = get_latest_bar_times()
 
-    # Step 2: replay only the new bars through generator
-    # We re-use the existing gen (which already has dedup + buffer state)
-    # by feeding it just the new bars via a narrow ReplayFeed window.
+    # Which symbols have a genuinely newer bar than their own cursor?
+    advancing = {
+        s: latest[s] for s in SYMBOLS
+        if latest.get(s) is not None
+        and (cursors.get(s) is None or latest[s] > cursors[s])
+    }
+    if not advancing:
+        return [], cursors, latest
+
+    # Window: from the earliest cursor among advancing symbols (None → from beginning),
+    # to the latest bar across them.
+    adv_cursors = [cursors.get(s) for s in advancing]
+    start_ts = None if any(c is None for c in adv_cursors) else min(adv_cursors)
+    end_ts = max(advancing.values())
+
     detected: list[SignalEvent] = []
 
     @gen.on_signal
     async def _capture(evt: SignalEvent) -> None:
         detected.append(evt)
 
-    start_str = (last_bar_time + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S") \
-        if last_bar_time else None
-    end_str   = new_bar_time.strftime("%Y-%m-%d %H:%M:%S")
+    start_str = (start_ts + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S") \
+        if start_ts is not None else None
+    end_str   = end_ts.strftime("%Y-%m-%d %H:%M:%S")
 
     mini_feed = ReplayFeed(
         data_dir = DATA_DIR,
@@ -298,12 +386,21 @@ async def run_cycle(gen: SignalGenerator, last_bar_time: pd.Timestamp | None,
     )
     mini_feed.add_bar_handler(gen._on_bar)
     mini_feed.add_flow_handler(gen._on_flow)
-    await mini_feed.start()
+    try:
+        await mini_feed.start()
+    finally:
+        # Always unregister the temporary handler — if mini_feed.start() raises
+        # (CSV read error, etc.) a leaked _capture would fire on every future
+        # signal and pin a stale `detected` list. ValueError = already gone.
+        try:
+            gen._signal_handlers.remove(_capture)
+        except ValueError:
+            pass
 
-    # Remove the temporary handler
-    gen._signal_handlers.remove(_capture)
-
-    return detected, new_bar_time
+    new_cursors = dict(cursors)
+    for s, t in advancing.items():
+        new_cursors[s] = t
+    return detected, new_cursors, latest
 
 
 async def main() -> None:
@@ -317,7 +414,19 @@ async def main() -> None:
 
     SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
 
-    dedup, buffer_saved_at_str = load_dedup_state()
+    try:
+        dedup, buffer_saved_at_str = load_dedup_state()
+    except DedupStateError as e:
+        logger.error("FATAL: %s", e)
+        # Surface the corruption in status (not just a raw traceback) so the
+        # watchdog/operator sees *why* monitor refused to start, then exit non-zero.
+        try:
+            _write_status(consecutive_failures=1, last_success_at=None,
+                          last_error=str(e)[:200], backlog_count=-1,
+                          package_write_failures=0)
+        except Exception:
+            pass
+        sys.exit(1)
     if not dedup:
         logger.warning("starting with empty dedup state — signals may repeat")
 
@@ -331,7 +440,14 @@ async def main() -> None:
 
     if saved_at is not None:
         gen.load_dedup_state(dedup)
-        incr_start = (saved_at + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        # Incremental warmup start = the *earliest* 15m buffer tail across symbols (a
+        # safe lower watermark). Replaying from there re-feeds bars some symbols already
+        # buffered, but BarBuffer.update is idempotent on open_time so those are skipped
+        # — no holes for a lagging symbol, no duplicates for an ahead one (F6).
+        tails = [gen._bufs[(s, "15m")].last for s in SYMBOLS]
+        tail_times = [b.open_time for b in tails if b is not None]
+        incr_from = min(tail_times) if tail_times else saved_at
+        incr_start = (incr_from + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         logger.info("buffer state loaded — incremental warmup from %s ...", incr_start)
 
         incr_feed = ReplayFeed(data_dir=DATA_DIR, symbols=SYMBOLS, start=incr_start)
@@ -341,8 +457,13 @@ async def main() -> None:
         suppressed: list = []
         @gen.on_signal
         async def _dummy_incr(evt): suppressed.append(evt)
-        await incr_feed.start()
-        gen._signal_handlers.remove(_dummy_incr)
+        try:
+            await incr_feed.start()
+        finally:
+            try:
+                gen._signal_handlers.remove(_dummy_incr)
+            except ValueError:
+                pass
         logger.info("incremental warmup complete (suppressed %d signals)", len(suppressed))
 
     else:
@@ -360,25 +481,34 @@ async def main() -> None:
         dummy_signals: list = []
         @gen.on_signal
         async def _dummy(evt): dummy_signals.append(evt)
-        await init_feed.start()
-        gen._signal_handlers.remove(_dummy)
+        try:
+            await init_feed.start()
+        finally:
+            try:
+                gen._signal_handlers.remove(_dummy)
+            except ValueError:
+                pass
         logger.info("buffer warmup complete (suppressed %d historical signals)", len(dummy_signals))
 
-    last_bar_time = get_latest_bar_time()
-    logger.info("monitor started — last bar: %s", last_bar_time)
+    cursors: dict[str, pd.Timestamp | None] = get_latest_bar_times()
+    latest = dict(cursors)
+    logger.info("monitor started — per-symbol cursors: %s",
+                {s: (t.isoformat() if t is not None else None) for s, t in cursors.items()})
 
     consecutive_failures = 0
     last_success_at: "str | None" = None
     last_error: "str | None" = None
+    package_write_failures = 0   # cumulative: signals that detected but failed to write a complete package
+    last_buffer_save = pd.Timestamp.utcnow()
 
     while True:
         try:
-            signals, new_last = await run_cycle(gen, last_bar_time)
+            signals, new_cursors, latest = await run_cycle(gen, cursors)
             consecutive_failures = 0
             last_error = None
 
-            if new_last and new_last != last_bar_time:
-                last_bar_time = new_last
+            if new_cursors != cursors:
+                cursors = new_cursors
                 last_success_at = pd.Timestamp.utcnow().isoformat()
 
                 now = pd.Timestamp.utcnow()
@@ -397,9 +527,23 @@ async def main() -> None:
                     if not passes:
                         logger.info("filtered out %s %s: %s", sig.symbol, sig.grade, reason)
                         continue
-                    write_signal_pending(sig)
+                    # None = prompt/charts failed → package moved to signal_rejected/.
+                    # This is a functional failure (a real signal never reached openclaw),
+                    # so surface it in status rather than dropping silently.
+                    if write_signal_pending(sig) is None:
+                        package_write_failures += 1
+                        last_error = f"package write failed: {sig.symbol} {sig.grade} {sig.bar_time}"
 
-                save_dedup_state(gen, buffer_saved_at=buffer_saved_at_str)
+                save_dedup_state(gen, cursors=cursors)
+
+                # F6: periodically persist buffer state so a restart replays only minutes
+                # of bars, not days. Throttled to BUFFER_SAVE_SECONDS to bound parquet I/O.
+                if (pd.Timestamp.utcnow() - last_buffer_save).total_seconds() >= BUFFER_SAVE_SECONDS:
+                    try:
+                        gen.save_buffer_state(BUFFER_STATE_DIR)
+                        last_buffer_save = pd.Timestamp.utcnow()
+                    except Exception as save_err:
+                        logger.warning("buffer state save failed: %s", save_err)
 
             update_heartbeat()
 
@@ -410,7 +554,14 @@ async def main() -> None:
             update_heartbeat()   # process is alive; status file carries the failure info
 
         except Exception as e:
-            logger.exception("unexpected error in monitor cycle: %s", e)
+            # Unexpected failure must also surface in functional health, not just logs:
+            # otherwise a persistently-throwing cycle keeps a stale "last success" status
+            # while the watchdog sees nothing wrong.
+            consecutive_failures += 1
+            last_error = f"unexpected: {str(e)[:180]}"
+            logger.exception("unexpected error in monitor cycle (consecutive %d): %s",
+                             consecutive_failures, e)
+            update_heartbeat()   # process is alive; status carries the failure
 
         try:
             backlog = sum(
@@ -419,7 +570,9 @@ async def main() -> None:
             ) if SIGNAL_PENDING.exists() else 0
         except Exception:
             backlog = -1
-        _write_status(consecutive_failures, last_success_at, last_error, backlog)
+        _write_status(consecutive_failures, last_success_at, last_error, backlog,
+                      package_write_failures=package_write_failures,
+                      per_symbol=_build_per_symbol_status(cursors, latest))
 
         await asyncio.sleep(POLL_INTERVAL)
 

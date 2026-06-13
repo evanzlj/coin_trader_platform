@@ -137,7 +137,8 @@ def push_one(pkg_dir: Path) -> bool:
 
 def _heartbeat() -> None:
     HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT.write_text(datetime.datetime.now(datetime.timezone.utc).isoformat())
+    HEARTBEAT.write_text(datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         encoding="utf-8")
 
 
 def _pending_count() -> int:
@@ -195,34 +196,58 @@ def main() -> None:
     last_error: "str | None" = None
 
     while True:
+        round_failed = False
         try:
             backlog = _pending_count()
             p, f = push_round()
             if p or f:
                 logger.info("round done: pushed=%d failed=%d", p, f)
 
-            if p > 0:
+            if f > 0:
+                # Any failure this round is unhealthy — even if some packages went
+                # through (partial failure). A partial push means a real signal is
+                # still stuck on the China side (F7).
+                consecutive_failures += 1
+                round_failed = True
+                if p > 0:
+                    last_success_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    last_error = f"partial failure: pushed={p} failed={f} backlog={backlog}"
+                else:
+                    last_error = f"pushed=0 failed={f} backlog={backlog}"
+            elif p > 0:
+                # All attempted pushes succeeded.
                 consecutive_failures = 0
                 last_error = None
                 last_success_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            elif backlog > 0 and f > 0:
-                # Packages waiting but nothing got through
-                consecutive_failures += 1
-                last_error = f"pushed=0 failed={f} backlog={backlog}"
-            elif backlog == 0:
-                # Nothing to push — healthy idle
+            else:
+                # Nothing to push (backlog == 0) — healthy idle.
                 consecutive_failures = 0
                 last_error = None
 
             _heartbeat()
             _write_pusher_status(consecutive_failures, last_success_at, last_error, backlog)
 
-        except Exception:
+        except Exception as e:
+            # Unexpected failure (e.g. ssh subprocess blew up): still record functional
+            # health so the watchdog sees it instead of a stale "last success" snapshot.
             logger.exception("push_round error")
             consecutive_failures += 1
+            last_error = f"exception: {str(e)[:160]}"
+            round_failed = True
+            try:
+                backlog = _pending_count()
+            except Exception:
+                backlog = -1
+            try:
+                _heartbeat()
+                _write_pusher_status(consecutive_failures, last_success_at, last_error, backlog)
+            except Exception:
+                logger.exception("failed to write pusher status after exception")
 
         if args.once:
-            break
+            # --once is used by tests / cron; a failed or errored round must exit
+            # non-zero so the caller can tell push didn't go through.
+            sys.exit(1 if round_failed else 0)
         time.sleep(POLL_SECONDS)
 
 
