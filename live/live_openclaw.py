@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 SIGNAL_PENDING  = ROOT / "signal_pending"
 SIGNAL_ACTIVE   = ROOT / "signal_active"
+SIGNAL_REJECTED = ROOT / "signal_rejected"
+SIGNAL_STALE    = ROOT / "signal_stale"
 HEARTBEAT_FILE  = ROOT / "live" / "heartbeat" / "openclaw_last_run.txt"
 LOCK_FILE       = ROOT / "live" / "openclaw.lock"
 CDP_URL         = "http://127.0.0.1:18800"
@@ -396,6 +398,27 @@ async def process_one(page, pkg_dir: Path, retry_budget: int) -> dict:
     return {"dir": dir_name, "status": "error", "error": "max_retries"}
 
 
+# ── Package archival helper ───────────────────────────────────────────────────
+
+def _archive_package(pkg_dir: Path, dest_dir: Path, reason: str) -> None:
+    """Write reject_reason.txt then rename pkg_dir → dest_dir/. Silent on race / already-exists."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (pkg_dir / "reject_reason.txt").write_text(reason, encoding="utf-8")
+    except Exception:
+        pass
+    dest = dest_dir / pkg_dir.name
+    try:
+        if not dest.exists():
+            pkg_dir.rename(dest)
+            logger.info("archived → %s/ (%s): %s", dest_dir.name, reason, pkg_dir.name)
+        else:
+            logger.warning("dest already exists, skipping archive: %s → %s/",
+                           pkg_dir.name, dest_dir.name)
+    except Exception as e:
+        logger.warning("archive failed for %s: %s", pkg_dir.name, e)
+
+
 # ── Post-VLM filter + signal_active/ move ────────────────────────────────────
 
 def _r_dist_pct(activation_rule: dict) -> float | None:
@@ -548,7 +571,8 @@ def move_to_active(pkg_dir: Path, signal: dict, vlm: dict) -> bool:
     """
     valid_pbs = _filter_playbooks(signal, vlm)
     if not valid_pbs:
-        logger.info("all playbooks filtered out for %s — not moving to active", pkg_dir.name)
+        logger.info("all playbooks filtered for %s → signal_rejected/", pkg_dir.name)
+        _archive_package(pkg_dir, SIGNAL_REJECTED, "filtered_no_valid_playbooks")
         return False
 
     state = _build_state(signal, valid_pbs, pkg_dir.name)
@@ -598,18 +622,19 @@ def get_pending(stale_cutoff: pd.Timestamp) -> list[Path]:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Stale check + A+ guard
+        # Stale check + A+ guard — archive instead of skip to stop repeated logging
         sig_file = d / "signal.json"
         if sig_file.exists():
             try:
                 sig = json.loads(sig_file.read_text())
                 if sig.get("grade") == "A+":
+                    _archive_package(d, SIGNAL_STALE, "a_plus_not_live")
                     continue
                 bar_time = pd.Timestamp(sig["bar_time"])
                 if bar_time.tzinfo is None:
                     bar_time = bar_time.tz_localize("UTC")
                 if bar_time < stale_cutoff:
-                    logger.info("stale package skipped: %s (bar_time=%s)", d.name, bar_time)
+                    _archive_package(d, SIGNAL_STALE, f"stale_bar_time={bar_time.date()}")
                     continue
             except Exception as e:
                 logger.warning("could not read bar_time from %s: %s", d.name, e)
@@ -750,6 +775,10 @@ async def main() -> None:
                     return
                 else:
                     logger.warning("%s: %s — %s", s, result["dir"], result.get("error", "")[:80])
+                    _archive_package(
+                        pkg_dir, SIGNAL_REJECTED,
+                        f"{s}:{result.get('error', '')[:100]}",
+                    )
 
                 if s not in ("ok", "cached"):
                     needs_fresh_chat = True

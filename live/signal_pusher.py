@@ -27,7 +27,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import io
+import json
 import logging
+import os
 import re
 import subprocess
 import tarfile
@@ -42,6 +44,7 @@ REMOTE_HOST  = "evan@btc-ml"
 REMOTE_ROOT  = "/home/evan/repo/coin_trader_platform"
 PUSHED_DIR   = cfg.ROOT / ".signal_pushed"          # 本地去重标记
 HEARTBEAT    = cfg.ROOT / "live" / "heartbeat" / "signal_pusher_last_run.txt"   # watchdog 监控（#13）
+STATUS_FILE  = cfg.ROOT / "live" / "heartbeat" / "pusher_status.json"
 LOCK_FILE    = cfg.ROOT / "live" / "pusher.lock"
 POLL_SECONDS = 10
 SSH_TIMEOUT  = 60
@@ -137,6 +140,25 @@ def _heartbeat() -> None:
     HEARTBEAT.write_text(datetime.datetime.now(datetime.timezone.utc).isoformat())
 
 
+def _pending_count() -> int:
+    """Count of local signal_active packages not yet pushed."""
+    return sum(1 for p in _ready_pkgs() if not _already_pushed(p.name))
+
+
+def _write_pusher_status(consecutive_failures: int, last_success_at: "str | None",
+                          last_error: "str | None", backlog_count: int) -> None:
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "last_success_at":      last_success_at,
+        "consecutive_failures": consecutive_failures,
+        "last_error":           last_error,
+        "backlog_count":        backlog_count,
+        "updated_at":           datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }, indent=2), encoding="utf-8")
+    os.replace(tmp, STATUS_FILE)
+
+
 def push_round() -> tuple[int, int]:
     """扫一轮，推所有未推送的 ready 包。返回 (pushed, failed)。"""
     pushed = failed = 0
@@ -167,14 +189,38 @@ def main() -> None:
     args = ap.parse_args()
     logger.info("signal_pusher start: local=%s → %s:%s/signal_active",
                 cfg.SIGNAL_ACTIVE, REMOTE_HOST, REMOTE_ROOT)
+
+    consecutive_failures = 0
+    last_success_at: "str | None" = None
+    last_error: "str | None" = None
+
     while True:
         try:
+            backlog = _pending_count()
             p, f = push_round()
             if p or f:
                 logger.info("round done: pushed=%d failed=%d", p, f)
-            _heartbeat()                       # watchdog 监控（#13）
+
+            if p > 0:
+                consecutive_failures = 0
+                last_error = None
+                last_success_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            elif backlog > 0 and f > 0:
+                # Packages waiting but nothing got through
+                consecutive_failures += 1
+                last_error = f"pushed=0 failed={f} backlog={backlog}"
+            elif backlog == 0:
+                # Nothing to push — healthy idle
+                consecutive_failures = 0
+                last_error = None
+
+            _heartbeat()
+            _write_pusher_status(consecutive_failures, last_success_at, last_error, backlog)
+
         except Exception:
             logger.exception("push_round error")
+            consecutive_failures += 1
+
         if args.once:
             break
         time.sleep(POLL_SECONDS)

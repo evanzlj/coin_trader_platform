@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -59,6 +60,7 @@ SIGNAL_PENDING   = ROOT / "signal_pending"
 SIGNAL_REJECTED  = ROOT / "signal_rejected"
 CHARTS_DIR       = ROOT / "live" / "charts"
 LOCK_FILE        = ROOT / "live" / "monitor.lock"
+STATUS_FILE      = ROOT / "live" / "heartbeat" / "monitor_status.json"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 
@@ -123,6 +125,20 @@ def save_dedup_state(gen: SignalGenerator, buffer_saved_at: str | None = None) -
 def update_heartbeat() -> None:
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
     HEARTBEAT_FILE.write_text(pd.Timestamp.utcnow().isoformat())
+
+
+def _write_status(consecutive_failures: int, last_success_at: "str | None",
+                  last_error: "str | None", backlog_count: int) -> None:
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "last_success_at":      last_success_at,
+        "consecutive_failures": consecutive_failures,
+        "last_error":           last_error,
+        "backlog_count":        backlog_count,
+        "updated_at":           pd.Timestamp.utcnow().isoformat(),
+    }, indent=2), encoding="utf-8")
+    os.replace(tmp, STATUS_FILE)
 
 
 # ── Data loaders for prompt builder ──────────────────────────────────────────
@@ -254,15 +270,8 @@ async def run_cycle(gen: SignalGenerator, last_bar_time: pd.Timestamp | None,
       2. replay new bars through gen
       3. return detected signals + new last_bar_time
     """
-    # Step 1: fetch delta
-    try:
-        fetch_delta()
-    except FetchError as e:
-        logger.error("fetch failed, skipping cycle: %s", e)
-        return [], last_bar_time
-    except GapError as e:
-        logger.error("gap error, skipping cycle: %s", e)
-        return [], last_bar_time
+    # Step 1: fetch delta — FetchError/GapError propagate to main loop for counter tracking
+    fetch_delta()
 
     new_bar_time = get_latest_bar_time()
     if new_bar_time is None or new_bar_time == last_bar_time:
@@ -358,12 +367,19 @@ async def main() -> None:
     last_bar_time = get_latest_bar_time()
     logger.info("monitor started — last bar: %s", last_bar_time)
 
+    consecutive_failures = 0
+    last_success_at: "str | None" = None
+    last_error: "str | None" = None
+
     while True:
         try:
             signals, new_last = await run_cycle(gen, last_bar_time)
+            consecutive_failures = 0
+            last_error = None
 
             if new_last and new_last != last_bar_time:
                 last_bar_time = new_last
+                last_success_at = pd.Timestamp.utcnow().isoformat()
 
                 now = pd.Timestamp.utcnow()
                 for sig in signals:
@@ -387,8 +403,23 @@ async def main() -> None:
 
             update_heartbeat()
 
+        except (FetchError, GapError) as e:
+            consecutive_failures += 1
+            last_error = str(e)[:200]
+            logger.error("fetch/gap error (consecutive %d): %s", consecutive_failures, e)
+            update_heartbeat()   # process is alive; status file carries the failure info
+
         except Exception as e:
             logger.exception("unexpected error in monitor cycle: %s", e)
+
+        try:
+            backlog = sum(
+                1 for d in SIGNAL_PENDING.iterdir()
+                if d.is_dir() and (d / ".ready").exists()
+            ) if SIGNAL_PENDING.exists() else 0
+        except Exception:
+            backlog = -1
+        _write_status(consecutive_failures, last_success_at, last_error, backlog)
 
         await asyncio.sleep(POLL_INTERVAL)
 

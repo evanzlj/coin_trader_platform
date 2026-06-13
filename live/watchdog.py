@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
@@ -44,6 +45,15 @@ class ProcSpec:
     unit: str | None        # systemd --user unit（btcml executor）；None = 仅告警，不自动重启
 
 
+@dataclass(frozen=True)
+class StatusSpec:
+    """Check functional-health status JSON (monitor/pusher write these every cycle)."""
+    name: str
+    status_file: Path
+    max_consecutive_failures: int   # alert if >= this
+    max_backlog: int                # alert if >= this
+
+
 def _hb(name: str) -> Path:
     return HEARTBEAT_DIR / f"{name}_last_run.txt"
 
@@ -60,6 +70,33 @@ SPECS: dict[str, list[ProcSpec]] = {
         ProcSpec("signal_pusher", _hb("signal_pusher"), 10.0, None),
     ],
 }
+
+# Functional-health status specs (written by monitor/pusher each cycle)
+STATUS_SPECS: dict[str, list[StatusSpec]] = {
+    "china": [
+        StatusSpec("monitor",       HEARTBEAT_DIR / "monitor_status.json",  3, 10),
+        StatusSpec("signal_pusher", HEARTBEAT_DIR / "pusher_status.json",   3,  5),
+    ],
+}
+
+
+def check_status(spec: StatusSpec) -> str | None:
+    """Read functional-health status JSON. Returns alert string or None."""
+    if not spec.status_file.exists():
+        return None  # process hasn't written a full cycle yet — don't alarm
+    try:
+        data = json.loads(spec.status_file.read_text())
+    except Exception as e:
+        return f"{spec.name}: status file unreadable ({e})"
+    failures = int(data.get("consecutive_failures", 0))
+    backlog  = int(data.get("backlog_count", 0))
+    last_err = str(data.get("last_error") or "")
+    alerts = []
+    if failures >= spec.max_consecutive_failures:
+        alerts.append(f"consecutive_failures={failures}: {last_err[:80]}")
+    if backlog >= spec.max_backlog:
+        alerts.append(f"backlog={backlog}")
+    return f"{spec.name}: {'; '.join(alerts)}" if alerts else None
 
 
 def check_heartbeat(spec: ProcSpec) -> str | None:
@@ -118,7 +155,14 @@ def run_once(role: str) -> bool:
                 restart_via_systemd(spec)
             all_ok = False
         else:
-            logger.info("%s: OK", spec.name)
+            logger.info("%s heartbeat: OK", spec.name)
+    for spec in STATUS_SPECS.get(role, []):
+        alert = check_status(spec)
+        if alert:
+            send_alert(alert)
+            all_ok = False
+        else:
+            logger.info("%s status: OK", spec.name)
     return all_ok
 
 
