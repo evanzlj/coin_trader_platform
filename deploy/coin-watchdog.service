@@ -1,0 +1,20 @@
+# coin_trader watchdog — systemd **user** service（btc-ml / 新加坡）
+# 守 executor 心跳：5min 无心跳=卡死 → systemctl --user kill coin-executor（让其 systemd Restart 拉起）。
+# watchdog 自身简单不卡死，崩溃由 systemd 自己 Restart 拉起。
+#
+#   ~/.config/systemd/user/coin-watchdog.service  →  systemctl --user enable --now coin-watchdog
+#
+[Unit]
+Description=coin_trader watchdog (btc-ml, guards executor heartbeat)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/evan/repo/coin_trader_platform
+EnvironmentFile=-/home/evan/.config/coin_trader/executor.env
+ExecStart=/usr/bin/python3 -m live.watchdog --role btcml --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

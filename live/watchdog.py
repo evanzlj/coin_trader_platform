@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
+"""Watchdog（#13）— 各机守本机心跳，executor 卡死 → 让 systemd 重启 + 飞书。
+
+职责分离（btc-ml）：
+  - systemd（user service `coin-executor`）管「进程在」：Restart=always + StartLimitBurst=3。
+  - watchdog 管「心跳活」：executor 5min 无心跳=卡死（进程活着但循环僵死，systemd 测不到）
+    → `systemctl --user kill -s KILL coin-executor` → systemd 自动拉起（计入 StartLimit）。
+    15min 内超 3 次 → systemd 停拉起 → watchdog 持续 stale → 持续飞书（等人工，§22 line 903）。
+
+运行：
+  btc-ml:  python3 -m live.watchdog --role btcml --loop    # 守 executor（卡死 systemctl kill）
+  中国:    python3 live/watchdog.py   --role china --loop   # 守 monitor/openclaw/signal_pusher（告警）
+  单次：   去掉 --loop（健康=exit0 / 有告警=exit1），可挂 cron / Task Scheduler。
 """
-Watchdog — checks heartbeat files for monitor.py and executor.py.
-
-Run independently (e.g. via Windows Task Scheduler every 5 minutes):
-    python3 live/watchdog.py
-
-If any process heartbeat is older than STALE_MINUTES, writes an alert
-to live/heartbeat/alerts.log (and optionally sends a system notification).
-"""
-
 from __future__ import annotations
 
+import argparse
 import logging
+import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -21,98 +27,116 @@ import pandas as pd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    datefmt="%Y-%m-%dT%H:%M:%S")
+logger = logging.getLogger("watchdog")
 
-HEARTBEAT_DIR  = ROOT / "live" / "heartbeat"
-ALERT_LOG      = HEARTBEAT_DIR / "alerts.log"
-STALE_MINUTES  = 20
+HEARTBEAT_DIR = ROOT / "live" / "heartbeat"
+ALERT_LOG     = HEARTBEAT_DIR / "alerts.log"
+LOOP_SECONDS  = 300
 
-PROCESSES = {
-    "monitor":  HEARTBEAT_DIR / "monitor_last_run.txt",
-    "openclaw": HEARTBEAT_DIR / "openclaw_last_run.txt",
-    "executor": HEARTBEAT_DIR / "executor_last_run.txt",
+
+@dataclass(frozen=True)
+class ProcSpec:
+    name: str
+    heartbeat: Path
+    stale_min: float
+    unit: str | None        # systemd --user unit（btcml executor）；None = 仅告警，不自动重启
+
+
+def _hb(name: str) -> Path:
+    return HEARTBEAT_DIR / f"{name}_last_run.txt"
+
+
+# 各机守本机进程。心跳节奏（§20.2 line 905）：executor 15s/卡死 5min；monitor·openclaw 30s/卡死 20min；
+# signal_pusher 轮询 10s/卡死 10min。只有 executor 走 systemd 自动重启，其余告警（Windows 侧人工/Task Scheduler）。
+SPECS: dict[str, list[ProcSpec]] = {
+    "btcml": [
+        ProcSpec("executor", _hb("executor"), 5.0, "coin-executor"),
+    ],
+    "china": [
+        ProcSpec("monitor",       _hb("monitor"),       20.0, None),
+        ProcSpec("openclaw",      _hb("openclaw"),      20.0, None),
+        ProcSpec("signal_pusher", _hb("signal_pusher"), 10.0, None),
+    ],
 }
 
 
-def check_heartbeat(name: str, path: Path) -> str | None:
-    """
-    Returns an alert string if the heartbeat is stale or missing, else None.
-    """
-    if not path.exists():
-        return f"{name}: heartbeat file not found ({path})"
-
+def check_heartbeat(spec: ProcSpec) -> str | None:
+    """stale/缺失 → 告警字符串；健康 → None。"""
+    if not spec.heartbeat.exists():
+        return f"{spec.name}: heartbeat file not found ({spec.heartbeat})"
     try:
-        raw = path.read_text().strip()
-        last_run = pd.Timestamp(raw, tz="UTC")
+        last = pd.Timestamp(spec.heartbeat.read_text().strip(), tz="UTC")
     except Exception as e:
-        return f"{name}: cannot parse heartbeat ({e})"
-
-    age_minutes = (pd.Timestamp.utcnow() - last_run).total_seconds() / 60
-    if age_minutes > STALE_MINUTES:
-        return (
-            f"{name}: last heartbeat {age_minutes:.1f} min ago "
-            f"(threshold {STALE_MINUTES} min) — process may be dead"
-        )
+        return f"{spec.name}: cannot parse heartbeat ({e})"
+    age = (pd.Timestamp.utcnow() - last).total_seconds() / 60
+    if age > spec.stale_min:
+        return f"{spec.name}: last heartbeat {age:.1f} min ago (threshold {spec.stale_min} min) — 卡死/死亡"
     return None
 
 
 def send_alert(message: str) -> None:
-    """Log alert + write to alerts.log + optionally system notification."""
+    """log + alerts.log + 飞书 + （Windows）系统通知。"""
     logger.error("ALERT: %s", message)
-
     ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    ts = pd.Timestamp.utcnow().isoformat()
     with open(ALERT_LOG, "a") as f:
-        f.write(f"{ts} ALERT: {message}\n")
-
-    # Windows system tray notification (requires win10toast or plyer)
+        f.write(f"{pd.Timestamp.utcnow().isoformat()} ALERT: {message}\n")
+    try:
+        from live import notify
+        notify.feishu_alert(f"[watchdog] {message}")
+    except Exception as e:
+        logger.warning("feishu alert failed: %s", e)
     try:
         from plyer import notification
-        notification.notify(
-            title="coin_trader_platform ALERT",
-            message=message,
-            timeout=10,
-        )
-    except ImportError:
-        pass  # plyer not installed — log-only is fine
+        notification.notify(title="coin_trader ALERT", message=message, timeout=10)
+    except Exception:
+        pass
 
 
-def run_once() -> bool:
-    """Check all processes. Returns True if all healthy."""
+def restart_via_systemd(spec: ProcSpec) -> None:
+    """卡死 → systemctl --user kill -s KILL，让 systemd Restart 拉起（计入 StartLimitBurst=3）。"""
+    unit = f"{spec.unit}.service"
+    try:
+        r = subprocess.run(["systemctl", "--user", "kill", "-s", "KILL", unit],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            logger.warning("%s 卡死 → systemctl --user kill %s（systemd 将自动拉起）", spec.name, unit)
+        else:
+            send_alert(f"{spec.name}: systemctl kill {unit} 失败 rc={r.returncode}: {r.stderr.strip()[:120]}")
+    except Exception as e:
+        send_alert(f"{spec.name}: systemctl kill {unit} 异常: {e}")
+
+
+def run_once(role: str) -> bool:
     all_ok = True
-    for name, path in PROCESSES.items():
-        alert = check_heartbeat(name, path)
+    for spec in SPECS[role]:
+        alert = check_heartbeat(spec)
         if alert:
             send_alert(alert)
+            if spec.unit:                       # 有 systemd unit → 卡死强制重启（systemd StartLimit 限次）
+                restart_via_systemd(spec)
             all_ok = False
         else:
-            logger.info("%s: OK", name)
+            logger.info("%s: OK", spec.name)
     return all_ok
 
 
 def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--loop", action="store_true",
-        help="Run in a loop every 5 minutes (default: run once and exit)",
-    )
-    args = parser.parse_args()
-
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--role", choices=list(SPECS), required=True, help="本机角色（守哪些进程）")
+    ap.add_argument("--loop", action="store_true", help=f"常驻每 {LOOP_SECONDS//60} 分钟检查（默认单次）")
+    args = ap.parse_args()
     if args.loop:
-        logger.info("watchdog loop started (interval: 5 min, stale threshold: %d min)",
-                    STALE_MINUTES)
+        logger.info("watchdog loop [%s] started (interval %ds)", args.role, LOOP_SECONDS)
         while True:
-            run_once()
-            time.sleep(300)
+            try:
+                run_once(args.role)
+            except Exception:
+                logger.exception("watchdog round error")
+            time.sleep(LOOP_SECONDS)
     else:
-        ok = run_once()
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if run_once(args.role) else 1)
 
 
 if __name__ == "__main__":

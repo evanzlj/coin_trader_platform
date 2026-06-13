@@ -1,0 +1,28 @@
+# coin_trader executor — systemd **user** service（btc-ml / 新加坡）
+# 安装见 deploy/README.md。职责：管「进程在」（崩溃/退出自动拉起 + 限次）；
+# 「卡死」（活着但 5min 无心跳）由 coin-watchdog 检测后 systemctl --user kill 触发本服务重启。
+#
+#   ~/.config/systemd/user/coin-executor.service  →  systemctl --user enable --now coin-executor
+#
+[Unit]
+Description=coin_trader executor (A-only live)
+After=network-online.target
+Wants=network-online.target
+# 15 分钟内最多自动重启 3 次；超限 → systemd 停拉起（failed），watchdog 持续飞书等人工（§22 line 903）
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/evan/repo/coin_trader_platform
+# 实盘改 EXECUTOR_ENV=live；testnet 联调用 testnet
+Environment=EXECUTOR_ENV=testnet
+Environment=OHLCV_DB=/home/evan/repo/ai_crypto_analyst/data/ai_crypto_analyst.db
+# secret（FEISHU_WEBHOOK 等）放 gitignored 本地文件，不进 repo；- 前缀 = 文件缺失不报错
+EnvironmentFile=-/home/evan/.config/coin_trader/executor.env
+ExecStart=/usr/bin/python3 -m live.executor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

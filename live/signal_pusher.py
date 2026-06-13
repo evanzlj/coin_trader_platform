@@ -24,6 +24,7 @@ executor `load_states` 只认带 .ready 的完整包，mv 完成前看不到 →
 from __future__ import annotations
 
 import argparse
+import datetime
 import io
 import logging
 import re
@@ -39,6 +40,7 @@ logger = logging.getLogger("signal_pusher")
 REMOTE_HOST = "evan@btc-ml"
 REMOTE_ROOT = "/home/evan/repo/coin_trader_platform"
 PUSHED_DIR  = cfg.ROOT / ".signal_pushed"          # 本地去重标记
+HEARTBEAT   = cfg.ROOT / "live" / "heartbeat" / "signal_pusher_last_run.txt"   # watchdog 监控（#13）
 POLL_SECONDS = 10
 SSH_TIMEOUT  = 60
 
@@ -111,6 +113,11 @@ def push_one(pkg_dir: Path) -> bool:
     return False
 
 
+def _heartbeat() -> None:
+    HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT.write_text(datetime.datetime.now(datetime.timezone.utc).isoformat())
+
+
 def push_round() -> tuple[int, int]:
     """扫一轮，推所有未推送的 ready 包。返回 (pushed, failed)。"""
     pushed = failed = 0
@@ -137,6 +144,7 @@ def main() -> None:
             p, f = push_round()
             if p or f:
                 logger.info("round done: pushed=%d failed=%d", p, f)
+            _heartbeat()                       # watchdog 监控（#13）
         except Exception:
             logger.exception("push_round error")
         if args.once:
