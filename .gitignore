@@ -34,6 +34,8 @@ live/heartbeat/
 signal_pending/
 signal_active/
 signal_done/
+.signal_pushed/
+.signal_incoming/
 logs/
 *.parquet
 

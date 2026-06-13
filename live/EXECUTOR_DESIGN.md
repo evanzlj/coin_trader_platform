@@ -845,6 +845,12 @@ btc-ml（新加坡）:
   push 最简单；只传几 KB json，图不传——executor 用不到图）。
 - **完整性（取代同机原子 rename）**：跨机器无原子 rename。改为「先传到临时名，传完再落 `.ready`
   标记」，executor 只认带 ready 的包、绝不读半个；断网时中国侧积压、恢复后重传。
+- **实现 `live/signal_pusher.py`（#11，已 Mac 模拟验证）**：中国侧常驻轮询 `signal_active/`，
+  Python `tarfile` 打包整包（含 .ready，跨平台、Windows 无需 rsync）→ ssh stdin → btc-ml 解到
+  `.signal_incoming/{pkg}` → 本地原子 `mv` 到 `signal_active/{pkg}`。去重：本地 `.signal_pushed/{pkg}`
+  标记；btc-ml 已有 `signal_active/`或`signal_done/{pkg}`（executor 接管/归档过）→ 远端 `SKIP_EXISTS`、
+  **绝不覆盖 executor 维护的 state.json**；ssh 失败/超时不落 .pushed → 下轮自然重传。端到端（真中国
+  openclaw → btc-ml）待中国 Windows 上线联调。
 - state.json 之后由 btc-ml executor **本地**维护（唯一 writer），signal_done 也在 btc-ml 本地。
 
 ### 20.3 executor 在 btc-ml 读行情
@@ -866,7 +872,7 @@ btc-ml（新加坡）:
 
 | 机器 | 跑的进程 | 装的依赖 |
 |------|---------|---------|
-| 中国 Windows | monitor / openclaw / warmup_replay / fetch_delta / watchdog | playwright、绘图、pandas… → `requirements-windows.txt` |
+| 中国 Windows | monitor / openclaw / warmup_replay / fetch_delta / **signal_pusher** / watchdog | playwright、绘图、pandas… → `requirements-windows.txt` |
 | btc-ml 新加坡 | executor（读旁边 `ai_crypto_analyst` 的 DB 取行情） | 交易所官方 SDK、pandas… → `requirements-executor.txt` |
 
 **为什么不拆两个 repo**：`replay/scorer.py`（状态机）、state.json schema、数据口径这三样，executor
