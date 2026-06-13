@@ -37,7 +37,7 @@ from live.playbook_fsm import (
 from live.position_manager import (
     open_position, manage_open_position, NakedPositionError, pos_side_of,
 )
-from live.slot_pool import Account, build_accounts, build_occupancy, allocate
+from live.slot_pool import Account, build_accounts, build_occupancy, allocate, sync_balances
 from live.single_instance import SingleInstance, AlreadyRunning
 from live import reconcile
 from live import notify
@@ -365,6 +365,7 @@ def main() -> None:
         keys = load_keys()
         accounts = build_accounts(keys)
         brokers = build_brokers(keys)
+        sync_balances(accounts, brokers)                # #22 P1 用交易所真实余额更新 slot capital
         reader = OhlcvReader()
         engine = ExecutorEngine(reader, brokers, accounts)
         reconcile.startup_reconcile(engine)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
 import subprocess
 import sys
 import textwrap
@@ -37,6 +38,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """写临时文件 → os.replace 原子替换（#22 P1：防崩溃半写 CSV）。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data)
+    os.replace(tmp, path)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -170,10 +178,12 @@ def export_delta_remote(dataset: str, since_map: dict[tuple[str, str], Optional[
             if not rows:
                 print(f"  [skip] {{symbol}} {{tf}} — no new rows", flush=True)
                 continue
-            with open(out_file, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([d[0] for d in cur.description])
-                writer.writerows(rows)
+            import io as _io, csv as _csv
+            buf = _io.StringIO()
+            w = _csv.writer(buf)
+            w.writerow([d[0] for d in cur.description])
+            w.writerows(rows)
+            _atomic_write(out_file, buf.getvalue())                           # #22 P1 原子写
             print(f"  {{symbol}} {{tf}} → {{len(rows)}} new rows", flush=True)
 
         db.close()
@@ -215,9 +225,8 @@ def transfer_and_append(dataset: str) -> dict[Path, int]:
 
             # Skip header row, append data rows
             data_rows = lines[1:]
-            with open(local_csv, "a", newline="") as f:
-                for row in data_rows:
-                    f.write(row + "\n")
+            existing = local_csv.read_text()
+            _atomic_write(local_csv, existing.rstrip("\n") + "\n" + "\n".join(data_rows) + "\n")  # #22 P1
 
             appended[local_csv] = len(data_rows)
             logger.info("  appended %d rows → %s", len(data_rows), local_csv.name)
@@ -308,7 +317,7 @@ def fill_gap_remote(dataset: str, symbol: str, tf: str,
     # Merge and sort
     df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
     merged = pd.concat([df, gap_df]).drop_duplicates("open_time").sort_values("open_time")
-    merged.to_csv(local_csv, index=False)
+    _atomic_write(local_csv, merged.to_csv(index=False))                   # #22 P1 原子写
     logger.info("gap filled: %d rows inserted into %s", len(gap_df), local_csv.name)
 
 

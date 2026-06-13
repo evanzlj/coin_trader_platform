@@ -724,6 +724,12 @@ async def main() -> None:
                         logger.warning("move_to_active failed for %s: %s", pkg_dir.name, e)
                 elif s == "cached":
                     logger.info("cached: %s", result["dir"])
+                    try:
+                        signal = json.loads((pkg_dir / "signal.json").read_text())
+                        vlm    = json.loads((pkg_dir / "vlm_response.json").read_text())
+                        move_to_active(pkg_dir, signal, vlm)    # #22 P1：有 playbooks → executor 接管
+                    except Exception as e:
+                        logger.warning("move_to_active failed for cached %s: %s", pkg_dir.name, e)
                 elif s == "blocked":
                     logger.error("BLOCKED: %s — %s", result["dir"], result.get("error", ""))
                     logger.error("pausing — please resolve and restart")

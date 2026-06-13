@@ -56,6 +56,22 @@ class Occupancy:
         return sum(len(v) for v in self.by_account.values())
 
 
+def sync_balances(accounts: list[Account], brokers: dict) -> None:
+    """#22 P1：用交易所真实可用余额同步 Account.capital，替换硬编码值。
+    在 build_accounts 之后、allocate 之前调用一次（executor 启动或 tick 定期）。"""
+    from live.broker.base import Broker
+    for a in accounts:
+        b: Broker | None = brokers.get(a.label)
+        if b is None:
+            continue
+        try:
+            bal = b.get_available_balance()
+            if bal is not None and bal > 0:
+                a.capital = bal
+        except Exception:
+            pass                                          # 查不成功保持旧值，下轮重试
+
+
 def build_occupancy(states: list[dict]) -> Occupancy:
     """从 signal_active 的 state.json 列表重建占用（仅 ACTIVATED/TP1_HIT 的 pb）。"""
     by: dict = {}
