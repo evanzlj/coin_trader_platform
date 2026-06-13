@@ -1012,7 +1012,7 @@ btc-ml（新加坡）:
 | adopt 补 SL | 挂上 → ACTIVATED | place 失败 → 平退出 `DONE_UNKNOWN` / 平不掉 → `recovering` | **查询 UNKNOWN → `AdoptUnknownError` → 保持 OPENING**（不重复挂、不平退出）|
 | manage get_order(TP) | FILLED/降级到价 → 推进 | NEW → 等 | **UNKNOWN+有仓 → 保持；UNKNOWN+无仓 → `DONE_UNKNOWN`（无敞口优先，不傻等）** |
 | manage SL/BE 触发判定 | — | pos None+TP未成交 → DONE_SL/BE | get_position 抛 → tick per-pb catch，保持 |
-| reconcile_position get_position | 有仓 → 查/补 SL | 无仓+订单解释 → resolved | 抛 → 保持状态(ok)，下轮重试 |
+| reconcile_position get_position | 有仓 → 查/补 SL | 无仓+订单解释 → resolved | 抛 → `unknown`（保持状态不臆测；startup 短重试→仍 unknown 标 `reconcile_pending`；tick 每轮快速重试补 SL，不等 RECONCILE_MINUTES，§22 P1）|
 | reconcile SL 补挂 | 挂上 → ok | — | 补不上→平退出；平不掉→`recovering` |
 | recovering `_try_recover` | 平掉 → `DONE_UNKNOWN` | — | get_position 抛 → 保持 recovering，下 tick 重试 |
 
