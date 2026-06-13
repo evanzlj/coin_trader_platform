@@ -211,12 +211,53 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "resolved")
         self.assertEqual(pb["status"], "DONE_SL")
 
-    def test_reconcile_position_api_error_holds(self):
-        # get_position 抛(API error) → 保持状态，不判死（UNKNOWN 不臆测，§21 全局不变量）
+    def test_reconcile_position_api_error_returns_unknown(self):
+        # get_position 抛(API error) → 'unknown'：保持状态不判死，但告知上层尽快再查（§22 P1 缩短无 SL 窗口）
         b = MockBroker(spec=SPEC, fail_on={"get_position"})
         pb = self._active()
-        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "ok")
+        self.assertEqual(reconcile_position(b, "BTC/USDT", pb), "unknown")
         self.assertEqual(pb["status"], "ACTIVATED")
+
+    def _engine_with(self, brokers, pb):
+        state = {"symbol": "BTC/USDT", "playbooks": [pb]}
+        eng = ExecutorEngine(None, brokers, [])
+        eng.load_states = lambda: [(Path("/tmp/_drill_fake"), state)]
+        eng.save_state = lambda *a, **k: None
+        eng.archive = lambda *a, **k: None
+        return eng
+
+    def _run_startup_fast(self, eng):
+        _r, _s = cfg.STARTUP_RECONCILE_RETRIES, cfg.STARTUP_RECONCILE_RETRY_SECONDS
+        cfg.STARTUP_RECONCILE_RETRIES, cfg.STARTUP_RECONCILE_RETRY_SECONDS = 4, 0
+        try:
+            startup_reconcile(eng)
+        finally:
+            cfg.STARTUP_RECONCILE_RETRIES, cfg.STARTUP_RECONCILE_RETRY_SECONDS = _r, _s
+
+    def test_startup_reconcile_unknown_marks_pending(self):
+        # 启动撞 get_position 持续抖动 → 短重试仍 unknown → 标记 reconcile_pending（tick 快速重试，不等定期对账 §22 P1）
+        b = MockBroker(spec=SPEC, fail_on={"get_position"})
+        pb = self._active()
+        self._run_startup_fast(self._engine_with({"a": b}, pb))
+        self.assertTrue(pb["exec"].get("reconcile_pending"))
+        self.assertEqual(pb["status"], "ACTIVATED")
+
+    def test_startup_reconcile_retries_through_flaky_then_rearms(self):
+        # 启动撞抖动但短重试内恢复 → 穿过抖动直接补挂被撤的 SL，不标 pending（§22 P1 核心修复）
+        b = MockBroker(spec=SPEC)
+        b.positions[("BTC/USDT", PosSide.SHORT)] = Position("BTC/USDT", PosSide.SHORT, 0.027, 72700)
+        b.orders["o2"] = OrderStatus("o2", "x", OrderState.CANCELED, 0, 0)   # SL 被撤
+        n = {"i": 0}; real = b.get_position
+        def flaky(*a, **k):
+            n["i"] += 1
+            if n["i"] <= 2:
+                raise RuntimeError("flaky get_position")
+            return real(*a, **k)
+        b.get_position = flaky
+        pb = self._active()
+        self._run_startup_fast(self._engine_with({"a": b}, pb))
+        self.assertFalse(pb["exec"].get("reconcile_pending"))               # 抖动穿过，无需 pending
+        self.assertTrue(any(c[0] == "place_stop_market" for c in b.calls))  # SL 已补挂
 
     def test_safe_get_order_normalizes_raise(self):
         # adapter get_order 抛（如 OKX _inst_meta 抖）→ safe_get_order 归一 UNKNOWN，不外抛（§22 不变量3）

@@ -305,8 +305,8 @@ def s_network_down_no_crash(label, broker, accts):
             "exec": {"account": label, "pos_side": "SHORT", "client_id_base": base, "direction": "short",
                      "opening_at": pd.Timestamp.now("UTC").isoformat(), "invalidation": {"level": 63000.0, "dir": "above"}}}
     reconcile._recover_opening(eng, SYM, pb_o)
-    ok = r == "ok" and pb_a["status"] == "ACTIVATED" and pb_o["status"] == "OPENING"
-    print(f"  inject: net down → ACTIVATED held={pb_a['status']=='ACTIVATED'} OPENING held={pb_o['status']=='OPENING'}  {'✓' if ok else '✗'}")
+    ok = r == "unknown" and pb_a["status"] == "ACTIVATED" and pb_o["status"] == "OPENING"
+    print(f"  inject: net down → reconcile={r} ACTIVATED held={pb_a['status']=='ACTIVATED'} OPENING held={pb_o['status']=='OPENING'}  {'✓' if ok else '✗'}")
     return ok
 
 

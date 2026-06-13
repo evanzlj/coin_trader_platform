@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import pandas as pd
 
@@ -31,7 +32,8 @@ TERMINAL_V = {s.value for s in TERMINAL}
 
 def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
     """核对一个 ACTIVATED/TP1_HIT 的 pb 与交易所实际状态。
-    返回 'ok'（一致继续）| 'resolved'（已被平，定终态）| 'manual'（对不上，挂起人工）。
+    返回 'ok'（一致继续）| 'updated'（补挂 SL）| 'resolved'（已被平，定终态）
+    | 'unknown'（get_position 查询抖动，查不清→上层短重试/快速再对账，§22 不臆测）| 'manual'（对不上，挂起人工）。
     原地更新 pb（status / exec.manual_override）。"""
     ex = pb.get("exec") or {}
     if ex.get("recovering"):
@@ -41,8 +43,8 @@ def reconcile_position(broker: Broker, symbol: str, pb: dict) -> str:
     try:
         pos = broker.get_position(symbol, ps)
     except Exception as e:
-        logger.warning("reconcile %s get_position error, hold state: %s", symbol, e)
-        return "ok"                                     # 查询异常 → 保持当前状态，不臆测（UNKNOWN 不判死）
+        logger.warning("reconcile %s get_position error → unknown (hold, retry soon): %s", symbol, e)
+        return "unknown"                                # 查询异常 → 查不清，保持状态但告知上层尽快再查（§22 不臆测 + P1 缩短无 SL 窗口）
     status = pb["status"]
 
     def filled(oid) -> bool:
@@ -242,7 +244,15 @@ def startup_reconcile(engine) -> None:
                 if broker is None:
                     _flag_manual(pb, "manual_no_broker", symbol)
                 else:
-                    reconcile_position(broker, symbol, pb)
+                    # 启动撞交易所抖动（get_position 抛→unknown）→ 短重试，避免无 SL 窗口拖到定期对账（§22 P1）
+                    r = reconcile_position(broker, symbol, pb)
+                    for _ in range(cfg.STARTUP_RECONCILE_RETRIES):
+                        if r != "unknown":
+                            break
+                        time.sleep(cfg.STARTUP_RECONCILE_RETRY_SECONDS)
+                        r = reconcile_position(broker, symbol, pb)
+                    if r == "unknown":
+                        pb.setdefault("exec", {})["reconcile_pending"] = True   # 仍查不清 → 标记，tick 每轮快速重试（不等 RECONCILE_MINUTES）
                 changed = True
         if changed:
             engine.save_state(pkg_dir, state)

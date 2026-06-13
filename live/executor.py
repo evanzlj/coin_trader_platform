@@ -183,6 +183,11 @@ class ExecutorEngine:
                         if self._try_recover(broker, symbol, pb):
                             changed = True
                         continue
+                    if ex0.get("reconcile_pending"):   # 启动撞交易所抖动查不清 → 每轮快速重试对账（缩短无 SL 窗口，不等定期对账 §22 P1）
+                        if reconcile.reconcile_position(broker, symbol, pb) != "unknown":
+                            ex0.pop("reconcile_pending", None)
+                            changed = True
+                        continue
                     if ex0.get("manual_override"):
                         continue                       # 仅配置类（无 broker 等）仍让位
                     if ref_price is None:
@@ -253,8 +258,13 @@ class ExecutorEngine:
                 for pb in state["playbooks"]:
                     if pb["status"] in OPEN_STATUSES and not (pb.get("exec") or {}).get("manual_override"):  # OPENING 已由 (a) 每 tick 处理
                         broker = self.brokers.get(pb["exec"]["account"])
-                        if broker and reconcile.reconcile_position(broker, symbol, pb) != "ok":
-                            rec_changed = True
+                        if broker:
+                            rr = reconcile.reconcile_position(broker, symbol, pb)
+                            if rr == "unknown":
+                                pb["exec"]["reconcile_pending"] = True   # 定期对账也撞抖动 → 转 pending，(a) 每轮快速重试
+                                rec_changed = True
+                            elif rr != "ok":
+                                rec_changed = True
                 if rec_changed:
                     self.save_state(pkg_dir, state)
             self.last_reconcile = now

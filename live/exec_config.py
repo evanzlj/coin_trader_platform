@@ -47,6 +47,8 @@ SIGNAL_MAX_AGE_MINUTES = 240    # 信号 T0 距今超此 → 丢弃不激活（�
 OPENING_GRACE_SECONDS  = 120    # OPENING 内 entry FILLED+暂时无仓 → grace 内保持 OPENING（仓位最终一致性窗口，§22 P0）
 STALE_DATA_MINUTES = 20         # 最新 bar 超此未更新 → 停开新仓（§21 #3）
 RECONCILE_MINUTES  = 15         # 定期对账间隔（§21 #5）
+STARTUP_RECONCILE_RETRIES       = 4    # 启动对账撞交易所抖动（get_position 抛 unknown）→ 短重试次数（§22 P1：缩短无 SL 窗口）
+STARTUP_RECONCILE_RETRY_SECONDS = 1.5  # 启动对账短重试间隔（秒）
 
 # ── 路径 ────────────────────────────────────────────────────────────────────
 def _p(env_key: str, default: Path) -> Path:
