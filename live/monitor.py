@@ -41,7 +41,9 @@ from signal_generator.generator import SignalGenerator
 from signal_generator.events import SignalEvent
 from draw_kline import render
 from prompt_generator.builder import build_prompt
-from live.fetch_delta import fetch_delta, FetchError, GapError
+from live.data_sync import data_sync as _data_sync, SyncError as _SyncError
+# NOTE: also expose has_4h_context and ready_horizon for cursor gating (G1)
+from live.data_sync import ready_horizon, has_4h_context
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,11 +58,14 @@ DATA_DIR         = ROOT / "history_data_manager" / "data"
 DEDUP_STATE      = ROOT / "live" / "state" / "dedup_state.json"
 BUFFER_STATE_DIR = ROOT / "live" / "state" / "buffer"
 HEARTBEAT_FILE   = ROOT / "live" / "heartbeat" / "monitor_last_run.txt"
-SIGNAL_PENDING   = ROOT / "signal_pending"
+SIGNAL_PENDING   = ROOT / "signal_pending"      # legacy (re-arch: write to VLM_PENDING)
 SIGNAL_REJECTED  = ROOT / "signal_rejected"
+VLM_PENDING      = Path(os.environ.get("VLM_PENDING", str(ROOT / "vlm_pending")))
+VLM_REJECTED     = Path(os.environ.get("VLM_REJECTED", str(ROOT / "vlm_rejected")))
 CHARTS_DIR       = ROOT / "live" / "charts"
 LOCK_FILE        = ROOT / "live" / "monitor.lock"
 STATUS_FILE      = ROOT / "live" / "heartbeat" / "monitor_status.json"
+PRODUCER_SANDBOX = os.environ.get("PRODUCER_SANDBOX") == "1"
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 
@@ -239,7 +244,7 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
     grade_str = sig.grade.replace("+", "plus")
     ts_str    = sig.bar_time.strftime("%Y%m%d_%H%M")
     pkg_name  = f"{sym_slug}_{grade_str}_{ts_str}"
-    pkg_dir   = SIGNAL_PENDING / pkg_name
+    pkg_dir   = VLM_PENDING / pkg_name
 
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -287,25 +292,25 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
         logger.warning("chart rendering failed for %s: %s", pkg_name, e)
 
     if not prompt_ok or not charts_ok:
-        # Package is incomplete — move to signal_rejected/ rather than touching .ready.
+        # Package is incomplete — move to vlm_rejected/ rather than touching .ready.
         # On name conflict, append a microsecond suffix so the source ALWAYS leaves
-        # signal_pending/ (no half-package residue), mirroring openclaw's _archive_package.
-        SIGNAL_REJECTED.mkdir(parents=True, exist_ok=True)
-        dest = SIGNAL_REJECTED / pkg_name
+        # vlm_pending/ (no half-package residue).
+        VLM_REJECTED.mkdir(parents=True, exist_ok=True)
+        dest = VLM_REJECTED / pkg_name
         if dest.exists():
-            dest = SIGNAL_REJECTED / f"{pkg_name}__dup_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S_%f')}"
+            dest = VLM_REJECTED / f"{pkg_name}__dup_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S_%f')}"
         try:
             pkg_dir.rename(dest)
         except Exception as mv_err:
             logger.warning("could not move rejected package %s: %s", pkg_name, mv_err)
-        logger.warning("signal rejected (prompt_ok=%s charts_ok=%s): %s",
+        logger.warning("package rejected (prompt_ok=%s charts_ok=%s): %s",
                        prompt_ok, charts_ok, pkg_name)
         return None
 
     # .ready marker — only written when package is complete
     (pkg_dir / ".ready").touch()
 
-    logger.info("signal_pending written: %s", pkg_name)
+    logger.info("vlm_pending written: %s", pkg_name)
     return pkg_dir
 
 
@@ -340,33 +345,36 @@ async def run_cycle(gen: SignalGenerator,
                     ) -> tuple[list[SignalEvent], dict[str, pd.Timestamp | None],
                                dict[str, pd.Timestamp | None]]:
     """
-    Run one monitor cycle:
-      1. fetch delta
-      2. replay new bars (per-symbol cursors) through gen
-      3. return (detected signals, new cursors, latest-bar map)
+    Run one monitor cycle (re-arch Phase 1b):
+      1. data_sync  — pull new closed bars from local DB (no more SSH)
+      2. gate each cursor to ready_horizon (min of ohlcv_15m, flow_15m)
+      3. replay new bars (per-symbol, per-readiness) through gen
+      4. return (detected signals, new cursors, latest-bar map)
 
-    Per-symbol cursors (F5): the replay window starts at the *earliest* lagging
-    symbol's cursor (min) and ends at the latest bar seen. All symbols are replayed
-    over that window; symbols already ahead simply re-feed bars they've buffered, and
-    BarBuffer.update is idempotent on open_time so those are skipped (no duplicate
-    bars, no re-fired signals). A symbol that fell behind (late T2) is caught up.
+    ready_horizon ensures a symbol only advances when BOTH ohlcv_15m and
+    taker_flow_15m have closed to that bar (G1). 4h context is checked at
+    package-production time in main() via has_4h_context.
     """
-    # Step 1: fetch delta — FetchError/GapError propagate to main loop for counter tracking
-    fetch_delta()
+    # Step 1: pull delta from local DB — SyncError propagates to main for counter tracking
+    _data_sync()
 
     latest = get_latest_bar_times()
 
-    # Which symbols have a genuinely newer bar than their own cursor?
-    advancing = {
-        s: latest[s] for s in SYMBOLS
-        if latest.get(s) is not None
-        and (cursors.get(s) is None or latest[s] > cursors[s])
-    }
+    # Step 2: gate advancing cursor to ready_horizon (G1)
+    advancing = {}
+    for s in SYMBOLS:
+        l = latest.get(s)
+        if l is None:
+            continue
+        h = ready_horizon(s)
+        candidate = min(l, h) if h else None
+        if candidate is not None and (cursors.get(s) is None or candidate > cursors[s]):
+            advancing[s] = candidate
+
     if not advancing:
         return [], cursors, latest
 
-    # Window: from the earliest cursor among advancing symbols (None → from beginning),
-    # to the latest bar across them.
+    # Window: from the earliest cursor among advancing symbols to the max ready_horizon
     adv_cursors = [cursors.get(s) for s in advancing]
     start_ts = None if any(c is None for c in adv_cursors) else min(adv_cursors)
     end_ts = max(advancing.values())
@@ -416,6 +424,17 @@ async def main() -> None:
         sys.exit(1)
 
     SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
+    VLM_PENDING.mkdir(parents=True, exist_ok=True)
+
+    # ── Sandbox / 生产路径保护（G2）───────────────────────────────────────────
+    if PRODUCER_SANDBOX:
+        prod_vlm = ROOT / "vlm_pending"
+        prod_rej = ROOT / "vlm_rejected"
+        if VLM_PENDING == prod_vlm or VLM_REJECTED == prod_rej:
+            logger.error("PRODUCER_SANDBOX=1 but path resolves to production directory: "
+                         "VLM_PENDING=%s VLM_REJECTED=%s. Override via env or unset "
+                         "PRODUCER_SANDBOX.", VLM_PENDING, VLM_REJECTED)
+            sys.exit(1)
 
     try:
         dedup, buffer_saved_at_str = load_dedup_state()
@@ -530,7 +549,14 @@ async def main() -> None:
                     if not passes:
                         logger.info("filtered out %s %s: %s", sig.symbol, sig.grade, reason)
                         continue
-                    # None = prompt/charts failed → package moved to signal_rejected/.
+                    # 4h context gate (G1): refuse to produce a package if the 4h bar
+                    # current at T0 hasn't been collected yet (e.g. first 4h of a new
+                    # symbol hasn't closed, or flow data is missing for that era).
+                    if not has_4h_context(sig.symbol, sig.bar_time):
+                        logger.info("skipping %s %s @ %s: 4h context not ready",
+                                    sig.symbol, sig.grade, sig.bar_time)
+                        continue
+                    # None = prompt/charts failed → package moved to vlm_rejected/.
                     # This is a functional failure (a real signal never reached openclaw),
                     # so surface it in status rather than dropping silently.
                     if write_signal_pending(sig) is None:
@@ -550,10 +576,10 @@ async def main() -> None:
 
             update_heartbeat()
 
-        except (FetchError, GapError) as e:
+        except _SyncError as e:
             consecutive_failures += 1
             last_error = str(e)[:200]
-            logger.error("fetch/gap error (consecutive %d): %s", consecutive_failures, e)
+            logger.error("data_sync error (consecutive %d): %s", consecutive_failures, e)
             update_heartbeat()   # process is alive; status file carries the failure info
 
         except Exception as e:
@@ -568,9 +594,9 @@ async def main() -> None:
 
         try:
             backlog = sum(
-                1 for d in SIGNAL_PENDING.iterdir()
+                1 for d in VLM_PENDING.iterdir()
                 if d.is_dir() and (d / ".ready").exists()
-            ) if SIGNAL_PENDING.exists() else 0
+            ) if VLM_PENDING.exists() else 0
         except Exception:
             backlog = -1
         # Status reporting must NEVER take down the main loop: a bad timestamp / disk

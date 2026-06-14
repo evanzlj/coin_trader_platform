@@ -177,6 +177,14 @@ def push_round() -> tuple[int, int]:
 def main() -> None:
     import sys
     from live.single_instance import SingleInstance, AlreadyRunning
+    # Legacy gate (G3): only vlm_finalizer on btc-ml writes to production signal_active
+    # in the re-arch. Set ALLOW_LEGACY_PUSHER=1 for rollback only.
+    if os.environ.get("ALLOW_LEGACY_PUSHER") != "1":
+        logger.error("signal_pusher blocked: ALLOW_LEGACY_PUSHER not set to 1. "
+                     "The re-arch (live/REARCH_PRODUCER_ON_BTCML.md) moves producer "
+                     "to btc-ml; this pusher is legacy. Override: "
+                     "ALLOW_LEGACY_PUSHER=1 python ...")
+        sys.exit(1)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         _lock = SingleInstance(LOCK_FILE)

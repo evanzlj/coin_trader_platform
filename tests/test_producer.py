@@ -130,10 +130,15 @@ class _BoomFeed:
 class TestRunCycleHandlerLeak(unittest.TestCase):
     def setUp(self):
         self._orig_feed = monitor.ReplayFeed
-        self._orig_fetch = monitor.fetch_delta
+        self._orig_fetch = monitor._data_sync
         self._orig_latest = monitor.get_latest_bar_times
+        self._orig_rh = monitor.ready_horizon
+        self._orig_4h = monitor.has_4h_context
         monitor.ReplayFeed = _BoomFeed
-        monitor.fetch_delta = lambda: None
+        monitor._data_sync = lambda: None
+        # ready_horizon must be >= the latest bar so advancing is possible
+        monitor.ready_horizon = lambda s: pd.Timestamp("2026-01-02 00:00:00", tz="UTC")
+        monitor.has_4h_context = lambda s, t0: True
         # BTC has a new bar → run_cycle proceeds to build the (booming) feed.
         monitor.get_latest_bar_times = lambda: {
             "BTC/USDT": pd.Timestamp("2026-01-02 00:00:00", tz="UTC"),
@@ -142,8 +147,10 @@ class TestRunCycleHandlerLeak(unittest.TestCase):
 
     def tearDown(self):
         monitor.ReplayFeed = self._orig_feed
-        monitor.fetch_delta = self._orig_fetch
+        monitor._data_sync = self._orig_fetch
         monitor.get_latest_bar_times = self._orig_latest
+        monitor.ready_horizon = self._orig_rh
+        monitor.has_4h_context = self._orig_4h
 
     def test_capture_handler_removed_when_feed_raises(self):
         gen = _LeakGen()
@@ -251,7 +258,7 @@ class TestPusherStatusAndExit(unittest.TestCase):
             "sp.main()\n",
             encoding="utf-8",
         )
-        env = dict(os.environ)
+        env = dict(os.environ, ALLOW_LEGACY_PUSHER="1")
         env["PYTHONPATH"] = str(ROOT)
         return subprocess.run(
             [sys.executable, str(wrapper)],
@@ -584,16 +591,22 @@ class TestPerSymbolCursor(unittest.TestCase):
     """F5: BTC already at T2; ETH posts T2 late → ETH must still be replayed."""
     def setUp(self):
         self._orig_feed = monitor.ReplayFeed
-        self._orig_fetch = monitor.fetch_delta
+        self._orig_fetch = monitor._data_sync
         self._orig_latest = monitor.get_latest_bar_times
+        self._orig_rh = monitor.ready_horizon
+        self._orig_4h = monitor.has_4h_context
         monitor.ReplayFeed = _RecordingFeed
-        monitor.fetch_delta = lambda: None
+        monitor._data_sync = lambda: None
+        monitor.ready_horizon = lambda s: pd.Timestamp("2026-01-01T00:15:00+00:00", tz="UTC")
+        monitor.has_4h_context = lambda s, t0: True
         _RecordingFeed.last = None
 
     def tearDown(self):
         monitor.ReplayFeed = self._orig_feed
-        monitor.fetch_delta = self._orig_fetch
+        monitor._data_sync = self._orig_fetch
         monitor.get_latest_bar_times = self._orig_latest
+        monitor.ready_horizon = self._orig_rh
+        monitor.has_4h_context = self._orig_4h
 
     def test_late_eth_bar_not_skipped_by_btc_cursor(self):
         T1 = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
@@ -671,13 +684,17 @@ class TestMonitorGenericExceptionStatus(unittest.TestCase):
         self._saved = {k: getattr(monitor, k) for k in
                        ("SignalGenerator", "ReplayFeed", "load_dedup_state",
                         "get_latest_bar_times", "run_cycle", "STATUS_FILE",
-                        "HEARTBEAT_FILE", "SIGNAL_PENDING")}
+                        "HEARTBEAT_FILE", "SIGNAL_PENDING", "_data_sync",
+                        "ready_horizon", "has_4h_context")}
         self._saved_sleep = asyncio.sleep
 
         T = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
         monitor.SignalGenerator = _StubGen
         monitor.ReplayFeed = _NoopFeed
         monitor.load_dedup_state = lambda: ({}, None)
+        monitor._data_sync = lambda: None
+        monitor.ready_horizon = lambda s: T
+        monitor.has_4h_context = lambda s, t0: True
         monitor.get_latest_bar_times = lambda: {s: T for s in monitor.SYMBOLS}
         monitor.STATUS_FILE = self.tmp / "monitor_status.json"
         monitor.HEARTBEAT_FILE = self.tmp / "hb.txt"
@@ -853,7 +870,7 @@ class TestPusherPartialFailure(unittest.TestCase):
             "sp.main()\n",
             encoding="utf-8",
         )
-        env = dict(os.environ)
+        env = dict(os.environ, ALLOW_LEGACY_PUSHER="1")
         env["PYTHONPATH"] = str(ROOT)
         r = subprocess.run([sys.executable, str(wrapper)], cwd=str(ROOT),
                            env=env, capture_output=True, text=True, timeout=60)
