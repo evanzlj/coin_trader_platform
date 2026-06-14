@@ -71,7 +71,11 @@ Windows (中国，NAT 后)
 - 增量：`open_time > local_tail` → 写本地 CSV（复用 `_merge_dedup_sort` 的 dedup+sort+原子写）。
 - 无 SSH、无跨境、无 gap 填补（本地 DB 即源真值；gap=真实数据缺口，直接 `GapError`）。
 - monitor 把 `fetch_delta()` 调用替换成 `data_sync()`，下游全不变。
-- **[P1] 三路 data readiness gate（保留）**：本地化后跨境问题没了，但 DB 内 `ohlcv_15m / taker_flow_15m / ohlcv_4h` 写入仍可能有先后。monitor **只在三路都已收线到同一根 bar 时才推进 cursor / 产 `vlm_pending`**。即：对每个 symbol，取 `min(latest_closed(ohlcv_15m), latest_closed(taker_flow_15m), latest_closed_4h_aligned)` 作为可推进水位；任一路滞后则该 symbol 本轮不推进（其余 symbol 不受影响，沿用 §F5 per-symbol cursor）。**绝不在 flow/4h 未 ready 时产包。**
+- **[P1] data readiness gate（保留，但 15m 与 4h 语义不同）**：本地化后跨境问题没了，但 DB 内 `ohlcv_15m / taker_flow_15m / ohlcv_4h` 写入仍可能有先后。对候选推进的 T0（某根 15m）：
+  - **15m 两路必须同根 ready**：`ohlcv_15m` 与 `taker_flow_15m` 都已收线到 **同一根 T0**。任一路缺 T0 → 该 symbol 本轮不推进。
+  - **4h 只要 as-of T0 的最新已收线 context 存在**：要求 `latest_closed_4h.close_time <= T0.close_time` 即可，**绝不要求"当前 4h bar 与 T0 对齐/同根"**（否则会把每个 4h 窗口内绝大多数 15m 信号误挡）。换言之 4h 提供的是 T0 时刻冻结的上下文，正常情况下总是 ready。
+  - 其余 symbol 不受影响（沿用 §F5 per-symbol cursor）。**绝不在 15m 两路未同根 ready 时产包。**
+- **[P1] `--bootstrap` 全量物化**：btc-ml 新机首跑 `warmup_replay` 前，需先从本地 DB 全量生成基线 CSV。`data_sync.py` 提供 `--bootstrap`（或 `--full`）：把 2020→今 的 `ohlcv/{15m,4h}` + `taker_flow/15m`（均 `close_time<=now`）一次性物化成 CSV，跑 §全量 audit（dup/reverse/gap=0）确认干净后，再跑 `warmup_replay.py` 建 buffer/dedup。日常 monitor 走增量 `open_time>local_tail`。
 - **为何保留 CSV 物化**：`ReplayFeed` 和 `draw_kline` 都以 CSV 为输入接口；本地 DB→CSV 是廉价、安全的物化视图，避免改动信号/画图代码（最高风险区）。DBFeed 直读 DB 记为后续清理项，非本次范围。
 
 ### 3.2 `live/signal_sync.py`（Windows，替代 signal_pusher，双向）
@@ -126,7 +130,7 @@ pending 包是跨境队列，必须有明确状态机，否则会出现重复 Ch
 2. **claim 续约 / 回收**：`claimed` 超过 `CLAIM_LEASE`（如 20min，覆盖 ChatGPT TIMEOUT 360s × 重试 + 跨境往返）仍无 response → 视为 worker 拉了但挂了 → **回收**：清 `.claimed`，退回 `pending`，可被重新拉取。
 3. **TTL / stale**：pending 的 `signal.json.bar_time` 超 `SIGNAL_MAX_AGE` → monitor/扫描器直接归档 `vlm_stale/`，不再投递（避免积压老信号过 ChatGPT）。
 4. **重复 response**：finalizer 已处理过某 pkg（done）后又收到同名 response → 按 §3.4 决策表归档 duplicate，不二次入场。
-5. **拉取幂等**：`signal_sync` 用 `.synced_pulled/{pkg}` 本地标记，重启不重拉；同理 `.synced_pushed/{pkg}`。
+5. **拉取幂等（标记非唯一真相）**：`signal_sync` 用 `.synced_pulled/{pkg}` 本地标记避免重拉；同理 `.synced_pushed/{pkg}`。但**本地标记不能单独作为真相**：若本地 `vlm_pending/{pkg}` 实际缺失或校验失败（被删 / 半坏 / 缺 `.ready`/图），即使有 `.synced_pulled` 也**必须允许重新拉取**（真相 = 本地包是否完好）。否则本地包丢失会被永久跳过。
 6. **背压**：pending 积压数 > 阈值（如 20）→ status 报 backlog，watchdog 告警（Windows/链路可能挂）。
 
 ---
@@ -161,6 +165,7 @@ pending 包是跨境队列，必须有明确状态机，否则会出现重复 Ch
   - 关：拉一个真包 → ChatGPT → 推回；验证 btc-ml 收到 response。
 - **Phase 4**：端到端贯通 + watchdog 角色 + systemd units。
   - 关：DB 一根新信号 → 走完 btc-ml→Windows→btc-ml→executor 接管。
+  - **[P1] 生产 `signal_active` 单写者铁律**：在新 `vlm_finalizer` 指向**生产** `signal_active` 之前的同一时刻，**旧 Windows `signal_pusher` 必须已停掉或改指 sandbox**。两条链路**绝不能同时向生产 `signal_active` 投包**（否则 executor 收重复/冲突信号）。切换是原子操作：停旧 pusher → 确认旧链路不再写 → 才让新 finalizer 写生产。
 - **Phase 5**：下线 Windows 旧 monitor / fetch_delta / signal_pusher。
 
 ---
@@ -209,3 +214,4 @@ pending 包是跨境队列，必须有明确状态机，否则会出现重复 Ch
 - 每个 Phase 产物独立；Phase 5 前 Windows 旧链路保持可启动。
 - 出问题：停新 units、重启旧 Windows monitor + signal_pusher 即回到现状。
 - btc-ml 的 `data_sync`/`vlm_finalizer`/新 `vlm_pending` 目录与旧链路互不写同一文件，并存安全。
+- **生产 `signal_active` 任一时刻只有一个写者**（旧 Windows pusher 或新 finalizer，二选一）。回滚 = 停新 finalizer（或改 sandbox）→ 重启旧 pusher。切换/回滚都以"先停一方、确认不再写、再启另一方"为序，**不留两写并存窗口**。
