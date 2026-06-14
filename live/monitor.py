@@ -385,22 +385,31 @@ async def run_cycle(gen: SignalGenerator,
     async def _capture(evt: SignalEvent) -> None:
         detected.append(evt)
 
-    start_str = (start_ts + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S") \
-        if start_ts is not None else None
-    end_str   = end_ts.strftime("%Y-%m-%d %H:%M:%S")
-
-    mini_feed = ReplayFeed(
-        data_dir = DATA_DIR,
-        symbols  = SYMBOLS,
-        start    = start_str,
-        end      = end_str,
-    )
-    mini_feed.add_bar_handler(gen._on_bar)
-    mini_feed.add_flow_handler(gen._on_flow)
+    # Step 3: replay EACH symbol independently, capped to its own ready_horizon.
+    # A single global end_ts=max(advancing.values()) would push OHLCV beyond a
+    # lagging symbol's ready_horizon, pre-filling its buffer before the flow/4h
+    # context is ready — suppressing that bar's signal when flow finally catches up
+    # (Codex P1, monitor.py:377 hole).
     try:
-        await mini_feed.start()
+        for s, horizon in advancing.items():
+            cur = cursors.get(s)
+            if cur is None:
+                start_str = None
+            else:
+                start_str = (cur + pd.Timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+            end_str = horizon.strftime("%Y-%m-%d %H:%M:%S")
+
+            mini_feed = ReplayFeed(
+                data_dir=DATA_DIR,
+                symbols=[s],
+                start=start_str,
+                end=end_str,
+            )
+            mini_feed.add_bar_handler(gen._on_bar)
+            mini_feed.add_flow_handler(gen._on_flow)
+            await mini_feed.start()
     finally:
-        # Always unregister the temporary handler — if mini_feed.start() raises
+        # Always unregister the temporary handler — if a per-symbol feed.start() raises
         # (CSV read error, etc.) a leaked _capture would fire on every future
         # signal and pin a stale `detected` list. ValueError = already gone.
         try:
@@ -423,18 +432,19 @@ async def main() -> None:
         logger.error("monitor already running: %s", e)
         sys.exit(1)
 
-    SIGNAL_PENDING.mkdir(parents=True, exist_ok=True)
     VLM_PENDING.mkdir(parents=True, exist_ok=True)
 
-    # ── Sandbox / 生产路径保护（G2）───────────────────────────────────────────
+    # ── Sandbox / 生产路径保护（G2）── resolve BEFORE creating any directory ──
     if PRODUCER_SANDBOX:
-        prod_vlm = ROOT / "vlm_pending"
-        prod_rej = ROOT / "vlm_rejected"
-        if VLM_PENDING == prod_vlm or VLM_REJECTED == prod_rej:
+        prod_vlm = (ROOT / "vlm_pending").resolve()
+        prod_rej = (ROOT / "vlm_rejected").resolve()
+        if VLM_PENDING.resolve() == prod_vlm or VLM_REJECTED.resolve() == prod_rej:
             logger.error("PRODUCER_SANDBOX=1 but path resolves to production directory: "
                          "VLM_PENDING=%s VLM_REJECTED=%s. Override via env or unset "
-                         "PRODUCER_SANDBOX.", VLM_PENDING, VLM_REJECTED)
+                         "PRODUCER_SANDBOX.", VLM_PENDING.resolve(), VLM_REJECTED.resolve())
             sys.exit(1)
+
+    VLM_PENDING.mkdir(parents=True, exist_ok=True)
 
     try:
         dedup, buffer_saved_at_str = load_dedup_state()

@@ -570,12 +570,12 @@ class TestBufferStateAtomicLoad(unittest.TestCase):
 
 
 class _RecordingFeed:
-    """Captures construction args; start() is a no-op (no CSV read)."""
-    last = None
+    """Records ALL construction calls in a class-level list; start() is a no-op."""
+    calls: "list[dict]" = []
 
     def __init__(self, **kw):
-        _RecordingFeed.last = kw
         self.kw = kw
+        _RecordingFeed.calls.append(kw)
 
     def add_bar_handler(self, h):
         pass
@@ -599,7 +599,7 @@ class TestPerSymbolCursor(unittest.TestCase):
         monitor._data_sync = lambda: None
         monitor.ready_horizon = lambda s: pd.Timestamp("2026-01-01T00:15:00+00:00", tz="UTC")
         monitor.has_4h_context = lambda s, t0: True
-        _RecordingFeed.last = None
+        _RecordingFeed.calls = []
 
     def tearDown(self):
         monitor.ReplayFeed = self._orig_feed
@@ -621,10 +621,20 @@ class TestPerSymbolCursor(unittest.TestCase):
 
         # ETH must have advanced (it was replayed), even though BTC's cursor == latest.
         self.assertEqual(new_cursors["ETH/USDT"], T2)
-        # A replay feed was built (ETH had a genuinely new bar).
-        self.assertIsNotNone(_RecordingFeed.last)
-        # Window must start at the lagging cursor (ETH T1 + 1min), not BTC's T2.
-        self.assertIn("2026-01-01 00:01:00", _RecordingFeed.last["start"])
+        # At least one ReplayFeed was built (ETH had a genuinely new bar).
+        self.assertGreater(len(_RecordingFeed.calls), 0)
+
+        # With per-symbol replay, each advancing symbol gets its own feed capped at
+        # ready_horizon. The ETH feed should start from ETH T1+1min, not from BTC's T2.
+        eth_calls = [c for c in _RecordingFeed.calls if c.get("symbols") == ["ETH/USDT"]]
+        self.assertGreaterEqual(len(eth_calls), 1, "ETH must get its own replay feed")
+        self.assertIn("2026-01-01 00:01:00", eth_calls[0]["start"])
+
+        # Each symbol's end must be bounded by its ready_horizon (monitor.py ready_horizon
+        # mock returns T2 for all symbols). Verify no feed uses an end beyond T2.
+        for c in _RecordingFeed.calls:
+            self.assertEqual(c["end"], "2026-01-01 00:15:00",
+                             f"per-symbol end must be capped to ready_horizon: {c}")
 
     def test_no_advance_no_replay(self):
         T2 = pd.Timestamp("2026-01-01 00:15:00", tz="UTC")
@@ -633,7 +643,7 @@ class TestPerSymbolCursor(unittest.TestCase):
         gen = _LeakGen()
         signals, new_cursors, latest = asyncio.run(monitor.run_cycle(gen, cursors))
         self.assertEqual(new_cursors, cursors)
-        self.assertIsNone(_RecordingFeed.last, "no new bars → no replay feed built")
+        self.assertEqual(_RecordingFeed.calls, [], "no new bars → no replay feed built")
 
 
 # ── #2. monitor generic exception → status reflects failure ───────────────────
