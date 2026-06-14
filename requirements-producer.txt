@@ -6,5 +6,7 @@
 
 pandas>=2.0
 numpy>=1.24
-pyarrow>=14.0        # buffer state parquet (warmup_replay / monitor)
-matplotlib>=3.7      # draw_kline signal chart rendering (headless / Agg)
+pyarrow>=14.0         # buffer state parquet (warmup_replay / monitor)
+matplotlib>=3.7       # draw_kline signal chart rendering (headless / Agg)
+aiohttp>=3.9          # realtime_data_pull eagerly imports BinanceFuturesWS (uses aiohttp)
+websockets>=12.0      # same import chain (Binance Futures WS)
