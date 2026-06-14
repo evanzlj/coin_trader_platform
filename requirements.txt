@@ -1,4 +1,17 @@
+# Producer / 中国 Windows 侧依赖（monitor · live_openclaw · signal_pusher · watchdog）
+# btc-ml / 新加坡 executor 侧依赖见 requirements-executor.txt
+#
+# 注：playwright 只需 Python 包本身——live_openclaw 通过 CDP 连接已安装的浏览器
+#     （openclaw browser），无需 `playwright install chromium` 下载内置 chromium。
+
 pandas>=2.0
 numpy>=1.24
-aiohttp>=3.9
-websockets>=12.0
+pyarrow>=14.0        # buffer state parquet（signal_generator.save/load_buffer_state, F6）
+matplotlib>=3.7      # draw_kline 信号 K 线图渲染
+playwright>=1.40     # live_openclaw（连已装浏览器，无需 playwright install chromium）
+requests>=2.31       # 飞书告警（live/notify.py；缺失时静默降级，但生产应安装）
+aiohttp>=3.9         # realtime_data_pull（RealtimeFeed WS，monitor 备用路径）
+websockets>=12.0     # realtime_data_pull（Binance Futures WS）
+
+# 可选：watchdog 的 Windows 桌面弹窗通知；缺失时 try/except 静默降级
+plyer>=2.1
