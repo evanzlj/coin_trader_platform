@@ -929,6 +929,34 @@ class TestFetchDeltaFailClosed(unittest.TestCase):
             fd.LOCAL_DATA = orig
 
 
+class TestFetchDeltaClosedBarsOnly(unittest.TestCase):
+    def test_export_query_filters_to_closed_bars(self):
+        # The remote export must only pull CLOSED bars (close_time <= now), else the
+        # in-progress 15m bar leaks in and monitor evaluates signals on partial OHLC.
+        captured = {}
+
+        class _R:
+            stdout = "done\n"
+            returncode = 0
+
+        def fake_ssh_python(script):
+            captured["script"] = script
+            return _R()
+
+        orig = fd._ssh_python
+        fd._ssh_python = fake_ssh_python
+        try:
+            fd.export_delta_remote("ohlcv", {("BTC/USDT", "15m"): None,
+                                             ("ETH/USDT", "15m"): "2026-06-14T07:00:00+00:00"})
+        finally:
+            fd._ssh_python = orig
+
+        script = captured["script"]
+        # generated remote script must be valid Python and carry the close-time filter
+        compile(script, "<remote>", "exec")
+        self.assertIn("close_time<=strftime", script)
+
+
 class TestOpenclawWritersDefensive(unittest.TestCase):
     def test_status_write_failure_swallowed(self):
         # P1-4: os.replace blowing up must not propagate out of write_openclaw_status.

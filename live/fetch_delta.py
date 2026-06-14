@@ -201,11 +201,16 @@ def export_delta_remote(dataset: str, since_map: dict[tuple[str, str], Optional[
             slug = symbol.replace("/", "").lower()
             out_file = OUT / f"{{slug}}_{{tf}}.csv"
 
+            # CLOSED bars only: close_time <= btc-ml's UTC now. Mirrors data_reader's
+            # discipline — without it fetch pulls the current *in-progress* 15m bar
+            # (partial OHLC), which the monitor would then evaluate signals on
+            # prematurely, and which fetch would never re-pull with final values.
+            closed = "close_time<=strftime('%Y-%m-%dT%H:%M:%S','now')||'+00:00'"
             if since is None:
-                where = "WHERE symbol=? AND timeframe=? ORDER BY open_time"
+                where = f"WHERE symbol=? AND timeframe=? AND {{closed}} ORDER BY open_time"
                 params = (symbol, tf)
             else:
-                where = "WHERE symbol=? AND timeframe=? AND open_time>? ORDER BY open_time"
+                where = f"WHERE symbol=? AND timeframe=? AND open_time>? AND {{closed}} ORDER BY open_time"
                 params = (symbol, tf, since)
 
             cur = db.execute(
