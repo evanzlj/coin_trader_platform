@@ -134,19 +134,22 @@ class TestReadinessGate(_Base):
         now = pd.Timestamp("2026-06-14T03:00:00+00:00")
         self.assertIsNone(ds.ready_horizon("BTC/USDT", now=now))
 
-    def test_4h_context_present_and_absent(self):
-        now = pd.Timestamp("2026-06-14T03:00:00+00:00")
-        self.assertFalse(ds.has_4h_context("BTC/USDT", now=now))   # no 4h yet
-        # a 4h bar that has CLOSED by now: open 20:00 prev day, close 00:00 (<= 03:00)
+    def test_4h_context_asof_t0(self):
+        # No 4h at all → False
+        T0 = pd.Timestamp("2026-06-14T02:00:00+00:00")
+        self.assertFalse(ds.has_4h_context("BTC/USDT", T0))
+
+        # A 4h bar closed by T0
         ot = pd.Timestamp("2026-06-13T20:00:00+00:00")
         self.conn.execute("INSERT INTO ohlcv_bars(symbol,timeframe,open_time,close_time,open,high,low,close,volume,source,is_fallback)"
                           " VALUES('BTC/USDT','4h',?,?,1,2,0,1.5,10,'k',0)",
                           (ot.isoformat(), (ot + pd.Timedelta(hours=4)).isoformat()))
         self.conn.commit()
-        self.assertTrue(ds.has_4h_context("BTC/USDT", now=now))
-        # an only-in-progress 4h bar (closes after now) must NOT count as ready
-        now_early = pd.Timestamp("2026-06-13T22:00:00+00:00")
-        self.assertFalse(ds.has_4h_context("BTC/USDT", now=now_early))
+        self.assertTrue(ds.has_4h_context("BTC/USDT", T0))
+
+        # A different T0 earlier than the 4h close → must NOT say yes (4h close=00:00 > T0=23:00)
+        T0_early = pd.Timestamp("2026-06-13T22:00:00+00:00")
+        self.assertFalse(ds.has_4h_context("BTC/USDT", T0_early))
 
 
 class TestFailClosed(_Base):
@@ -155,7 +158,8 @@ class TestFailClosed(_Base):
         with self.assertRaises(ds.SyncError):
             ds.data_sync(now=pd.Timestamp("2026-06-14T03:00:00+00:00"))
 
-    def test_bootstrap_audit_catches_duplicate(self):
+    def test_db_duplicate_raises_before_merge(self):
+        """P1-1: dup in DB must cause SyncError during _merge_csv (not get silently deduped)."""
         _seed_15m(self.conn, "BTC/USDT", "2026-06-14T00:00:00+00:00", 5, "ohlcv")
         _seed_15m(self.conn, "BTC/USDT", "2026-06-14T00:00:00+00:00", 5, "taker_flow")
         # inject a duplicate open_time into the DB
@@ -163,13 +167,23 @@ class TestFailClosed(_Base):
                           " VALUES('BTC/USDT','15m','2026-06-14T00:15:00+00:00','2026-06-14T00:30:00+00:00',1,2,0,1.5,10,'k',0)")
         self.conn.commit()
         now = pd.Timestamp("2026-06-14T03:00:00+00:00")
-        # _merge_csv dedups, so the CSV itself is clean — but verify audit_series catches a raw dup file
+        # _validate_open_times runs BEFORE _merge_csv writes anything — this must fail
+        with self.assertRaises(ds.SyncError):
+            ds.bootstrap(now=now)
+
+    def test_incremental_without_bootstrap_raises(self):
+        """P1-2: data_sync() without existing CSV must raise SyncError, not silently full-pull."""
+        # NO bootstrap step — just call data_sync directly on empty DATA_DIR
+        now = pd.Timestamp("2026-06-14T03:00:00+00:00")
+        with self.assertRaises(ds.SyncError):
+            ds.data_sync(now=now)
+
+    def test_raw_dup_csv_audit(self):
+        """audit_series still catches a raw dup file (belt-and-suspenders)."""
         p = self.tmp / "dup.csv"
         p.write_text("open_time\n2026-06-14T00:00:00+00:00\n2026-06-14T00:15:00+00:00\n2026-06-14T00:15:00+00:00\n",
                      encoding="utf-8")
-        issue = ds.audit_series(p, "15m")
-        self.assertIsNotNone(issue)
-        self.assertEqual(issue[0], "duplicate")
+        self.assertEqual(ds.audit_series(p, "15m")[0], "duplicate")
 
     def test_audit_detects_reverse(self):
         p = self.tmp / "rev.csv"

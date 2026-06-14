@@ -132,20 +132,53 @@ def _query_closed(conn, dataset: str, symbol: str, tf: str,
     return pd.DataFrame(rows, columns=cols)
 
 
+def _validate_open_times(series_name: str, t: pd.Series, tf: str) -> None:
+    """Check a raw open_time series (no pre-dedup) for dup/reverse/gap. Raises SyncError."""
+    if len(t) < 2:
+        return
+    interval = pd.Timedelta(minutes=INTERVAL_MIN.get(tf, 15))
+    d = t.diff().dropna()
+    dup = d[d == pd.Timedelta(0)]
+    if not dup.empty:
+        i = dup.index[0]
+        raise SyncError(f"{series_name}: duplicate open_time ({t.iloc[i-1].isoformat()} == {t.iloc[i].isoformat()}) — "
+                        "data integrity, refusing to merge")
+    rev = d[d < pd.Timedelta(0)]
+    if not rev.empty:
+        i = rev.index[0]
+        raise SyncError(f"{series_name}: reverse open_time ({t.iloc[i-1].isoformat()} > {t.iloc[i].isoformat()}) — "
+                        "data integrity, refusing to merge")
+    bad = d[d > interval * 1.5]
+    if not bad.empty:
+        i = bad.index[0]
+        logger.warning("gap in %s (%s → %s) — proceeding",
+                       series_name, t.iloc[i-1].isoformat(), t.iloc[i].isoformat())
+
+
 def _merge_csv(path: Path, new_df: pd.DataFrame) -> int:
     """Union existing + new → dedup on open_time (keep last) → sort → atomic write.
-    Returns count of genuinely-new open_times added."""
+
+    Returns count of genuinely-new open_times added.
+    **Must NOT silently fix data corruption**: validate BOTH the existing CSV and the
+    DB query result BEFORE merge (P1-1). A dup/reverse in either source causes SyncError
+    before any write happens.
+    """
     if new_df.empty:
         return 0
-    new_keys = set(pd.to_datetime(new_df["open_time"], utc=True))
+    new_ots = pd.to_datetime(new_df["open_time"], utc=True)
+    _validate_open_times(f"DB new ({path.name})", new_ots, path.stem.rsplit("_", 1)[-1])
+
     if path.exists():
         existing = pd.read_csv(path)
-        existing_keys = set(pd.to_datetime(existing["open_time"], utc=True))
+        existing_ots = pd.to_datetime(existing["open_time"], utc=True)
+        _validate_open_times(f"existing CSV ({path.name})", existing_ots, path.stem.rsplit("_", 1)[-1])
+        existing_keys = set(existing_ots)
         combined = pd.concat([existing, new_df], ignore_index=True)
     else:
         existing_keys = set()
         combined = new_df
-    added = len(new_keys - existing_keys)
+
+    added = len(set(new_ots) - existing_keys)
     key = pd.to_datetime(combined["open_time"], utc=True)
     combined = (combined.assign(_k=key).sort_values("_k")
                 .drop_duplicates("_k", keep="last").drop(columns="_k").reset_index(drop=True))
@@ -153,10 +186,10 @@ def _merge_csv(path: Path, new_df: pd.DataFrame) -> int:
     return added
 
 
-# ── Continuity audit (G4 fail-closed) ─────────────────────────────────────────
+# ── Continuity audit (G4 fail-closed) — full-file, post-merge ─────────────────
 
 def audit_series(path: Path, tf: str) -> Optional[tuple[str, str, str]]:
-    """Full-series continuity check. Returns (kind, a, b) for the first issue, else None.
+    """Full-series continuity check on a final CSV. Returns (kind, a, b) or None.
     kind ∈ {duplicate, reverse, gap, check_failed}. Fail-closed on its own error."""
     interval = pd.Timedelta(minutes=INTERVAL_MIN.get(tf, 15))
     try:
@@ -204,14 +237,15 @@ def ready_horizon(symbol: str, now: Optional[pd.Timestamp] = None) -> Optional[p
     return min(o, f)
 
 
-def has_4h_context(symbol: str, now: Optional[pd.Timestamp] = None) -> bool:
-    """4h as-of context（G1）：存在至少一根 close_time<=now 的已收线 4h bar。
-    不要求与 T0 同根；缺失（4h 序列空/全未收线）→ fail-closed。"""
-    now_iso = _now_iso(now)
+def has_4h_context(symbol: str, t0: pd.Timestamp) -> bool:
+    """4h as-of T0 context（G1）：存在至少一根 close_time<=T0.close_time 的已收线 4h bar。
+    不要求与 T0 同根；缺失 → fail-closed。用候选 T0 参数（不是当前 now）来防止历史重叠 replay
+    被后来的 4h bar 误判为有上下文（Codex P1-3）。"""
+    t0_iso = t0.tz_convert("UTC").replace(microsecond=0).isoformat()
     with _connect() as conn:
         row = conn.execute(
             "SELECT MAX(close_time) FROM ohlcv_bars WHERE symbol=? AND timeframe='4h' AND close_time<=?",
-            (symbol, now_iso),
+            (symbol, t0_iso),
         ).fetchone()
     return bool(row and row[0])
 
@@ -219,9 +253,30 @@ def has_4h_context(symbol: str, now: Optional[pd.Timestamp] = None) -> bool:
 # ── Sync entry points ─────────────────────────────────────────────────────────
 
 def _sync(since_is_none: bool, now: Optional[pd.Timestamp] = None) -> dict[Path, int]:
-    """Materialize closed bars for all series. bootstrap → since=None; incremental → since=tail."""
+    """Materialize closed bars for all series. bootstrap → since=None; incremental → since=tail.
+
+    P1-2: incremental 路径必须先确认所有 expected CSV 已存在且非空，缺失 → SyncError
+    （不允许静默全量物化绕过 bootstrap→audit→warmup 门禁）。bootstrap 自动创建基线。"""
     now_iso = _now_iso(now)
     out: dict[Path, int] = {}
+
+    # Fail fast on missing DB (order matters: check DB before CSV so a missing-db
+    # test or scenario gets SyncError about the DB, not about CSV).
+    db = cfg.OHLCV_DB
+    if not Path(db).exists():
+        raise SyncError(f"source DB not found: {db}")
+
+    # Incremental: all expected CSVs must already exist and be non-empty.
+    if not since_is_none:
+        for dataset in ("ohlcv", "taker_flow"):
+            for sym in SYMBOLS:
+                for tf in _tfs(dataset):
+                    path = _csv_path(dataset, sym, tf)
+                    if not path.exists() or path.stat().st_size == 0:
+                        raise SyncError(
+                            f"expected CSV missing/empty: {path} — run --bootstrap first"
+                        )
+
     with _connect() as conn:
         for dataset in ("ohlcv", "taker_flow"):
             for sym in SYMBOLS:
@@ -248,9 +303,22 @@ def data_sync(now: Optional[pd.Timestamp] = None) -> dict[Path, int]:
 
 
 def bootstrap(now: Optional[pd.Timestamp] = None) -> dict[Path, int]:
-    """全量物化 2020→今（首跑/新机）+ 全量 audit。任一序列 dup/reverse/gap/check_failed → SyncError。"""
-    written = _sync(since_is_none=True, now=now)
-    for path, _ in written.items():
+    """全量物化 BOOTSTRAP_START→今（首跑/新机）+ 全量 audit。任一序列 dup/reverse/gap/check_failed → SyncError。"""
+    now_iso = _now_iso(now)
+    out: dict[Path, int] = {}
+    with _connect() as conn:
+        for dataset in ("ohlcv", "taker_flow"):
+            for sym in SYMBOLS:
+                for tf in _tfs(dataset):
+                    path = _csv_path(dataset, sym, tf)
+                    table, cols = _table_cols(dataset)
+                    sql = (f"SELECT {', '.join(cols)} FROM {table} "
+                           f"WHERE symbol=? AND timeframe=? AND open_time>=? AND close_time<=? "
+                           f"ORDER BY open_time")
+                    rows = conn.execute(sql, (sym, tf, BOOTSTRAP_START, now_iso)).fetchall()
+                    df = pd.DataFrame(rows, columns=cols)
+                    out[path] = _merge_csv(path, df)
+    for path, _ in out.items():
         if not path.exists():
             raise SyncError(f"bootstrap produced no CSV: {path}")
         tf = path.stem.rsplit("_", 1)[-1]
@@ -258,7 +326,7 @@ def bootstrap(now: Optional[pd.Timestamp] = None) -> dict[Path, int]:
         if issue is not None:
             kind, a, b = issue
             raise SyncError(f"bootstrap audit failed: {kind} in {path.name} ({a} → {b})")
-    return written
+    return out
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -274,6 +342,9 @@ def main() -> None:
     except SyncError as e:
         logger.error("data_sync FAILED: %s", e)
         sys.exit(1)
+    except Exception as e:
+        logger.exception("data_sync UNEXPECTED ERROR: %s", e)
+        sys.exit(2)
     total = sum(v for v in result.values())
     logger.info("data_sync %s complete: %d new row(s) across %d series",
                 "bootstrap" if args.bootstrap else "incremental", total, len(result))
