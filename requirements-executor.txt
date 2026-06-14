@@ -1,5 +1,5 @@
-# executor 依赖（部署在 btc-ml / 新加坡）
-# 中国 Windows 的 monitor/openclaw 依赖见 requirements.txt（playwright 等）
+# Executor deps (deployed on btc-ml / Singapore)
+# China Windows monitor/openclaw deps: see requirements.txt (playwright etc.)
 binance-futures-connector>=4.0.0
 python-okx>=0.3.0
 pandas>=2.0.0
