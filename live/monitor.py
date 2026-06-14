@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Live signal monitor — Process A.
+Live signal monitor — re-arch Phase 1b (producer on btc-ml).
 
 Polls for new 15m bar closes, runs signal detection, generates charts,
-and writes signal packages to signal_pending/ for openclaw to pick up.
+and writes VLM signal packages to vlm_pending/ for the vlm_finalizer/signal_sync.
 
 Startup:
   1. Load dedup state from live/state/dedup_state.json (produced by warmup_replay.py)
   2. Enter polling loop
 
 Loop (triggered by new bar, polled every 30s):
-  1. fetch_delta  — pull new bars from btc-ml
-  2. reload CSVs into SignalGenerator via a lightweight re-scan
-  3. detect signals on the new bar
-  4. for each signal: apply filters, generate charts, write signal_pending/
-  5. save dedup state + update heartbeat
+  1. data_sync  — pull new closed bars from local ai_crypto_analyst.db
+  2. gate each cursor to ready_horizon (min of ohlcv_15m, flow_15m)
+  3. detect signals on new bar (per-symbol, per-readiness)
+  4. for each signal: check 4h context, apply filters, generate charts, write vlm_pending/
+  5. save dedup state + periodic buffer state save + update heartbeat
 
 Usage:
     python3 live/monitor.py
@@ -236,9 +236,9 @@ def _load_frames(sig: SignalEvent) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
 
 def write_vlm_pending(sig: SignalEvent) -> "Path | None":
     """
-    Write signal package to signal_pending/{sym}_{grade}_{ts}/.
+    Write VLM signal package to vlm_pending/{sym}_{grade}_{ts}/.
     Returns the package directory path, or None if prompt/charts failed
-    (incomplete packages are moved to signal_rejected/ instead).
+    (incomplete packages are moved to vlm_rejected/ instead).
     """
     sym_slug  = sig.symbol.replace("/", "").lower()
     grade_str = sig.grade.replace("+", "plus")
