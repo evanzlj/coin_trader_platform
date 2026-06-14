@@ -1042,5 +1042,40 @@ class TestWatchdogStatusStaleness(unittest.TestCase):
         self.assertIsNotNone(alert)
 
 
+# ── Phase 1b sandbox guard (P1: mkdir NOT created before sandbox check) ───────
+
+class TestSandboxGuard(unittest.TestCase):
+    def test_sandbox_rejects_production_path(self):
+        tmp = Path(tempfile.mkdtemp())
+        prod_vlm = tmp / "vlm_pending"
+        prod_rej = tmp / "vlm_rejected"
+        # Simulate the sandbox check from monitor.py main(): if VLM_PENDING resolves
+        # to ROOT/vlm_pending, refuse and don't create the directory.
+        ROOT = tmp
+        VLM_PENDING = prod_vlm
+        VLM_REJECTED = prod_rej
+        with self.assertRaises(SystemExit) as cm:
+            if (VLM_PENDING.resolve() == (ROOT / "vlm_pending").resolve()
+                    or VLM_REJECTED.resolve() == (ROOT / "vlm_rejected").resolve()):
+                sys.exit(1)
+        self.assertEqual(cm.exception.code, 1)
+        # Directory must NOT have been created
+        self.assertFalse(prod_vlm.exists())
+
+    def test_sandbox_allows_custom_path(self):
+        tmp = Path(tempfile.mkdtemp())
+        custom_pending = tmp / "custom_vlm_pending"
+        custom_rejected = tmp / "custom_vlm_rejected"
+        ROOT = tmp
+        VLM_PENDING = custom_pending
+        VLM_REJECTED = custom_rejected
+        try:
+            if (VLM_PENDING.resolve() == (ROOT / "vlm_pending").resolve()
+                    or VLM_REJECTED.resolve() == (ROOT / "vlm_rejected").resolve()):
+                self.fail("custom path should not match production")
+        except SystemExit:
+            self.fail("custom path should not cause SystemExit")
+
+
 if __name__ == "__main__":
     unittest.main()

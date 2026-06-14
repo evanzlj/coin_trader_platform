@@ -232,9 +232,9 @@ def _load_frames(sig: SignalEvent) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
     return df15m, df4h, df_flow
 
 
-# ── Signal package writer ─────────────────────────────────────────────────────
+# ── VLM package writer (re-arch: output vlm_pending/) ─────────────────────────
 
-def write_signal_pending(sig: SignalEvent) -> "Path | None":
+def write_vlm_pending(sig: SignalEvent) -> "Path | None":
     """
     Write signal package to signal_pending/{sym}_{grade}_{ts}/.
     Returns the package directory path, or None if prompt/charts failed
@@ -374,11 +374,6 @@ async def run_cycle(gen: SignalGenerator,
     if not advancing:
         return [], cursors, latest
 
-    # Window: from the earliest cursor among advancing symbols to the max ready_horizon
-    adv_cursors = [cursors.get(s) for s in advancing]
-    start_ts = None if any(c is None for c in adv_cursors) else min(adv_cursors)
-    end_ts = max(advancing.values())
-
     detected: list[SignalEvent] = []
 
     @gen.on_signal
@@ -431,8 +426,6 @@ async def main() -> None:
     except AlreadyRunning as e:
         logger.error("monitor already running: %s", e)
         sys.exit(1)
-
-    VLM_PENDING.mkdir(parents=True, exist_ok=True)
 
     # ── Sandbox / 生产路径保护（G2）── resolve BEFORE creating any directory ──
     if PRODUCER_SANDBOX:
@@ -569,7 +562,7 @@ async def main() -> None:
                     # None = prompt/charts failed → package moved to vlm_rejected/.
                     # This is a functional failure (a real signal never reached openclaw),
                     # so surface it in status rather than dropping silently.
-                    if write_signal_pending(sig) is None:
+                    if write_vlm_pending(sig) is None:
                         package_write_failures += 1
                         last_error = f"package write failed: {sig.symbol} {sig.grade} {sig.bar_time}"
 
