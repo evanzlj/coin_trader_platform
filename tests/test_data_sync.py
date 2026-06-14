@@ -178,6 +178,19 @@ class TestFailClosed(_Base):
         with self.assertRaises(ds.SyncError):
             ds.data_sync(now=now)
 
+    def test_db_gap_raises_before_write(self):
+        """P1: gap in DB must raise SyncError and NOT write the affected CSV."""
+        _seed_15m(self.conn, "BTC/USDT", "2026-06-14T00:00:00+00:00", 4, "ohlcv")    # 00:00..00:45
+        _seed_15m(self.conn, "BTC/USDT", "2026-06-14T01:30:00+00:00", 3, "ohlcv")    # gap at 00:45→01:30
+        _seed_15m(self.conn, "BTC/USDT", "2026-06-14T00:00:00+00:00", 7, "taker_flow")
+        self.conn.commit()
+        path = ds._csv_path("ohlcv", "BTC/USDT", "15m")
+        now = pd.Timestamp("2026-06-14T03:00:00+00:00")
+        with self.assertRaises(ds.SyncError):
+            ds.bootstrap(now=now)
+        # CSV must NOT have been written (fail-closed before write)
+        self.assertFalse(path.exists())
+
     def test_raw_dup_csv_audit(self):
         """audit_series still catches a raw dup file (belt-and-suspenders)."""
         p = self.tmp / "dup.csv"

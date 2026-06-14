@@ -151,8 +151,8 @@ def _validate_open_times(series_name: str, t: pd.Series, tf: str) -> None:
     bad = d[d > interval * 1.5]
     if not bad.empty:
         i = bad.index[0]
-        logger.warning("gap in %s (%s → %s) — proceeding",
-                       series_name, t.iloc[i-1].isoformat(), t.iloc[i].isoformat())
+        raise SyncError(f"{series_name}: gap ({t.iloc[i-1].isoformat()} → {t.iloc[i].isoformat()}) — "
+                        f"data integrity, refusing to write")
 
 
 def _merge_csv(path: Path, new_df: pd.DataFrame) -> int:
