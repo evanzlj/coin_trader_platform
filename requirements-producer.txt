@@ -1,0 +1,10 @@
+# Producer deps on btc-ml (re-arch: monitor / data_sync / draw_kline / vlm_finalizer)
+# Executor deps: requirements-executor.txt ; Windows VLM worker deps: requirements.txt
+#
+# btc-ml runs the producer headless -> matplotlib must use the Agg backend
+# (set in code: matplotlib.use("Agg")).
+
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0        # buffer state parquet (warmup_replay / monitor)
+matplotlib>=3.7      # draw_kline signal chart rendering (headless / Agg)

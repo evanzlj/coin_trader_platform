@@ -1,4 +1,8 @@
-# Producer/Data 端到端验证清单（Windows 中国侧 ↔ btc-ml 新加坡侧）
+> ⚠️ **LEGACY / 已废弃方向** —— 本清单针对"Windows 跑 producer"的旧架构。
+> 项目已 pivot 到 **producer 迁回 btc-ml、Windows 只做 VLM worker**（见 `REARCH_PRODUCER_ON_BTCML.md`）。
+> 旧 Windows monitor/fetch_delta/signal_pusher 仅作 rollback 资产，**不要再按本清单执行**。保留供历史参考。
+
+# Producer/Data 端到端验证清单（Windows 中国侧 ↔ btc-ml 新加坡侧）[LEGACY]
 
 > 适用提交：`7f979df` 起（#22 P1 producer/data 链路硬化）。
 > 拓扑：**[Win]** monitor · openclaw · signal_pusher（中国）→ **[btc-ml]** executor · watchdog（新加坡）。

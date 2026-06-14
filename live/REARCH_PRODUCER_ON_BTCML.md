@@ -215,3 +215,41 @@ pending 包是跨境队列，必须有明确状态机，否则会出现重复 Ch
 - 出问题：停新 units、重启旧 Windows monitor + signal_pusher 即回到现状。
 - btc-ml 的 `data_sync`/`vlm_finalizer`/新 `vlm_pending` 目录与旧链路互不写同一文件，并存安全。
 - **生产 `signal_active` 任一时刻只有一个写者**（旧 Windows pusher 或新 finalizer，二选一）。回滚 = 停新 finalizer（或改 sandbox）→ 重启旧 pusher。切换/回滚都以"先停一方、确认不再写、再启另一方"为序，**不留两写并存窗口**。
+
+---
+
+## 10. 实施硬门禁（代码级，非文档级 — Phase 实现必须满足）
+
+Codex 复审：这些不变量必须落成**代码门禁**，不能靠人记。逐条是 Phase 实现的验收条件。
+
+**[G1] readiness gate 控制 monitor 的 replay 水位（Phase 1）**
+- 现状：monitor 先 `fetch_delta()`，再由 `ReplayFeed` 独立读 15m OHLCV / 4h / flow。`SignalGenerator._on_flow()` 是空实现（flow 不进信号逻辑），**但 flow 进 prompt + charts**（`prompt_generator/builder.py`、`draw_kline/renderer.py`）——所以 flow 缺失会产出**残缺的包**。
+- 要求：per-symbol `ready_horizon = min(latest_closed(ohlcv_15m), latest_closed(taker_flow_15m))`，monitor **只能 replay/推进到 `ready_horizon`**；4h 是 as-of T0 的 context（不要求同根），但**应已收线的 4h context 缺失时 fail-closed**（不产包 + 记 status）。
+
+**[G2] sandbox 代码强制（Phase 1/2）**
+- 所有新进程（`data_sync`/`monitor`/`vlm_finalizer`/`signal_sync`）路径全部 env 可注入（`VLM_PENDING`/`SIGNAL_ACTIVE`/`VLM_DONE_INCOMING`/`DATA_DIR` 等）。
+- 跑 sandbox phase 时设 `PRODUCER_SANDBOX=1`：若任一关键路径解析到**生产目录**，**启动即拒绝并非零退出**。不靠人记。
+
+**[G3] 旧链路上锁（不是正常路径）**
+- 旧 `signal_pusher` 加运行门槛 `ALLOW_LEGACY_PUSHER=1`，否则**默认拒跑 + 非零退出**，防误推生产 `signal_active`。
+- 旧 Windows monitor/fetch_delta 逻辑上冻结：不再投时间验证，只作 Phase 4 前的 rollback 资产。
+
+**[G4] bootstrap→audit→warmup 全链 fail-closed（Phase 1）**
+- 顺序固定：`data_sync --bootstrap` → 全量 audit（dup/reverse/gap=0）→ `warmup_replay` → monitor。
+- 任一环失败（缺 CSV / gap / dup / reverse / warmup state 缺失）→ **非零退出 + 写 status**，绝不带病继续。`ReplayFeed` 缺 CSV 当前只 warning+继续，bootstrap/warmup 路径要改成硬失败。
+
+**[G5] finalizer 是唯一 state 构建者，只信 btc-ml 原始包（Phase 2）**
+- 从 Windows 回传的 tar **只提取 `vlm_response.json`**，其余文件（含 `signal.json`/`state.json`）一律忽略/拒绝。
+- `signal_active` 包由 btc-ml 本地原始 `vlm_pending/{pkg}` 组装；VLM 只贡献 `playbooks`。
+
+**[G6] claim/lease 用原子语义（Phase 3）**
+- claim 不用"写文件再判断"。用远端 `mkdir {pkg}.claim`（POSIX 原子）或 `mv -T` no-clobber。默认单 worker，但防双开是系统稳定性，不靠假设。
+
+**[G7] watchdog/deploy 与新架构同步（Phase 4 前）**
+- `watchdog.py` 角色按 §6.1 改代码：btcml 增 monitor/vlm_finalizer/data_source health；china 改 signal_sync/vlm_worker。
+- systemd user units（btc-ml）+ Windows Task Scheduler 同步更新，否则 Windows 挂 / finalizer 挂 / DB 停更看不全。
+
+**[P2 顺手]**
+- `E2E_VALIDATION_CHECKLIST.md` 是 legacy 老链路 → 顶部标红/改名，防误执行。
+- btc-ml producer 依赖落地：新建 `requirements-producer.txt`（`matplotlib`/`pyarrow`/`pandas`），别只在 executor 那份。
+- 仓库内旧 `signal_pending/` 测试包 → Phase 1 sandbox 前清掉/隔离，别让旧 openclaw 误扫。
