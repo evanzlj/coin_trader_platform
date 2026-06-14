@@ -48,9 +48,9 @@
 - [x] **[Win]** 启动 `python3 live/monitor.py`
   - 通过：`buffer state loaded — incremental warmup from ...` 或冷启 `falling back to ... warmup`
   - 启动日志打印 `per-symbol cursors: {...}`（F5，四币种各自时间）
-- [ ] **[Win]** status JSON 内容齐全：`live/heartbeat/monitor_status.json` 含
+- [x] **[Win]** status JSON 内容齐全：`live/heartbeat/monitor_status.json` 含
   `per_symbol`（每币种 cursor/latest_bar/staleness_min）、`package_write_failures`、`consecutive_failures`、`backlog_count`
-- [ ] **[Win]** 心跳推进：`live/heartbeat/monitor_last_run.txt` 每 ~30s 更新
+- [x] **[Win]** 心跳推进：`live/heartbeat/monitor_last_run.txt` 每 ~30s 更新
 - [ ] **[Win]** F6 持久化：跑 >10min（`BUFFER_SAVE_SECONDS=600`）后 `live/state/buffer/` 的 parquet mtime 被刷新，且**无 `.tmp` 残留**
   - 然后重启 → 增量 warmup 区间是"分钟级"而非从原始 warmup 点回放数天
 - [ ] **[Win]** F6 容错：把某个 `buf_*.parquet` 写坏 → monitor **不崩**，日志 `buffer state load failed ... falling back to full warmup`
