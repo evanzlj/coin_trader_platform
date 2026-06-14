@@ -570,9 +570,14 @@ async def main() -> None:
             ) if SIGNAL_PENDING.exists() else 0
         except Exception:
             backlog = -1
-        _write_status(consecutive_failures, last_success_at, last_error, backlog,
-                      package_write_failures=package_write_failures,
-                      per_symbol=_build_per_symbol_status(cursors, latest))
+        # Status reporting must NEVER take down the main loop: a bad timestamp / disk
+        # error in _write_status or _build_per_symbol_status is non-fatal — log and go on.
+        try:
+            _write_status(consecutive_failures, last_success_at, last_error, backlog,
+                          package_write_failures=package_write_failures,
+                          per_symbol=_build_per_symbol_status(cursors, latest))
+        except Exception:
+            logger.exception("status write failed (non-fatal; loop continues)")
 
         await asyncio.sleep(POLL_INTERVAL)
 

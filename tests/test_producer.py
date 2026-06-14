@@ -714,6 +714,123 @@ class TestMonitorGenericExceptionStatus(unittest.TestCase):
         self.assertTrue(monitor.HEARTBEAT_FILE.exists(), "heartbeat must still update")
 
 
+# ── Fix A. status-write failure must NOT kill the monitor loop ────────────────
+
+class TestMonitorStatusWriteNonFatal(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._saved = {k: getattr(monitor, k) for k in
+                       ("SignalGenerator", "ReplayFeed", "load_dedup_state",
+                        "get_latest_bar_times", "run_cycle", "_write_status",
+                        "STATUS_FILE", "HEARTBEAT_FILE", "SIGNAL_PENDING")}
+        self._saved_sleep = asyncio.sleep
+
+        T = pd.Timestamp("2026-01-01 00:00:00", tz="UTC")
+        monitor.SignalGenerator = _StubGen
+        monitor.ReplayFeed = _NoopFeed
+        monitor.load_dedup_state = lambda: ({}, None)
+        monitor.get_latest_bar_times = lambda: {s: T for s in monitor.SYMBOLS}
+
+        async def _ok_cycle(gen, cursors):
+            return [], cursors, {s: T for s in monitor.SYMBOLS}
+        monitor.run_cycle = _ok_cycle
+
+        def _boom_status(*a, **k):
+            raise RuntimeError("status write boom")
+        monitor._write_status = _boom_status
+
+        monitor.STATUS_FILE = self.tmp / "monitor_status.json"
+        monitor.HEARTBEAT_FILE = self.tmp / "hb.txt"
+        monitor.SIGNAL_PENDING = self.tmp / "signal_pending"
+
+        async def _stop(*a, **k):
+            raise _StopLoop()
+        asyncio.sleep = _stop
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(monitor, k, v)
+        asyncio.sleep = self._saved_sleep
+
+    def test_status_write_exception_is_swallowed(self):
+        import live.single_instance as si
+        orig_lock = si.SingleInstance
+        si.SingleInstance = lambda *a, **k: type(
+            "L", (), {"acquire": lambda s: None, "release": lambda s: None})()
+        try:
+            # Reaching asyncio.sleep (_StopLoop) proves the loop survived the status
+            # error. Before the fix this raised RuntimeError("status write boom").
+            with self.assertRaises(_StopLoop):
+                asyncio.run(monitor.main())
+        finally:
+            si.SingleInstance = orig_lock
+        # heartbeat still written → we got through the cycle body, not crashed earlier.
+        self.assertTrue(monitor.HEARTBEAT_FILE.exists())
+
+
+# ── Fix B. fetch_delta ssh calls are timeout-bounded ──────────────────────────
+
+class TestFetchDeltaSSHTimeout(unittest.TestCase):
+    def test_ssh_python_passes_timeout_and_hardening_opts(self):
+        captured = {}
+
+        class _Done:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["kw"] = kw
+            return _Done()
+
+        orig = fd.subprocess.run
+        fd.subprocess.run = fake_run
+        try:
+            fd._ssh_python("print(1)")
+        finally:
+            fd.subprocess.run = orig
+
+        self.assertEqual(captured["kw"].get("timeout"), fd.SSH_TIMEOUT)
+        self.assertIn("BatchMode=yes", captured["cmd"])
+        self.assertIn("ConnectTimeout=15", captured["cmd"])
+
+    def test_ssh_timeout_becomes_runtimeerror(self):
+        import subprocess as sp
+
+        def fake_run(cmd, **kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+
+        orig = fd.subprocess.run
+        fd.subprocess.run = fake_run
+        try:
+            # RuntimeError → caught by fetch_delta's retry loop → FetchError after retries.
+            with self.assertRaises(RuntimeError):
+                fd._ssh_python("print(1)")
+        finally:
+            fd.subprocess.run = orig
+
+    def test_ssh_run_tar_path_also_timeout_bounded(self):
+        captured = {}
+
+        class _Done:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        def fake_run(cmd, **kw):
+            captured["kw"] = kw
+            return _Done()
+
+        orig = fd.subprocess.run
+        fd.subprocess.run = fake_run
+        try:
+            fd._ssh_run(["ssh", *fd.SSH_OPTS, fd.REMOTE_HOST, "tar -czf - ."], text=False)
+        finally:
+            fd.subprocess.run = orig
+        self.assertEqual(captured["kw"].get("timeout"), fd.SSH_TIMEOUT)
+
+
 # ── F7. pusher partial failure (p>0 AND f>0) → exit 1 + status ────────────────
 
 class TestPusherPartialFailure(unittest.TestCase):

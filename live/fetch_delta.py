@@ -64,6 +64,17 @@ INTERVAL_MINUTES = {"15m": 15, "4h": 240, "1h": 60}
 
 RETRY_DELAYS = [15, 30, 60]  # seconds between retries
 
+# SSH hardening (#22): bound every ssh call so a stalled btc-ml link can never hang a
+# whole monitor cycle. ConnectTimeout fast-fails an unreachable host; ServerAlive* drops
+# a mid-command stall; SSH_TIMEOUT is the outer subprocess backstop.
+SSH_TIMEOUT = 90   # seconds — generous headroom over a normal ~30s delta export+transfer
+SSH_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=10",
+    "-o", "ServerAliveCountMax=3",
+]
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -91,7 +102,11 @@ def _parse_remote_literal(stdout: str):
 
 def _ssh_run(cmd: list[str], check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
     kwargs = {"capture_output": True, "encoding": "utf-8", "errors": "replace"} if text else {"capture_output": True}
-    result = subprocess.run(cmd, **kwargs)
+    try:
+        result = subprocess.run(cmd, timeout=SSH_TIMEOUT, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        # Surfaces as RuntimeError → fetch_delta retry loop catches it → FetchError after retries.
+        raise RuntimeError(f"ssh timed out after {SSH_TIMEOUT}s") from e
     if check and result.returncode != 0:
         err = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else (result.stderr or "unknown error")
         raise RuntimeError(err.strip())
@@ -100,10 +115,14 @@ def _ssh_run(cmd: list[str], check: bool = True, text: bool = True) -> subproces
 
 def _ssh_python(script: str) -> subprocess.CompletedProcess:
     remote_cmd = f"python3 << 'PYEOF'\n{script}\nPYEOF"
-    result = subprocess.run(
-        ["ssh", REMOTE_HOST, remote_cmd],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, REMOTE_HOST, remote_cmd],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=SSH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ssh python timed out after {SSH_TIMEOUT}s") from e
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "unknown error").strip())
     return result
@@ -264,7 +283,8 @@ def transfer_and_append(dataset: str) -> dict[Path, int]:
     import tarfile
 
     remote_dir = f"{REMOTE_TMP}/{dataset}"
-    result = _ssh_run(["ssh", REMOTE_HOST, f"tar -czf - -C {remote_dir} . 2>/dev/null || true"], text=False)
+    result = _ssh_run(["ssh", *SSH_OPTS, REMOTE_HOST,
+                       f"tar -czf - -C {remote_dir} . 2>/dev/null || true"], text=False)
 
     appended: dict[Path, int] = {}
 
