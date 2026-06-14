@@ -324,10 +324,12 @@ def check_gap(csv_path: Path, tf: str, n_rows: int = 0) -> Optional[tuple[str, s
     the first fetch after an outage) is not missed by a fixed tail(10).
 
     Returns (kind, a, b) where kind is one of:
-      - "gap"        : a→b spans more than 1.5× the bar interval (fillable)
-      - "duplicate"  : a==b open_time appears twice (data integrity — not fillable)
-      - "reverse"    : open_time goes backwards a→b (data integrity — not fillable)
-    Returns None if the tail is clean. Never silently passes a corrupt tail.
+      - "gap"          : a→b spans more than 1.5× the bar interval (fillable)
+      - "duplicate"    : a==b open_time appears twice (data integrity — not fillable)
+      - "reverse"      : open_time goes backwards a→b (data integrity — not fillable)
+      - "check_failed" : the check itself errored (locked / corrupt / unparseable CSV)
+    Returns None only when the tail is verified clean. A check that cannot run is
+    FAIL-CLOSED ("check_failed"), never silently treated as clean.
     """
     interval = pd.Timedelta(minutes=INTERVAL_MINUTES.get(tf, 15))
     try:
@@ -358,8 +360,10 @@ def check_gap(csv_path: Path, tf: str, n_rows: int = 0) -> Optional[tuple[str, s
 
         return None
     except Exception as e:
+        # Fail-closed: a check that can't run must NOT pass as clean — surface it so
+        # fetch_delta raises GapError instead of feeding monitor a possibly-corrupt CSV.
         logger.warning("continuity check failed for %s: %s", csv_path.name, e)
-        return None
+        return "check_failed", str(e)[:160], ""
 
 
 def fill_gap_remote(dataset: str, symbol: str, tf: str,
@@ -435,6 +439,19 @@ def fetch_delta(datasets: Optional[list[str]] = None) -> None:
     for dataset in datasets:
         tfs = OHLCV_TFS if dataset == "ohlcv" else FLOW_TFS
 
+        # Fail-closed (P1): every expected base CSV must already exist. fetch_delta only
+        # *appends* deltas — it can't bootstrap a missing series — so a missing file means
+        # an incomplete dataset that monitor would silently run on. Refuse instead.
+        missing = [
+            f"{dataset}/{_slug(sym)}_{tf}.csv"
+            for sym in SYMBOLS for tf in tfs
+            if not (LOCAL_DATA / dataset / f"{_slug(sym)}_{tf}.csv").exists()
+        ]
+        if missing:
+            raise FetchError(
+                f"missing base CSV(s) — run fetch_history.py first: {', '.join(missing)}"
+            )
+
         # Retry loop. since_map is recomputed *inside* each attempt from the current CSV
         # tails (F1): if a previous attempt partially appended before failing, the next
         # attempt's `since` already reflects the new tail, so it never re-fetches rows
@@ -471,7 +488,13 @@ def fetch_delta(datasets: Optional[list[str]] = None) -> None:
 
             kind, a, b = issue
 
-            # Duplicate / reverse = data-integrity corruption — filling won't help.
+            # Duplicate / reverse / check_failed = corruption or an un-runnable check —
+            # filling won't help, and we must not pass it as clean.
+            if kind == "check_failed":
+                raise GapError(
+                    f"continuity check could not run on {csv_path.name} ({a}) — "
+                    "refusing to proceed on a possibly-corrupt CSV"
+                )
             if kind in ("duplicate", "reverse"):
                 raise GapError(
                     f"{kind} open_time in {csv_path.name} ({a} → {b}) — "

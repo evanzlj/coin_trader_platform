@@ -668,9 +668,16 @@ def extract_symbol(dir_name: str) -> str:
 
 
 def update_heartbeat() -> None:
-    """Write current timestamp to heartbeat file for watchdog."""
-    HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat(), encoding="utf-8")
+    """Write current timestamp to heartbeat file for watchdog.
+
+    Self-defensive: a heartbeat write failure (disk full / file lock) must NEVER
+    take down the ChatGPT-processing loop — log and move on.
+    """
+    try:
+        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat(), encoding="utf-8")
+    except Exception as e:
+        logger.warning("heartbeat write failed (non-fatal): %s", e)
 
 
 def write_openclaw_status(stats: dict) -> None:
@@ -681,13 +688,19 @@ def write_openclaw_status(stats: dict) -> None:
     --role china alerts when consecutive_rejections / move_failures / parse_errs
     breach thresholds — a producer that parses/moves nothing is functionally
     dead even though its heartbeat is fresh.
+
+    Self-defensive: a status write failure is non-fatal (same rule as monitor) —
+    it must not crash the long-running loop.
     """
-    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(stats)
-    payload["updated_at"] = pd.Timestamp.now("UTC").isoformat()
-    tmp = STATUS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, STATUS_FILE)
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(stats)
+        payload["updated_at"] = pd.Timestamp.now("UTC").isoformat()
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, STATUS_FILE)
+    except Exception as e:
+        logger.warning("openclaw status write failed (non-fatal): %s", e)
 
 
 def resolve_cdp_url(http_url: str) -> str:

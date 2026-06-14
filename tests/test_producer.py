@@ -907,5 +907,85 @@ class TestOpenclawActiveDuplicate(unittest.TestCase):
                          "already_in_signal_active")
 
 
+# ── Codex P1/P2: fail-closed fetch + defensive openclaw + watchdog staleness ──
+
+class TestFetchDeltaFailClosed(unittest.TestCase):
+    def test_check_gap_corrupt_csv_is_fail_closed(self):
+        # P1-3: an unparseable CSV must return "check_failed", never None (clean).
+        p = Path(tempfile.mkdtemp()) / "btcusdt_15m.csv"
+        p.write_text("open_time\nnot-a-date\nalso-not-a-date\n", encoding="utf-8")
+        issue = fd.check_gap(p, "15m", n_rows=2)
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue[0], "check_failed")
+
+    def test_fetch_delta_missing_base_csv_raises(self):
+        # P1-2: a missing expected base CSV must FetchError before any SSH, not skip.
+        orig = fd.LOCAL_DATA
+        fd.LOCAL_DATA = Path(tempfile.mkdtemp())   # empty → every expected file missing
+        try:
+            with self.assertRaises(fd.FetchError):
+                fd.fetch_delta(["ohlcv"])
+        finally:
+            fd.LOCAL_DATA = orig
+
+
+class TestOpenclawWritersDefensive(unittest.TestCase):
+    def test_status_write_failure_swallowed(self):
+        # P1-4: os.replace blowing up must not propagate out of write_openclaw_status.
+        orig_replace = oc.os.replace
+        orig_status = oc.STATUS_FILE
+        oc.STATUS_FILE = Path(tempfile.mkdtemp()) / "openclaw_status.json"
+
+        def _boom(*a, **k):
+            raise OSError("simulated replace failure")
+        oc.os.replace = _boom
+        try:
+            oc.write_openclaw_status({"processed": 1})   # must NOT raise
+        finally:
+            oc.os.replace = orig_replace
+            oc.STATUS_FILE = orig_status
+
+    def test_heartbeat_write_failure_swallowed(self):
+        d = Path(tempfile.mkdtemp()) / "hb_is_a_dir"
+        d.mkdir()
+        orig = oc.HEARTBEAT_FILE
+        oc.HEARTBEAT_FILE = d   # write_text onto a directory path raises → must be swallowed
+        try:
+            oc.update_heartbeat()   # must NOT raise
+        finally:
+            oc.HEARTBEAT_FILE = orig
+
+
+class TestWatchdogStatusStaleness(unittest.TestCase):
+    def _spec(self, f):
+        return watchdog.StatusSpec("monitor", f,
+                                   (("consecutive_failures", 3), ("backlog_count", 10)),
+                                   max_stale_min=5.0)
+
+    def test_stale_status_alerts(self):
+        # P2-2: a healthy-but-old status (writer stalled) must alert.
+        f = Path(tempfile.mkdtemp()) / "monitor_status.json"
+        old = (pd.Timestamp.now("UTC") - pd.Timedelta(minutes=30)).isoformat()
+        f.write_text(json.dumps({"consecutive_failures": 0, "backlog_count": 0,
+                                 "updated_at": old}), encoding="utf-8")
+        alert = watchdog.check_status(self._spec(f))
+        self.assertIsNotNone(alert)
+        self.assertIn("stale", alert)
+
+    def test_fresh_status_no_stale_alert(self):
+        f = Path(tempfile.mkdtemp()) / "monitor_status.json"
+        fresh = pd.Timestamp.now("UTC").isoformat()
+        f.write_text(json.dumps({"consecutive_failures": 0, "backlog_count": 0,
+                                 "updated_at": fresh}), encoding="utf-8")
+        self.assertIsNone(watchdog.check_status(self._spec(f)))
+
+    def test_missing_updated_at_alerts(self):
+        f = Path(tempfile.mkdtemp()) / "monitor_status.json"
+        f.write_text(json.dumps({"consecutive_failures": 0, "backlog_count": 0}),
+                     encoding="utf-8")
+        alert = watchdog.check_status(self._spec(f))
+        self.assertIsNotNone(alert)
+
+
 if __name__ == "__main__":
     unittest.main()

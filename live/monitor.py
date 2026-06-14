@@ -287,12 +287,15 @@ def write_signal_pending(sig: SignalEvent) -> "Path | None":
         logger.warning("chart rendering failed for %s: %s", pkg_name, e)
 
     if not prompt_ok or not charts_ok:
-        # Package is incomplete — move to signal_rejected/ rather than touching .ready
+        # Package is incomplete — move to signal_rejected/ rather than touching .ready.
+        # On name conflict, append a microsecond suffix so the source ALWAYS leaves
+        # signal_pending/ (no half-package residue), mirroring openclaw's _archive_package.
         SIGNAL_REJECTED.mkdir(parents=True, exist_ok=True)
         dest = SIGNAL_REJECTED / pkg_name
+        if dest.exists():
+            dest = SIGNAL_REJECTED / f"{pkg_name}__dup_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S_%f')}"
         try:
-            if not dest.exists():
-                pkg_dir.rename(dest)
+            pkg_dir.rename(dest)
         except Exception as mv_err:
             logger.warning("could not move rejected package %s: %s", pkg_name, mv_err)
         logger.warning("signal rejected (prompt_ok=%s charts_ok=%s): %s",

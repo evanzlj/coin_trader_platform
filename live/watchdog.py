@@ -56,6 +56,7 @@ class StatusSpec:
     name: str
     status_file: Path
     thresholds: tuple[tuple[str, int], ...]
+    max_stale_min: float | None = None   # alert if updated_at older than this (status writer stalled)
 
 
 def _hb(name: str) -> Path:
@@ -82,12 +83,12 @@ STATUS_SPECS: dict[str, list[StatusSpec]] = {
     "china": [
         StatusSpec("monitor", HEARTBEAT_DIR / "monitor_status.json",
                    (("consecutive_failures", 3), ("backlog_count", 10),
-                    ("package_write_failures", 3))),
+                    ("package_write_failures", 3)), max_stale_min=5.0),
         StatusSpec("signal_pusher", HEARTBEAT_DIR / "pusher_status.json",
-                   (("consecutive_failures", 3), ("backlog_count", 5))),
+                   (("consecutive_failures", 3), ("backlog_count", 5)), max_stale_min=5.0),
         StatusSpec("openclaw", HEARTBEAT_DIR / "openclaw_status.json",
                    (("consecutive_rejections", 5), ("move_failures", 3),
-                    ("parse_errs", 5))),
+                    ("parse_errs", 5)), max_stale_min=25.0),
     ],
 }
 
@@ -106,6 +107,22 @@ def check_status(spec: StatusSpec) -> str | None:
         return f"{spec.name}: status file unreadable ({e})"
     last_err = str(data.get("last_error") or "")
     alerts = []
+
+    # Stale status = the writer stopped updating (e.g. status write failing while the
+    # heartbeat still ticks). Without this, the watchdog would keep trusting an old
+    # "healthy" snapshot. updated_at missing/unparseable also counts as stale.
+    if spec.max_stale_min is not None:
+        updated = data.get("updated_at")
+        # to_datetime(..., errors="coerce") → NaT for None / bad strings (pd.Timestamp(None)
+        # silently returns NaT and would slip past, hence the explicit isna check).
+        ts = pd.to_datetime(updated, utc=True, errors="coerce")
+        if pd.isna(ts):
+            alerts.append(f"status updated_at missing/unparseable ({updated!r})")
+        else:
+            age_min = (pd.Timestamp.now("UTC") - ts).total_seconds() / 60
+            if age_min > spec.max_stale_min:
+                alerts.append(f"status stale {age_min:.1f}min (threshold {spec.max_stale_min})")
+
     for field, threshold in spec.thresholds:
         try:
             val = int(data.get(field, 0) or 0)
@@ -137,8 +154,9 @@ def send_alert(message: str) -> None:
     """log + alerts.log + 飞书 + （Windows）系统通知。"""
     logger.error("ALERT: %s", message)
     ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(ALERT_LOG, "a") as f:
-        f.write(f"{pd.Timestamp.now("UTC").isoformat()} ALERT: {message}\n")
+    ts = pd.Timestamp.now("UTC").isoformat()   # hoisted: nested " in an f-string is a SyntaxError on Python 3.11
+    with open(ALERT_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{ts} ALERT: {message}\n")
     try:
         from live import notify
         notify.feishu_alert(f"[watchdog] {message}")
