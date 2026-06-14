@@ -142,7 +142,7 @@ def save_dedup_state(gen: SignalGenerator,
     """
     state = gen.get_dedup_state()
     DEDUP_STATE.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict = {"saved_at": pd.Timestamp.utcnow().isoformat(), "dedup": state}
+    payload: dict = {"saved_at": pd.Timestamp.now("UTC").isoformat(), "dedup": state}
     per_symbol = _cursor_iso(cursors)
     if per_symbol:
         payload["per_symbol"] = per_symbol
@@ -160,7 +160,7 @@ def save_dedup_state(gen: SignalGenerator,
 
 def update_heartbeat() -> None:
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT_FILE.write_text(pd.Timestamp.utcnow().isoformat(), encoding="utf-8")
+    HEARTBEAT_FILE.write_text(pd.Timestamp.now("UTC").isoformat(), encoding="utf-8")
 
 
 def _write_status(consecutive_failures: int, last_success_at: "str | None",
@@ -176,7 +176,7 @@ def _write_status(consecutive_failures: int, last_success_at: "str | None",
         "backlog_count":          backlog_count,
         "package_write_failures": package_write_failures,
         "per_symbol":             per_symbol or {},
-        "updated_at":             pd.Timestamp.utcnow().isoformat(),
+        "updated_at":             pd.Timestamp.now("UTC").isoformat(),
     }, indent=2), encoding="utf-8")
     os.replace(tmp, STATUS_FILE)
 
@@ -185,7 +185,7 @@ def _build_per_symbol_status(cursors: "dict[str, pd.Timestamp | None]",
                              latest: "dict[str, pd.Timestamp | None]") -> dict:
     """Per-symbol {cursor, latest_bar, staleness_min} so a single-symbol data outage
     is visible to ops / watchdog even when the others keep flowing (F5)."""
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.now("UTC")
     out: dict = {}
     for sym in SYMBOLS:
         lt = latest.get(sym)
@@ -468,7 +468,7 @@ async def main() -> None:
 
     else:
         # ── Fallback: 56-week internal warmup (pre-warmup_replay baseline) ──
-        warmup_start = (pd.Timestamp.utcnow() - pd.Timedelta(weeks=56)).strftime("%Y-%m-%d")
+        warmup_start = (pd.Timestamp.now("UTC") - pd.Timedelta(weeks=56)).strftime("%Y-%m-%d")
         logger.warning(
             "no persisted buffer state found — falling back to 56-week warmup from %s",
             warmup_start,
@@ -499,7 +499,7 @@ async def main() -> None:
     last_success_at: "str | None" = None
     last_error: "str | None" = None
     package_write_failures = 0   # cumulative: signals that detected but failed to write a complete package
-    last_buffer_save = pd.Timestamp.utcnow()
+    last_buffer_save = pd.Timestamp.now("UTC")
 
     while True:
         try:
@@ -509,9 +509,9 @@ async def main() -> None:
 
             if new_cursors != cursors:
                 cursors = new_cursors
-                last_success_at = pd.Timestamp.utcnow().isoformat()
+                last_success_at = pd.Timestamp.now("UTC").isoformat()
 
-                now = pd.Timestamp.utcnow()
+                now = pd.Timestamp.now("UTC")
                 for sig in signals:
                     # Grade filter: A+ not yet live — remove when A+ execution is ready
                     if sig.grade == "A+":
@@ -538,10 +538,10 @@ async def main() -> None:
 
                 # F6: periodically persist buffer state so a restart replays only minutes
                 # of bars, not days. Throttled to BUFFER_SAVE_SECONDS to bound parquet I/O.
-                if (pd.Timestamp.utcnow() - last_buffer_save).total_seconds() >= BUFFER_SAVE_SECONDS:
+                if (pd.Timestamp.now("UTC") - last_buffer_save).total_seconds() >= BUFFER_SAVE_SECONDS:
                     try:
                         gen.save_buffer_state(BUFFER_STATE_DIR)
-                        last_buffer_save = pd.Timestamp.utcnow()
+                        last_buffer_save = pd.Timestamp.now("UTC")
                     except Exception as save_err:
                         logger.warning("buffer state save failed: %s", save_err)
 

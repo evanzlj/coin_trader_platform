@@ -212,7 +212,7 @@ class SignalGenerator:
                 lambda p: p.write_text(json.dumps(sm_counts), encoding="utf-8"))
 
         _atomic(state_dir / "saved_at.txt",
-                lambda p: p.write_text(pd.Timestamp.utcnow().isoformat(), encoding="utf-8"))
+                lambda p: p.write_text(pd.Timestamp.now("UTC").isoformat(), encoding="utf-8"))
         logger.info("buffer state saved → %s (%d symbol×tf buffers)", state_dir,
                     sum(1 for buf in self._bufs.values() if buf._bars))
 

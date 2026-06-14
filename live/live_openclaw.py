@@ -418,7 +418,7 @@ def _archive_package(pkg_dir: Path, dest_dir: Path, reason: str) -> bool:
         pass
     dest = dest_dir / pkg_dir.name
     if dest.exists():
-        suffix = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        suffix = pd.Timestamp.now("UTC").strftime("%Y%m%d_%H%M%S_%f")
         dest = dest_dir / f"{pkg_dir.name}__dup_{suffix}"
     try:
         pkg_dir.rename(dest)
@@ -568,7 +568,7 @@ def _build_state(signal: dict, valid_playbooks: list[dict], pkg_name: str) -> di
         "grade":          signal.get("grade"),
         "bar_time":       signal.get("bar_time"),
         "structure_side": signal.get("structure_side"),
-        "created_at":     pd.Timestamp.utcnow().isoformat(),
+        "created_at":     pd.Timestamp.now("UTC").isoformat(),
         "overall_status": "WATCHING",
         "playbooks":      pb_states,
     }

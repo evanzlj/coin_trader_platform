@@ -75,7 +75,7 @@ async def run(start: str, end: str) -> None:
 
     logger.info("warmup complete — %d signals detected during replay", signal_count)
 
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.now("UTC")
 
     # Save buffer state (BarBuffers + state machine bar counts)
     gen.save_buffer_state(BUFFER_STATE_DIR)
@@ -101,7 +101,7 @@ async def run(start: str, end: str) -> None:
 
 def main() -> None:
     args = parse_args()
-    end  = args.end or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    end  = args.end or pd.Timestamp.now("UTC").strftime("%Y-%m-%d")
     asyncio.run(run(args.start, end))
 
 

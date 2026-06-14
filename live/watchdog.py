@@ -127,7 +127,7 @@ def check_heartbeat(spec: ProcSpec) -> str | None:
         last = pd.Timestamp(spec.heartbeat.read_text().strip(), tz="UTC")
     except Exception as e:
         return f"{spec.name}: cannot parse heartbeat ({e})"
-    age = (pd.Timestamp.utcnow() - last).total_seconds() / 60
+    age = (pd.Timestamp.now("UTC") - last).total_seconds() / 60
     if age > spec.stale_min:
         return f"{spec.name}: last heartbeat {age:.1f} min ago (threshold {spec.stale_min} min) — 卡死/死亡"
     return None
@@ -138,7 +138,7 @@ def send_alert(message: str) -> None:
     logger.error("ALERT: %s", message)
     ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(ALERT_LOG, "a") as f:
-        f.write(f"{pd.Timestamp.utcnow().isoformat()} ALERT: {message}\n")
+        f.write(f"{pd.Timestamp.now("UTC").isoformat()} ALERT: {message}\n")
     try:
         from live import notify
         notify.feishu_alert(f"[watchdog] {message}")
