@@ -96,6 +96,9 @@ class TestPullIdempotency(_Base):
                 for f in src.iterdir():
                     if f.is_file():
                         shutil.copy2(f, dest)
+                # Fake PNGs so _local_pull_complete() passes
+                (dest / f"{name.split('_')[0]}_4h.png").write_bytes(b"fake")
+                (dest / f"{name.split('_')[0]}_15m.png").write_bytes(b"fake")
                 return dest
             return None
         ss._tar_pull = _fake_tar
@@ -207,13 +210,23 @@ class TestExitCode(_Base):
         ss._write_status(p, f, 0)
         self.assertEqual(f, 0)
 
-    def test_once_exits_nonzero_on_partial_failure(self):
-        # Main loop sets round_failed=True when SSH/remote_list fails → exit 1
-        p, f = ss.pull_round()
-        # f=0 because _remote_package_exists returns True for all (skip)
-        # But round_failed is set in main() when overall round fails
-        # This is tested indirectly via the status-writing logic
-        self.assertIsNotNone(getattr(ss, "_remote_list_new", None))  # mocked
+    def test_ssh_failure_propagates_as_runtime_error(self):
+        """Verify _remote_list_new raises RuntimeError when SSH fails (→ main exits 1)."""
+        # Remove setUp's mocks so we test the real code path
+        ss._remote_list_new = self._orig_list
+        orig_ssh = self._orig_ssh if hasattr(self, '_orig_ssh') else ss._ssh
+        called = [0]
+
+        def boom(*a, **kw):
+            called[0] += 1
+            raise RuntimeError("ssh failed")
+        ss._ssh = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                ss._remote_list_new()
+            self.assertGreater(called[0], 0, "SSH must have been called")
+        finally:
+            ss._ssh = orig_ssh
 
 
 class TestStatusWritten(_Base):

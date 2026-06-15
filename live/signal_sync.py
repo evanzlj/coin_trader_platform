@@ -96,29 +96,34 @@ def _ssh(cmd: list[str], timeout: int = SSH_TIMEOUT, text: bool = True,
     return r
 
 
-# How long a .claimed package stays claimed before it can be re-taken (seconds).
-# If Windows claims a package then crashes, the lease expires and the package
-# becomes available to the next cycle (or another worker).
-CLAIM_LEASE = 1800   # 30 minutes (>> ChatGPT TIMEOUT 360s + retry buffer + network)
-
-# Lease marker written into .claimed file: "CLAIMED_AT:<unix_timestamp>"
-_CLAIM_TS_PREFIX = "CLAIMED_AT:"
+# Lease (seconds). If Windows claims a package then crashes, lease expires and the
+# package becomes available for re-claim (P1-1). >> chatbot TIMEOUT 360s.
+_CLAIM_LEASE = 1800   # 30 min
 
 
 def _remote_list_new() -> list[str]:
-    """List remote vlm_pending packages that can be claimed (no .claimed or expired lease).
-    Claims each returned package atomically. Returns sorted list of pkg names."""
+    """List remote vlm_pending packages claimable, claim atomically.
+
+    Atomic claim via `mkdir .claimed` (no-clobber — if the dir exists, mkdir
+    fails and the package is skipped or falls to lease check). Single-Windows
+    worker is the default but the door is atomic (G6)."""
     script = (
         f"cd {_VLM_PENDING} 2>/dev/null || exit 0; "
-        f"NOW=$(date +%s); LEASE={CLAIM_LEASE}; "
+        f"NOW=$(date +%s); LEASE={_CLAIM_LEASE}; "
         f"for d in */; do "
         f"  pkg=${{d%/}}; "
         f"  if [ ! -f \"$pkg/.ready\" ]; then continue; fi; "
-        f"  if [ -f \"$pkg/.claimed\" ]; then "
-        f"    TS=$(cat \"$pkg/.claimed\" 2>/dev/null | sed -n 's/^{_CLAIM_TS_PREFIX}//p'); "
-        f"    if [ -z \"$TS\" ] || [ \"$(( NOW - TS ))\" -lt \"$LEASE\" ]; then continue; fi; "
+        f"  # Atomically claim via mkdir (fails fast if .claimed dir exists)\n"
+        f"  if [ -d \"$pkg/.claimed\" ]; then "
+        f"    # Lease expired?  Re-use the dir as a mutex — rmdir + mkdir (best-effort)\n"
+        f"    if [ -f \"$pkg/.claimed/lease_ts\" ]; then "
+        f"      TS=$(cat \"$pkg/.claimed/lease_ts\" 2>/dev/null); "
+        f"      if [ -n \"$TS\" ] && [ \"$(( NOW - TS ))\" -lt \"$LEASE\" ]; then continue; fi; "
+        f"    else continue; fi; "
+        f"    rmdir \"$pkg/.claimed\" 2>/dev/null || continue; "
         f"  fi; "
-        f"  echo \"{_CLAIM_TS_PREFIX}$NOW\" > \"$pkg/.claimed\" && "
+        f"  mkdir \"$pkg/.claimed\" 2>/dev/null || continue; "
+        f"  echo \"$NOW\" > \"$pkg/.claimed/lease_ts\" && "
         f"  echo \"$pkg\"; "
         f"done"
     )
@@ -185,6 +190,38 @@ def _tar_pull(name: str) -> Optional[Path]:
         return None
 
 
+_REQUIRED_PULL_FILES = {".ready", "signal.json", "prompt.txt"}
+_PNG_PATTERNS = ("*_4h.png", "*_15m.png")
+
+
+def _local_pull_complete(name: str) -> bool:
+    """Verify local package has ALL required files (P1: marker !== truth).
+    Even if .synced_pulled/{name} exists, a corrupt/missing local package
+    must NOT block re-pull. Required: .ready + signal.json + prompt.txt + both PNGs."""
+    pkg = LOCAL_VLM_PENDING / name
+    if not pkg.exists():
+        return False
+    for req in _REQUIRED_PULL_FILES:
+        if not (pkg / req).exists():
+            return False
+    for pat in _PNG_PATTERNS:
+        if not list(pkg.glob(pat)):
+            return False
+    return True
+
+
+def _maybe_clear_pulled(name: str) -> None:
+    """If .synced_pulled says pulled but local is incomplete, clear both so
+    the package can be re-pulled (P1: self-healing after crash/partial failure)."""
+    if not (SYNCED_PULL_DIR / name).exists():
+        return
+    if not _local_pull_complete(name):
+        logger.warning("local %s incomplete despite pulled marker — clearing for re-pull", name)
+        import shutil
+        shutil.rmtree(LOCAL_VLM_PENDING / name, ignore_errors=True)
+        (SYNCED_PULL_DIR / name).unlink(missing_ok=True)
+
+
 def _mark_pulled(name: str) -> None:
     SYNCED_PULL_DIR.mkdir(parents=True, exist_ok=True)
     (SYNCED_PULL_DIR / name).touch()
@@ -197,6 +234,11 @@ def _already_pulled(name: str) -> bool:
 def pull_round() -> tuple[int, int]:
     """Pull new packages from remote. Returns (pulled, failed)."""
     pulled = failed = 0
+
+    # Before pulling new, heal any incomplete local packages (P1)
+    for existing in (SYNCED_PULL_DIR.iterdir() if SYNCED_PULL_DIR.exists() else []):
+        _maybe_clear_pulled(existing.name)
+
     for name in _remote_list_new():
         if _already_pulled(name):
             continue
