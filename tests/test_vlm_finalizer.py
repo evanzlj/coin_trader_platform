@@ -165,6 +165,23 @@ class TestSuccessPath(_Base):
         self.assertFalse((dest / "evil.txt").exists(), "extra files must not enter signal_active")
         self.assertFalse((dest / "fake_signal.json").exists())
 
+    def test_clean_staging_before_build(self):
+        """P3: stale staging residue (evil.txt) must not leak into signal_active."""
+        _create_pending(self.tmp)
+        _create_incoming(self.tmp)
+        # Pre-seed staging with unwanted file
+        stale = vf._STAGING_DIR / "btcusdt_a_20260601_0000" / "evil.txt"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("stale", encoding="utf-8")
+        self.assertTrue(stale.exists(), "precondition: stale file exists in staging")
+
+        result = vf.process_one("btcusdt_a_20260601_0000")
+        self.assertEqual(result, "moved")
+        dest = vf.SIGNAL_ACTIVE / "btcusdt_a_20260601_0000"
+        self.assertFalse((dest / "evil.txt").exists(),
+                         "stale evil.txt must NOT be in signal_active")
+        self.assertTrue((dest / ".ready").exists())
+
     def test_executor_load_states_compatible(self):
         """F: executor.Engine.load_states 能读到该包。"""
         _create_pending(self.tmp)
@@ -297,7 +314,8 @@ class TestSandbox(_Base):
 
     def test_covered_paths(self):
         """E: sandbox guards all write paths. Test each one individually."""
-        for name in ("SIGNAL_ACTIVE", "VLM_DONE_INCOMING", "VLM_REJECTED", "VLM_PENDING_DONE"):
+        for name in ("SIGNAL_ACTIVE", "VLM_DONE_INCOMING", "VLM_REJECTED",
+                     "VLM_PENDING", "VLM_PENDING_DONE"):
             tmp = Path(tempfile.mkdtemp())
             setattr(vf, name, tmp / name.lower())
             vf.ROOT = tmp

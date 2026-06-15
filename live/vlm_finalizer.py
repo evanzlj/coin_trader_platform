@@ -85,6 +85,7 @@ def _check_sandbox() -> None:
         ("SIGNAL_ACTIVE", SIGNAL_ACTIVE, ROOT / "signal_active"),
         ("VLM_DONE_INCOMING", VLM_DONE_INCOMING, ROOT / "vlm_done_incoming"),
         ("VLM_REJECTED", VLM_REJECTED, ROOT / "vlm_rejected"),
+        ("VLM_PENDING", VLM_PENDING, ROOT / "vlm_pending"),
         ("VLM_PENDING_DONE", VLM_PENDING_DONE, ROOT / "vlm_pending_done"),
     ]
     failed = []
@@ -365,6 +366,11 @@ def process_one(pkg_name: str) -> str:
     #     7a. 在 staging 目录构建（安全隔离，executor 看不到半写包）
     state = _build_state(signal, valid_pbs, pkg_name)
     staging_root = _STAGING_DIR / pkg_name
+    # P3: clean any stale staging residue from a prior crash so no leftover files
+    # (evil.txt from a bad fetch, half-written json) leak into signal_active.
+    if staging_root.exists():
+        import shutil
+        shutil.rmtree(staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
 
     staging_state = staging_root / "state.json"
