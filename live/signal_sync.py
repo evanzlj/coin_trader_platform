@@ -254,6 +254,11 @@ def pull_round() -> tuple[int, int]:
             if local is not None:
                 import shutil
                 shutil.rmtree(local, ignore_errors=True)
+            # Release remote claim so the package isn't locked for 30min
+            try:
+                _ssh([f"cd {_VLM_PENDING} && rm -rf \"{name}/.claimed\""], timeout=15)
+            except Exception:
+                pass
             failed += 1
     return pulled, failed
 
@@ -303,15 +308,19 @@ def _remote_push_staging(pkg_dir: Path) -> str:
     data = buf.getvalue()
 
     # Remote: extract to staging → atomic mv → finalizer never sees half-package
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    staging = f".tmp_{name}_{ts}"
     remote_script = (
         f"mkdir -p {_VLM_DONE_INCOMING} && "
         f"cd {_VLM_DONE_INCOMING} && "
-        f"mkdir -p .tmp_{name} && "
-        f"tar xzf - -C .tmp_{name} && "
-        f"if [ -f \".tmp_{name}/{name}/vlm_response.json\" ]; then "
-        f"  mv .tmp_{name}/{name} {name} && rm -rf .tmp_{name} && echo MOVED; "
+        f"mkdir -p {staging} && "
+        f"tar xzf - -C {staging} && "
+        f"if [ -f \"{staging}/{name}/vlm_response.json\" ]; then "
+        f"  mv -T \"{staging}/{name}\" \"{name}\" 2>/dev/null && "
+        f"    rm -rf \"{staging}\" && echo MOVED || "
+        f"    {{ rm -rf \"{staging}\"; echo SKIP_EXISTS; }}"
         f"else "
-        f"  rm -rf .tmp_{name} && echo BAD_PACKAGE; "
+        f"  rm -rf \"{staging}\" && echo BAD_PACKAGE; "
         f"fi"
     )
     try:
@@ -382,12 +391,14 @@ def _backlog_count() -> int:
                and not _already_pushed(d.name)) if LOCAL_VLM_DONE.exists() else 0
 
 
-def _write_status(pushed: int, failed: int, backlog: int, last_error: Optional[str] = None) -> None:
+def _write_status(pushed: int, failed: int, backlog: int, last_error: Optional[str] = None,
+                  consecutive_failures: int = 0) -> None:
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
         tmp = STATUS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({
             "pushed": pushed, "failed": failed, "backlog_count": backlog,
+            "consecutive_failures": consecutive_failures,
             "last_error": last_error,
             "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }, indent=2), encoding="utf-8")
@@ -417,8 +428,10 @@ def main() -> None:
     logger.info("signal_sync started: pull %s → %s | push %s → %s",
                 _VLM_PENDING, LOCAL_VLM_PENDING, LOCAL_VLM_DONE, _VLM_DONE_INCOMING)
 
+    consecutive_failures = 0
     while True:
         round_failed = False
+        last_error: Optional[str] = None
         try:
             p, f = pull_round()
             if p or f:
@@ -431,16 +444,23 @@ def main() -> None:
 
             if f > 0 or fd > 0:
                 round_failed = True
+                consecutive_failures += 1
+                last_error = f"pull_failed={f} push_failed={fd}"
+            else:
+                consecutive_failures = 0
 
             _heartbeat()
-            _write_status(p + pd, f + fd, backlog)
+            _write_status(p + pd, f + fd, backlog, last_error=last_error,
+                          consecutive_failures=consecutive_failures)
 
         except Exception as e:
             logger.exception("signal_sync cycle error")
             round_failed = True
+            consecutive_failures += 1
             try:
                 _heartbeat()
-                _write_status(0, 0, _backlog_count(), last_error=str(e)[:200])
+                _write_status(0, 0, _backlog_count(), last_error=str(e)[:200],
+                              consecutive_failures=consecutive_failures)
             except Exception:
                 pass
 

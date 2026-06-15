@@ -243,11 +243,16 @@ async def process_one(page, pkg_dir: Path) -> dict:
     done_path = LOCAL_VLM_DONE / dir_name
     rec_path = done_path / "vlm_response.json"
 
-    # Already done?
+    # Already done? (P1: if vlm_response exists but .ready doesn't, repair
+    # the half-written state from a crash — touch .ready + archive pending.)
     if rec_path.exists():
         try:
             existing = json.loads(rec_path.read_text(encoding="utf-8"))
             if existing.get("watch_summary") and not existing.get("error"):
+                if not (done_path / ".ready").exists():
+                    (done_path / ".ready").touch()
+                    _archive(pkg_dir, LOCAL_VLM_DONE_PENDING, "cached_repair_ready")
+                    logger.info("cached repair: added .ready + archived %s", dir_name)
                 return {"dir": dir_name, "status": "cached"}
         except Exception:
             pass
@@ -308,9 +313,13 @@ async def process_one(page, pkg_dir: Path) -> dict:
                 (pkg_dir / "_raw_response.txt").write_text(text, encoding="utf-8")
                 return {"dir": dir_name, "status": "parse_err"}
             # Only write vlm_response.json (G5: NO state.json, NO signal.json)
+            # Atomic write: tmp + os.replace so a crash mid-write never leaves a
+            # half-JSON that cached path would accept but .ready would be missing.
             LOCAL_VLM_DONE.mkdir(parents=True, exist_ok=True)
             done_path.mkdir(parents=True, exist_ok=True)
-            rec_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp = done_path / "vlm_response.json.tmp"
+            tmp.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, rec_path)
             (done_path / ".ready").touch()
             # Archive the processed pending package (移出活跃队列)
             _archive(pkg_dir, LOCAL_VLM_DONE_PENDING, "processed")
@@ -378,17 +387,34 @@ async def main() -> None:
             logger.warning("nav failed: %s", e)
 
         stats = {"processed": 0, "ok": 0, "parse_err": 0, "error": 0,
+                 "cached": 0, "stale": 0, "consecutive_failures": 0,
                  "last_success_at": None, "last_error": None}
-        stale_cutoff = pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS)
         needs_fresh_chat = True
         current_symbol = None
 
         while True:
+            stale_cutoff = pd.Timestamp.now("UTC") - pd.Timedelta(seconds=STALE_SECONDS)
             pending = sorted([
                 d for d in LOCAL_VLM_PENDING.iterdir()
                 if d.is_dir() and (d / ".ready").exists()
                 and not (d / "vlm_response.json").exists()
             ])
+            # Filter stale packages locally before sending to ChatGPT
+            fresh = []
+            for d in pending:
+                sig = d / "signal.json"
+                if sig.exists():
+                    try:
+                        sig_data = json.loads(sig.read_text(encoding="utf-8"))
+                        bt = pd.Timestamp(sig_data.get("bar_time", "2000-01-01"), tz="UTC")
+                        if bt < stale_cutoff:
+                            _archive(d, LOCAL_VLM_REJECTED, f"stale_bar_time={bt.date()}")
+                            stats["stale"] = stats.get("stale", 0) + 1
+                            continue
+                    except Exception:
+                        pass
+                fresh.append(d)
+            pending = fresh
             if not pending:
                 _update_heartbeat()
                 _write_status(stats)
@@ -415,8 +441,11 @@ async def main() -> None:
                     stats["ok"] += 1
                     stats["last_success_at"] = pd.Timestamp.now("UTC").isoformat()
                 elif s in ("parse_err", "error", "cached"):
-                    stats[s] = stats.get(s, 0) + 1
-                    if s != "cached":
+                    if s == "cached":
+                        stats["cached"] = stats.get("cached", 0) + 1
+                    else:
+                        stats[s] = stats.get(s, 0) + 1
+                        stats["consecutive_failures"] = stats.get("consecutive_failures", 0) + 1
                         _archive(pkg_dir, LOCAL_VLM_REJECTED, f"{s}:{result.get('error','')[:100]}")
                         stats["last_error"] = f"{s}: {result.get('error','')[:80]}"
                         needs_fresh_chat = True

@@ -63,32 +63,28 @@ def _hb(name: str) -> Path:
     return HEARTBEAT_DIR / f"{name}_last_run.txt"
 
 
-# 各机守本机进程。心跳节奏（§20.2 line 905）：executor 15s/卡死 5min；monitor·openclaw 30s/卡死 20min；
-# signal_pusher 轮询 10s/卡死 10min。只有 executor 走 systemd 自动重启，其余告警（Windows 侧人工/Task Scheduler）。
+# 各机守本机进程（re-arch Phase 3: Windows = signal_sync + vlm_worker）。
+# executor 走 systemd 自动重启，其余告警（Windows 侧人工/Task Scheduler）。
 SPECS: dict[str, list[ProcSpec]] = {
     "btcml": [
         ProcSpec("executor", _hb("executor"), 5.0, "coin-executor"),
     ],
     "china": [
-        ProcSpec("monitor",       _hb("monitor"),       20.0, None),
-        ProcSpec("openclaw",      _hb("openclaw"),      20.0, None),
-        ProcSpec("signal_pusher", _hb("signal_pusher"), 10.0, None),
+        ProcSpec("signal_sync", _hb("signal_sync"), 10.0, None),
+        ProcSpec("vlm_worker",  _hb("vlm_worker"),  20.0, None),
     ],
 }
 
-# Functional-health status specs (written by monitor/openclaw/pusher each cycle).
-# A process whose heartbeat is fresh can still be functionally dead (fetching but never
-# writing packages, parsing nothing, rejecting everything) — these catch that.
+# Functional-health status specs (re-arch Phase 3). Watchdog alerts on stale
+# status or breached thresholds: SSH failures, backlog, parse errors, rejects.
 STATUS_SPECS: dict[str, list[StatusSpec]] = {
     "china": [
-        StatusSpec("monitor", HEARTBEAT_DIR / "monitor_status.json",
-                   (("consecutive_failures", 3), ("backlog_count", 10),
-                    ("package_write_failures", 3)), max_stale_min=5.0),
-        StatusSpec("signal_pusher", HEARTBEAT_DIR / "pusher_status.json",
-                   (("consecutive_failures", 3), ("backlog_count", 5)), max_stale_min=5.0),
-        StatusSpec("openclaw", HEARTBEAT_DIR / "openclaw_status.json",
-                   (("consecutive_rejections", 5), ("move_failures", 3),
-                    ("parse_errs", 5)), max_stale_min=25.0),
+        StatusSpec("signal_sync", HEARTBEAT_DIR / "signal_sync_status.json",
+                   (("consecutive_failures", 3), ("backlog_count", 5)),
+                   max_stale_min=5.0),
+        StatusSpec("vlm_worker", HEARTBEAT_DIR / "vlm_worker_status.json",
+                   (("consecutive_failures", 3), ("parse_err", 5),
+                    ("stale", 5)), max_stale_min=25.0),
     ],
 }
 
