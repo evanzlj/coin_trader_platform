@@ -124,16 +124,23 @@ class ReplayFeed:
                 for _, row in df.iterrows():
                     events.append((row["close_time"], self._row_to_bar(row, symbol, "15m")))
 
-            # ── OHLCV 4h (no start filter: needed to warm up 4H structure buffer)
+            # ── OHLCV 4h (start-filtered during incremental replay, full during warmup)
+            # During live monitor cycles the buffer already has all historical 4h bars,
+            # so re-loading 6+ years every 15min wastes ~8s per symbol. Use a 30-day
+            # lookback window when start is set (more than enough for 4h structure
+            # calculations that need ≤ 20 bars = 80h). None → batch/warmup = full load.
             path_4h = self.data_dir / "ohlcv" / f"{slug}_4h.csv"
             if not path_4h.exists():
                 logger.warning("missing: %s", path_4h)
             else:
-                df4h = self._load_ohlcv(path_4h, symbol, "4h", apply_start=False)
+                _4h_start = (self._start - pd.Timedelta(days=30)).isoformat() \
+                    if self._start is not None else None
+                df4h = self._load_ohlcv(path_4h, symbol, "4h", apply_start=True,
+                                        start_override=_4h_start)
                 for _, row in df4h.iterrows():
                     events.append((row["close_time"], self._row_to_bar(row, symbol, "4h")))
 
-                # ── Weekly: resample from full 4h (no start filter: needs 50 weeks)
+                # ── Weekly: resample from filtered 4h (same window)
                 weekly = self._resample_weekly(df4h, symbol)
                 for _, row in weekly.iterrows():
                     events.append((row["close_time"], self._row_to_bar(row, symbol, "1w")))
@@ -162,15 +169,17 @@ class ReplayFeed:
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _load_ohlcv(self, path: Path, symbol: str, tf: str,
-                    apply_start: bool = True) -> pd.DataFrame:
+                    apply_start: bool = True,
+                    start_override: "Optional[str]" = None) -> pd.DataFrame:
         df = pd.read_csv(path, parse_dates=["open_time", "close_time"])
         for col in ("open_time", "close_time"):
             if df[col].dt.tz is None:
                 df[col] = df[col].dt.tz_localize("UTC")
             else:
                 df[col] = df[col].dt.tz_convert("UTC")
-        if apply_start and self._start is not None:
-            df = df[df["open_time"] >= self._start]
+        _start = start_override if start_override is not None else self._start
+        if apply_start and _start is not None:
+            df = df[df["open_time"] >= pd.Timestamp(_start, tz="UTC")]
         if self._end is not None:
             df = df[df["open_time"] <= self._end]
         return df.reset_index(drop=True)
