@@ -210,6 +210,21 @@ class TestExitCode(_Base):
         ss._write_status(p, f, 0)
         self.assertEqual(f, 0)
 
+    def test_once_exits_one_on_ssh_failure(self):
+        """Real --once subprocess with unreachable REMOTE_HOST → exit 1."""
+        r = subprocess.run(
+            [sys.executable, "-m", "live.signal_sync", "--once"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=30,
+            env=dict(os.environ,
+                     LOCAL_VLM_PENDING=str(self.tmp / "empty"),
+                     LOCAL_VLM_DONE=str(self.tmp / "empty2"),
+                     LOCK_FILE=str(self.tmp / "lock"),
+                     STATUS_FILE=str(self.tmp / "status.json"),
+                     HEARTBEAT_FILE=str(self.tmp / "hb.txt"),
+                     REMOTE_HOST="nonexistent-worker.invalid",
+                     SSH_TIMEOUT="5"))
+        self.assertEqual(r.returncode, 1, f"--once must exit 1 on SSH failure; stderr={r.stderr[-200:]}")
+
     def test_ssh_failure_propagates_as_runtime_error(self):
         """Verify _remote_list_new raises RuntimeError when SSH fails (→ main exits 1)."""
         # Remove setUp's mocks so we test the real code path

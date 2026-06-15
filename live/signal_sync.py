@@ -115,12 +115,12 @@ def _remote_list_new() -> list[str]:
         f"  if [ ! -f \"$pkg/.ready\" ]; then continue; fi; "
         f"  # Atomically claim via mkdir (fails fast if .claimed dir exists)\n"
         f"  if [ -d \"$pkg/.claimed\" ]; then "
-        f"    # Lease expired?  Re-use the dir as a mutex — rmdir + mkdir (best-effort)\n"
+        f"    # Lease expired? rm -rf (non-empty dir) then mkdir (single-worker safe)\n"
         f"    if [ -f \"$pkg/.claimed/lease_ts\" ]; then "
         f"      TS=$(cat \"$pkg/.claimed/lease_ts\" 2>/dev/null); "
         f"      if [ -n \"$TS\" ] && [ \"$(( NOW - TS ))\" -lt \"$LEASE\" ]; then continue; fi; "
         f"    else continue; fi; "
-        f"    rmdir \"$pkg/.claimed\" 2>/dev/null || continue; "
+        f"    rm -rf \"$pkg/.claimed\"; "
         f"  fi; "
         f"  mkdir \"$pkg/.claimed\" 2>/dev/null || continue; "
         f"  echo \"$NOW\" > \"$pkg/.claimed/lease_ts\" && "
@@ -247,10 +247,13 @@ def pull_round() -> tuple[int, int]:
             _mark_pulled(name)
             continue
         local = _tar_pull(name)
-        if local is not None:
+        if local is not None and _local_pull_complete(name):
             _mark_pulled(name)
             pulled += 1
         else:
+            if local is not None:
+                import shutil
+                shutil.rmtree(local, ignore_errors=True)
             failed += 1
     return pulled, failed
 
