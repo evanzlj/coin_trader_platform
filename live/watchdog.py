@@ -189,6 +189,27 @@ def restart_via_systemd(spec: ProcSpec) -> None:
         send_alert(f"{spec.name}: systemctl kill {unit} 异常: {e}")
 
 
+def check_data_source_health() -> str | None:
+    """Check per-symbol staleness from monitor_status.json. Alerts if any symbol's
+    latest 15m bar is behind by more than STALE_DATA_MINUTES — the DB collection
+    may have stalled even while the monitor process is alive."""
+    mon_status = HEARTBEAT_DIR / "monitor_status.json"
+    if not mon_status.exists():
+        return None
+    try:
+        data = json.loads(mon_status.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f"data_source: monitor_status unreadable ({e})"
+    per = data.get("per_symbol", {})
+    alerts = []
+    for sym, info in per.items():
+        sm = info.get("staleness_min")
+        if sm is not None and isinstance(sm, (int, float)) and sm > cfg.STALE_DATA_MINUTES:
+            cursor = info.get("cursor", "?")
+            alerts.append(f"{sym} stale {sm:.0f}min (cursor={cursor}, threshold={cfg.STALE_DATA_MINUTES}min)")
+    return f"data_source: {'; '.join(alerts)}" if alerts else None
+
+
 def run_once(role: str) -> bool:
     all_ok = True
     for spec in SPECS[role]:
@@ -207,6 +228,13 @@ def run_once(role: str) -> bool:
             all_ok = False
         else:
             logger.info("%s status: OK", spec.name)
+    if role == "btcml":
+        alert = check_data_source_health()
+        if alert:
+            send_alert(alert)
+            all_ok = False
+        else:
+            logger.info("data_source health: OK")
     return all_ok
 
 
