@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -41,16 +42,23 @@ sys.path.insert(0, str(ROOT))
 
 logger = logging.getLogger("vlm_worker")
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Paths (all env-overridable, P1-4 / REARCH §10 G2) ─────────────────────────
 
-LOCAL_VLM_PENDING       = Path(__file__).parent.parent / "local_vlm_pending"
-LOCAL_VLM_DONE          = Path(__file__).parent.parent / "local_vlm_done"
-LOCAL_VLM_REJECTED      = Path(__file__).parent.parent / "local_vlm_rejected"
-LOCAL_VLM_DONE_PENDING  = Path(__file__).parent.parent / "local_vlm_done_pending" / "archive"
+LOCAL_VLM_PENDING       = Path(os.environ.get("LOCAL_VLM_PENDING",
+                              str(ROOT / "local_vlm_pending")))
+LOCAL_VLM_DONE          = Path(os.environ.get("LOCAL_VLM_DONE",
+                              str(ROOT / "local_vlm_done")))
+LOCAL_VLM_REJECTED      = Path(os.environ.get("LOCAL_VLM_REJECTED",
+                              str(ROOT / "local_vlm_rejected")))
+LOCAL_VLM_DONE_PENDING  = Path(os.environ.get("LOCAL_VLM_DONE_PENDING",
+                              str(ROOT / "local_vlm_done_pending" / "archive")))
 
-STATUS_FILE    = Path(__file__).parent.parent / "live" / "heartbeat" / "vlm_worker_status.json"
-HEARTBEAT_FILE = Path(__file__).parent.parent / "live" / "heartbeat" / "vlm_worker_last_run.txt"
-LOCK_FILE      = Path(__file__).parent.parent / "live" / "vlm_worker.lock"
+STATUS_FILE    = Path(os.environ.get("VLM_WORKER_STATUS",
+                      str(ROOT / "live" / "heartbeat" / "vlm_worker_status.json")))
+HEARTBEAT_FILE = Path(os.environ.get("VLM_WORKER_HEARTBEAT",
+                      str(ROOT / "live" / "heartbeat" / "vlm_worker_last_run.txt")))
+LOCK_FILE      = Path(os.environ.get("VLM_WORKER_LOCK",
+                      str(ROOT / "live" / "vlm_worker.lock")))
 
 CDP_URL     = "http://127.0.0.1:18800"
 TIMEOUT     = 360

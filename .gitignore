@@ -36,8 +36,21 @@ signal_active/
 signal_done/
 .signal_pushed/
 .signal_incoming/
+vlm_pending/
+vlm_done_incoming/
+vlm_rejected/
+vlm_pending_done/
+local_vlm_pending/
+local_vlm_done/
+local_vlm_rejected/
+local_vlm_done_pending/
+.synced_pulled/
+.synced_pushed/
+.f_active_incoming/
 logs/
 *.parquet
+*.lock
+old_prompt_sample/
 
 # OS
 .DS_Store

@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -95,16 +96,30 @@ def _ssh(cmd: list[str], timeout: int = SSH_TIMEOUT, text: bool = True,
     return r
 
 
+# How long a .claimed package stays claimed before it can be re-taken (seconds).
+# If Windows claims a package then crashes, the lease expires and the package
+# becomes available to the next cycle (or another worker).
+CLAIM_LEASE = 1800   # 30 minutes (>> ChatGPT TIMEOUT 360s + retry buffer + network)
+
+# Lease marker written into .claimed file: "CLAIMED_AT:<unix_timestamp>"
+_CLAIM_TS_PREFIX = "CLAIMED_AT:"
+
+
 def _remote_list_new() -> list[str]:
-    """List remote vlm_pending packages that have .ready and NO .claimed.
-    Returns sorted list of pkg names."""
+    """List remote vlm_pending packages that can be claimed (no .claimed or expired lease).
+    Claims each returned package atomically. Returns sorted list of pkg names."""
     script = (
         f"cd {_VLM_PENDING} 2>/dev/null || exit 0; "
+        f"NOW=$(date +%s); LEASE={CLAIM_LEASE}; "
         f"for d in */; do "
         f"  pkg=${{d%/}}; "
-        f"  if [ -f \"$pkg/.ready\" ] && [ ! -f \"$pkg/.claimed\" ] && [[ \"$pkg\" =~ ^[A-Za-z0-9_.-]+$ ]]; then "
-        f"    touch \"$pkg/.claimed\"; echo \"$pkg\"; "
+        f"  if [ ! -f \"$pkg/.ready\" ]; then continue; fi; "
+        f"  if [ -f \"$pkg/.claimed\" ]; then "
+        f"    TS=$(cat \"$pkg/.claimed\" 2>/dev/null | sed -n 's/^{_CLAIM_TS_PREFIX}//p'); "
+        f"    if [ -z \"$TS\" ] || [ \"$(( NOW - TS ))\" -lt \"$LEASE\" ]; then continue; fi; "
         f"  fi; "
+        f"  echo \"{_CLAIM_TS_PREFIX}$NOW\" > \"$pkg/.claimed\" && "
+        f"  echo \"$pkg\"; "
         f"done"
     )
     r = _ssh([script], text=True)
@@ -244,6 +259,7 @@ def _remote_push_staging(pkg_dir: Path) -> str:
 
     # Remote: extract to staging → atomic mv → finalizer never sees half-package
     remote_script = (
+        f"mkdir -p {_VLM_DONE_INCOMING} && "
         f"cd {_VLM_DONE_INCOMING} && "
         f"mkdir -p .tmp_{name} && "
         f"tar xzf - -C .tmp_{name} && "
