@@ -133,7 +133,7 @@ class ReplayFeed:
             if not path_4h.exists():
                 logger.warning("missing: %s", path_4h)
             else:
-                _4h_start = (self._start - pd.Timedelta(days=30)).isoformat() \
+                _4h_start = self._start - pd.Timedelta(days=30) \
                     if self._start is not None else None
                 df4h = self._load_ohlcv(path_4h, symbol, "4h", apply_start=True,
                                         start_override=_4h_start)
@@ -170,7 +170,7 @@ class ReplayFeed:
 
     def _load_ohlcv(self, path: Path, symbol: str, tf: str,
                     apply_start: bool = True,
-                    start_override: "Optional[str]" = None) -> pd.DataFrame:
+                    start_override: "Optional[pd.Timestamp]" = None) -> pd.DataFrame:
         df = pd.read_csv(path, parse_dates=["open_time", "close_time"])
         for col in ("open_time", "close_time"):
             if df[col].dt.tz is None:
@@ -179,7 +179,7 @@ class ReplayFeed:
                 df[col] = df[col].dt.tz_convert("UTC")
         _start = start_override if start_override is not None else self._start
         if apply_start and _start is not None:
-            df = df[df["open_time"] >= pd.Timestamp(_start, tz="UTC")]
+            df = df[df["open_time"] >= _start]
         if self._end is not None:
             df = df[df["open_time"] <= self._end]
         return df.reset_index(drop=True)
