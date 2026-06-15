@@ -149,7 +149,7 @@ def _tar_pull(name: str) -> Optional[Path]:
     remote_tar = (
         f"cd {_VLM_PENDING} && "
         f"if [ -d \"{name}\" ] && [ -f \"{name}/.ready\" ] && [ -f \"{name}/signal.json\" ]; then "
-        f"  tar czf - -C {name} .ready signal.json prompt.txt *_4h.png *_15m.png 2>/dev/null; "
+        f"  tar czf - -C {name} . 2>/dev/null; "
         f"  echo '\nTAR_OK'; "
         f"fi"
     )
@@ -171,11 +171,12 @@ def _tar_pull(name: str) -> Optional[Path]:
             if not members:
                 return None
             dest.mkdir(parents=True, exist_ok=True)
-            # Only extract permitted files
+            # Only extract permitted files (skip .claimed dir marker)
             for m in members:
-                if "/" in m.name:
-                    # Strip any path prefix — tar stores relative to package dir
-                    m.name = Path(m.name).name
+                basename = Path(m.name).name
+                if basename == ".claimed":
+                    continue
+                m.name = basename
                 tar.extract(m, path=dest)
         if not (dest / ".ready").exists() or not (dest / "signal.json").exists():
             import shutil

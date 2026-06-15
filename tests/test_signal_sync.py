@@ -118,6 +118,10 @@ class TestPullIdempotency(_Base):
         self.assertTrue(dest.exists())
         self.assertTrue((dest / ".ready").exists())
         self.assertTrue((dest / "signal.json").exists())
+        self.assertTrue((dest / "prompt.txt").exists())
+        # PNGs are now included (tar all + extract filter)
+        self.assertGreaterEqual(len(list(dest.glob("*_4h.png"))), 1)
+        self.assertGreaterEqual(len(list(dest.glob("*_15m.png"))), 1)
 
     def test_pull_idempotent(self):
         ss.pull_round()  # first pull
