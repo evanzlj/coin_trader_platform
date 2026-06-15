@@ -1077,5 +1077,44 @@ class TestSandboxGuard(unittest.TestCase):
             self.fail("custom path should not cause SystemExit")
 
 
+# ── data_source health watchdog test ──────────────────────────────────────────
+
+class TestDataSourceHealth(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._orig_mon = watchdog.HEARTBEAT_DIR
+
+    def tearDown(self):
+        watchdog.HEARTBEAT_DIR = self._orig_mon
+
+    def _mon_status(self, staleness):
+        return json.dumps({
+            "per_symbol": {
+                "BTC/USDT": {"cursor": "2026-01-01T00:00:00", "staleness_min": staleness},
+                "ETH/USDT": {"cursor": "2026-01-01T00:00:00", "staleness_min": staleness},
+            }
+        })
+
+    def test_stale_data_source_alerts(self):
+        d = Path(tempfile.mkdtemp())
+        f = d / "monitor_status.json"
+        f.write_text(self._mon_status(25), encoding="utf-8")
+        watchdog.HEARTBEAT_DIR = d
+        alert = watchdog.check_data_source_health()
+        self.assertIsNotNone(alert)
+        self.assertIn("stale 25min", alert)
+
+    def test_fresh_data_source_returns_none(self):
+        d = Path(tempfile.mkdtemp())
+        f = d / "monitor_status.json"
+        f.write_text(self._mon_status(5), encoding="utf-8")
+        watchdog.HEARTBEAT_DIR = d
+        self.assertIsNone(watchdog.check_data_source_health())
+
+    def test_missing_file_returns_none(self):
+        watchdog.HEARTBEAT_DIR = Path(tempfile.mkdtemp())
+        self.assertIsNone(watchdog.check_data_source_health())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,8 @@ import pandas as pd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from live import exec_config as cfg
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                     datefmt="%Y-%m-%dT%H:%M:%S")
 logger = logging.getLogger("watchdog")
