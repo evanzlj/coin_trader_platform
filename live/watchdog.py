@@ -67,7 +67,9 @@ def _hb(name: str) -> Path:
 # executor 走 systemd 自动重启，其余告警（Windows 侧人工/Task Scheduler）。
 SPECS: dict[str, list[ProcSpec]] = {
     "btcml": [
-        ProcSpec("executor", _hb("executor"), 5.0, "coin-executor"),
+        ProcSpec("executor",      _hb("executor"),      5.0, "coin-executor"),
+        ProcSpec("monitor",       _hb("monitor"),       20.0, None),
+        ProcSpec("vlm_finalizer", _hb("vlm_finalizer"), 20.0, None),
     ],
     "china": [
         ProcSpec("signal_sync", _hb("signal_sync"), 10.0, None),
@@ -78,6 +80,14 @@ SPECS: dict[str, list[ProcSpec]] = {
 # Functional-health status specs (re-arch Phase 3). Watchdog alerts on stale
 # status or breached thresholds: SSH failures, backlog, parse errors, rejects.
 STATUS_SPECS: dict[str, list[StatusSpec]] = {
+    "btcml": [
+        StatusSpec("monitor",       HEARTBEAT_DIR / "monitor_status.json",
+                   (("consecutive_failures", 3), ("backlog_count", 10),
+                    ("package_write_failures", 3)), max_stale_min=5.0),
+        StatusSpec("vlm_finalizer", HEARTBEAT_DIR / "finalizer_status.json",
+                   (("bad_schema", 5), ("filtered", 10), ("move_failed", 3)),
+                   max_stale_min=5.0),
+    ],
     "china": [
         StatusSpec("signal_sync", HEARTBEAT_DIR / "signal_sync_status.json",
                    (("consecutive_failures", 3), ("backlog_count", 5)),

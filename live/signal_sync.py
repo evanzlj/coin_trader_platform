@@ -317,8 +317,8 @@ def _remote_push_staging(pkg_dir: Path) -> str:
         f"tar xzf - -C {staging} && "
         f"if [ -f \"{staging}/{name}/vlm_response.json\" ]; then "
         f"  mv -T \"{staging}/{name}\" \"{name}\" 2>/dev/null && "
-        f"    rm -rf \"{staging}\" && echo MOVED || "
-        f"    {{ rm -rf \"{staging}\"; echo SKIP_EXISTS; }}"
+        f"    rm -rf \"{staging}\" && echo MOVED "
+        f"  || {{ rm -rf \"{staging}\"; echo SKIP_EXISTS; }} ; "
         f"else "
         f"  rm -rf \"{staging}\" && echo BAD_PACKAGE; "
         f"fi"
@@ -340,7 +340,9 @@ def _remote_push_staging(pkg_dir: Path) -> str:
     if out.endswith("BAD_PACKAGE"):
         logger.warning("push %s remote rejected as bad", name)
         return "FAIL"
-    # Could be SKIP_EXISTS if vlm_done_incoming/{name} already existed
+    if out.endswith("SKIP_EXISTS"):
+        logger.info("skip %s — already on remote (race)", name)
+        return "SKIP"
     logger.warning("push %s unexpected: %s", name, out[:120])
     return "FAIL"
 

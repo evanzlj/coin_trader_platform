@@ -251,8 +251,9 @@ async def process_one(page, pkg_dir: Path) -> dict:
             if existing.get("watch_summary") and not existing.get("error"):
                 if not (done_path / ".ready").exists():
                     (done_path / ".ready").touch()
-                    _archive(pkg_dir, LOCAL_VLM_DONE_PENDING, "cached_repair_ready")
-                    logger.info("cached repair: added .ready + archived %s", dir_name)
+                    logger.info("cached repair: added .ready for %s", dir_name)
+                if pkg_dir.exists():
+                    _archive(pkg_dir, LOCAL_VLM_DONE_PENDING, "cached_archived")
                 return {"dir": dir_name, "status": "cached"}
         except Exception:
             pass
@@ -439,6 +440,7 @@ async def main() -> None:
                 s = result["status"]
                 if s == "ok":
                     stats["ok"] += 1
+                    stats["consecutive_failures"] = 0
                     stats["last_success_at"] = pd.Timestamp.now("UTC").isoformat()
                 elif s in ("parse_err", "error", "cached"):
                     if s == "cached":

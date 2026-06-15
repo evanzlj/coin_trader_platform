@@ -225,6 +225,35 @@ class TestExitCode(_Base):
                      SSH_TIMEOUT="5"))
         self.assertEqual(r.returncode, 1, f"--once must exit 1 on SSH failure; stderr={r.stderr[-200:]}")
 
+    def test_push_remote_script_compiles_shell(self):
+        """Verify generated push script is valid bash syntax (P1 syntax regression)."""
+        # Pull a real script from _remote_push_staging by mocking _ssh to capture it
+        captured = []
+
+        def capture_ssh(cmd, *a, **kw):
+            captured.append(cmd[-1] if isinstance(cmd[-1], str) else "")
+            class R:
+                returncode = 0
+                stdout = b"MOVED"
+                stderr = b""
+            return R()
+
+        orig = ss.subprocess
+        ss.subprocess.run = capture_ssh
+        try:
+            p = Path(tempfile.mkdtemp()) / "local_vlm_done" / "btcusdt_a_test"
+            p.mkdir(parents=True)
+            (p / "vlm_response.json").write_text("{}", encoding="utf-8")
+            (p / ".ready").touch()
+            ss._remote_push_staging(p)
+        finally:
+            ss.subprocess.run = orig
+
+        if captured:
+            r = subprocess.run(["bash", "-n", "-c", captured[0]],
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, f"bash syntax error in push script: {r.stderr[:200]}")
+
     def test_ssh_failure_propagates_as_runtime_error(self):
         """Verify _remote_list_new raises RuntimeError when SSH fails (→ main exits 1)."""
         # Remove setUp's mocks so we test the real code path
