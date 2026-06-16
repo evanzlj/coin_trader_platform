@@ -29,10 +29,13 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
+import urllib.request
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -40,6 +43,11 @@ from playwright.async_api import async_playwright
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
 logger = logging.getLogger("vlm_worker")
 
 # ── Paths (all env-overridable, P1-4 / REARCH §10 G2) ─────────────────────────
@@ -67,6 +75,15 @@ POLL_SECONDS = 30
 STALE_SECONDS = 7200
 COOLDOWN_MIN = 90
 COOLDOWN_MAX = 120
+
+# ── ChatGPT UI 文案匹配（中英文兼容）─────────────────────────────────────────
+# 英文文案为常见推测；匹配不到只会回退到原有的 timeout 行为，不会更糟。
+RE_RATE_LIMIT = re.compile(r"请求过于频繁|too many (requests|messages)|rate limit", re.I)
+RE_DISMISS    = re.compile(r"明白了|got it|^ok$", re.I)
+RE_SERVER_ERR = re.compile(r"Something went wrong|出错了|发生错误", re.I)
+RE_RETRY      = re.compile(r"重试|retry|regenerate", re.I)
+RE_STOPPED    = re.compile(r"已停止思考|stopped (thinking|generating)", re.I)
+RE_ANALYZING  = re.compile(r"正在分析|analyzing", re.I)
 
 
 # ── JSON 解析（复用 openclaw 逻辑）────────────────────────────────────────────
@@ -156,10 +173,10 @@ async def _wait_for_response(page, prev_count: int) -> tuple[Optional[str], Opti
     while time.time() - start < TIMEOUT:
         await asyncio.sleep(4)
         try:
-            rl = page.locator('text="请求过于频繁"').first
+            rl = page.get_by_text(RE_RATE_LIMIT).first
             if await rl.count() > 0:
                 rate_limit_hits += 1
-                dismiss = page.locator('button:has-text("明白了")').first
+                dismiss = page.get_by_role("button", name=RE_DISMISS).first
                 if await dismiss.count() > 0:
                     try:
                         await dismiss.click(timeout=5000)
@@ -173,9 +190,9 @@ async def _wait_for_response(page, prev_count: int) -> tuple[Optional[str], Opti
         except Exception:
             pass
         try:
-            err = page.locator('text="Something went wrong"').first
+            err = page.get_by_text(RE_SERVER_ERR).first
             if await err.count() > 0:
-                rb = page.locator('button:has-text("重试")').first
+                rb = page.get_by_role("button", name=RE_RETRY).first
                 if await rb.count() > 0:
                     try:
                         await rb.click(timeout=5000)
@@ -187,7 +204,7 @@ async def _wait_for_response(page, prev_count: int) -> tuple[Optional[str], Opti
         except Exception:
             pass
         try:
-            if await page.locator('text="已停止思考"').first.count() > 0 and (time.time() - start) > 30:
+            if await page.get_by_text(RE_STOPPED).first.count() > 0 and (time.time() - start) > 30:
                 return None, "thinking_failed"
         except Exception:
             pass
@@ -198,7 +215,7 @@ async def _wait_for_response(page, prev_count: int) -> tuple[Optional[str], Opti
         text = await msgs.nth(cnt - 1).inner_text()
         cur = text.strip()
         cur_len = len(cur)
-        is_analyzing = "正在分析" in cur and cur_len < 50
+        is_analyzing = bool(RE_ANALYZING.search(cur)) and cur_len < 50
         if is_analyzing:
             if stuck_start == 0:
                 stuck_start = time.time()
@@ -271,12 +288,19 @@ async def process_one(page, pkg_dir: Path) -> dict:
 
     prompt = prompt_file.read_text(encoding="utf-8")
 
+    # Lock to prevent re-upload on crash/restart
+    processing_marker = pkg_dir / ".processing"
+    if processing_marker.exists():
+        logger.warning("%s has .processing marker (previous crash?) — clearing", dir_name)
+    processing_marker.touch()
+
     for attempt in range(MAX_RETRIES + 1):
         try:
             if attempt > 0:
                 logger.info("retry %d/%d for %s", attempt, MAX_RETRIES, dir_name)
                 await asyncio.sleep(3)
 
+            logger.info("step: uploading 2 charts for %s ...", dir_name)
             prev_count = await page.locator('[data-message-author-role="assistant"]').count()
             fi = page.locator('input[type="file"]').first
             await fi.set_input_files([str(img_4h), str(img_15m)])
@@ -285,19 +309,23 @@ async def process_one(page, pkg_dir: Path) -> dict:
                 await asyncio.sleep(2)
                 if await sb.get_attribute("disabled") is None:
                     break
+            logger.info("step: filling prompt for %s ...", dir_name)
             if not await _fill_prompt(page, prompt):
+                processing_marker.unlink(missing_ok=True)
                 return {"dir": dir_name, "status": "error", "error": "fill_failed"}
             await asyncio.sleep(2)
             for _ in range(6):
                 if await sb.get_attribute("disabled") is None:
                     break
                 await asyncio.sleep(2)
+            logger.info("step: sending to ChatGPT for %s ...", dir_name)
             if not await _send_message(page):
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(5)
                     continue
+                processing_marker.unlink(missing_ok=True)
                 return {"dir": dir_name, "status": "error", "error": "send_failed"}
-            logger.info("sent to ChatGPT: %s", dir_name)
+            logger.info("step: waiting for ChatGPT response for %s ...", dir_name)
             text, err = await _wait_for_response(page, prev_count)
             if err:
                 if attempt < MAX_RETRIES:
@@ -324,12 +352,15 @@ async def process_one(page, pkg_dir: Path) -> dict:
             (done_path / ".ready").touch()
             # Archive the processed pending package (移出活跃队列)
             _archive(pkg_dir, LOCAL_VLM_DONE_PENDING, "processed")
+            processing_marker.unlink(missing_ok=True)
             logger.info("vlm_response written: %s (%d chars)", dir_name, len(text))
             return {"dir": dir_name, "status": "ok", "chars": len(text),
                     "pbs": len(parsed.get("playbooks", []))}
         except Exception as e:
             if attempt >= MAX_RETRIES:
+                processing_marker.unlink(missing_ok=True)
                 return {"dir": dir_name, "status": "error", "error": str(e)[:200]}
+    processing_marker.unlink(missing_ok=True)
     return {"dir": dir_name, "status": "error", "error": "max_retries"}
 
 
@@ -354,6 +385,25 @@ def _write_status(stats: dict) -> None:
         logger.warning("status write failed: %s", e)
 
 
+# ── CDP 解析 ───────────────────────────────────────────────────────────────────
+
+def resolve_cdp_url(http_url: str) -> str:
+    """Resolve HTTP CDP endpoint to WebSocket URL.
+    Playwright 1.60+ may reject HTTP-style CDP on some Chrome versions;
+    fall back to extracting webSocketDebuggerUrl from /json/version/.
+    """
+    try:
+        resp = urllib.request.urlopen(f"{http_url.rstrip('/')}/json/version/", timeout=5)
+        data = json.loads(resp.read().decode())
+        ws_url = data.get("webSocketDebuggerUrl")
+        if ws_url:
+            logger.info("resolved CDP WS: %s", ws_url[:60] + "...")
+            return ws_url
+    except Exception as e:
+        logger.warning("could not resolve WS from %s: %s", http_url, e)
+    return http_url  # fallback, let Playwright try original
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -368,13 +418,15 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cdp-url", default=CDP_URL)
     parser.add_argument("--tab-index", type=int, default=0)
+    parser.add_argument("--delay-min", type=float, default=COOLDOWN_MIN)
+    parser.add_argument("--delay-max", type=float, default=COOLDOWN_MAX)
     args = parser.parse_args()
 
     LOCAL_VLM_PENDING.mkdir(parents=True, exist_ok=True)
     logger.info("vlm_worker started — watching %s", LOCAL_VLM_PENDING)
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(args.cdp_url)
+        browser = await p.chromium.connect_over_cdp(resolve_cdp_url(args.cdp_url))
         pages = browser.contexts[0].pages
         if args.tab_index >= len(pages):
             logger.error("tab index %d out of range (%d pages)", args.tab_index, len(pages))
@@ -422,6 +474,8 @@ async def main() -> None:
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
+            logger.info("scan: %d pending package(s): %s", len(pending),
+                        [d.name for d in pending])
             for pkg_dir in pending:
                 sym = pkg_dir.name.split("usdt")[0] + "usdt"
                 if needs_fresh_chat or current_symbol != sym:
@@ -453,7 +507,9 @@ async def main() -> None:
                         needs_fresh_chat = True
                 _update_heartbeat()
                 _write_status(stats)
-                await asyncio.sleep(min(COOLDOWN_MIN, COOLDOWN_MAX))
+                delay = random.uniform(args.delay_min, args.delay_max)
+                logger.info("cooldown %.0fs ...", delay)
+                await asyncio.sleep(delay)
 
             _update_heartbeat()
             _write_status(stats)
