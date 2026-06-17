@@ -39,6 +39,11 @@ sys.path.insert(0, str(ROOT))
 from realtime_data_pull.feed import ReplayFeed
 from signal_generator.generator import SignalGenerator
 from signal_generator.events import SignalEvent
+from signal_generator.frozen_universe import (
+    FROZEN_SIGNAL_UNIVERSE_ID,
+    SignalUniverseDriftError,
+    assert_frozen_runtime,
+)
 from draw_kline import render
 from prompt_generator.builder import build_prompt
 from live.data_sync import data_sync as _data_sync, SyncError as _SyncError
@@ -73,35 +78,10 @@ POLL_INTERVAL        = 30    # seconds between new-bar checks
 SIGNAL_TTL_BARS      = 2     # discard signal_pending entries older than this many bars (30 min)
 BUFFER_SAVE_SECONDS  = 600   # F6: persist buffer state at most this often during operation
 
-# ── Per-symbol live filters ───────────────────────────────────────────────────
-# Matches research findings; applied after VLM response but pre-scored here
-# to avoid wasting a VLM call on signals that will be discarded anyway.
-
-def _passes_filter(sig: SignalEvent) -> tuple[bool, str]:
-    """
-    Return (passes, reason).
-    Checks r_dist (structure_space as proxy) and b2act >= 2 enforced by scorer.
-    TP1 zone exclusions are checked post-VLM in executor; not pre-filterable here.
-    """
-    sym = sig.symbol
-
-    if sym == "BTC/USDT":
-        if sig.structure_space < 0.5:
-            return False, f"r_dist {sig.structure_space:.2f}% < 0.5%"
-
-    elif sym == "ETH/USDT":
-        if sig.structure_space < 1.5:
-            return False, f"r_dist {sig.structure_space:.2f}% < 1.5%"
-
-    elif sym == "BNB/USDT":
-        if not (0.3 <= sig.structure_space <= 1.0):
-            return False, f"r_dist {sig.structure_space:.2f}% outside 0.3-1.0%"
-
-    elif sym == "SOL/USDT":
-        if sig.structure_space < 1.5:
-            return False, f"r_dist {sig.structure_space:.2f}% < 1.5%"
-
-    return True, ""
+# ── 所有 A 信号直接过 ChatGPT，不过滤结构宽度 ────────────────────────────────
+# 之前有一版用 structure_space 做前置过滤，但 structure_space != playbook r_dist。
+# 宽结构里可以有窄 r_dist 的 playbook，前置过滤会错误拦掉有效信号。
+# 过滤只在 finalizer 里按实际 playbook activation/invalidation 计算 r_dist 执行。
 
 
 # ── Dedup state I/O ───────────────────────────────────────────────────────────
@@ -437,6 +417,19 @@ async def main() -> None:
                          "PRODUCER_SANDBOX.", VLM_PENDING.resolve(), VLM_REJECTED.resolve())
             sys.exit(1)
 
+    try:
+        assert_frozen_runtime(symbols=SYMBOLS)
+        logger.info("signal universe freeze verified: %s", FROZEN_SIGNAL_UNIVERSE_ID)
+    except SignalUniverseDriftError as e:
+        logger.error("FATAL: %s", e)
+        try:
+            _write_status(consecutive_failures=1, last_success_at=None,
+                          last_error=str(e)[:200], backlog_count=-1,
+                          package_write_failures=0)
+        except Exception:
+            pass
+        sys.exit(1)
+
     VLM_PENDING.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -547,10 +540,6 @@ async def main() -> None:
                     if age > 30:
                         logger.info("stale signal skipped (%d min old): %s %s",
                                     int(age), sig.symbol, sig.grade)
-                        continue
-                    passes, reason = _passes_filter(sig)
-                    if not passes:
-                        logger.info("filtered out %s %s: %s", sig.symbol, sig.grade, reason)
                         continue
                     # 4h context gate (G1): refuse to produce a package if the 4h bar
                     # current at T0 hasn't been collected yet (e.g. first 4h of a new
