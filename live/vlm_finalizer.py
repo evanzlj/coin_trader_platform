@@ -154,7 +154,7 @@ def _validate_vlm_response(raw: Any) -> Optional[str]:
     if not isinstance(raw, dict):
         return "top_level_not_dict"
     ws = raw.get("watch_summary")
-    if not isinstance(ws, str) or not ws.strip():
+    if not (isinstance(ws, str) and ws.strip()) and not (isinstance(ws, dict) and ws.get("one_sentence_read")):
         return "watch_summary_missing_or_empty"
     if raw.get("error"):
         return f"error_flag_present: {str(raw['error'])[:80]}"
