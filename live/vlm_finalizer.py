@@ -196,18 +196,24 @@ def _tp1_dist_pct(activation_rule: dict) -> Optional[float]:
 
 
 def _passes_filters(symbol: str, r_dist: Optional[float], tp1_pct: Optional[float]) -> tuple[bool, str]:
-    if r_dist is None or tp1_pct is None:
-        return True, ""
+    # 口径对齐回测 scoring/aonly_filter_analysis.py:passes_filter：
+    #   - r_dist 算不出（act/inv level 缺）→ 拒绝（回测剔除，不再「None 即放行」）
+    #   - tp1_pct 缺只跳过 tp1 子句，r_dist 阈值照常判（不再整体放行）
+    #   - ETH 死区右开 [1.0, 2.0)，与回测一致（原 live 闭区间多排除了 2.0 这一点）
+    #   注：b2act >= 2 不在此层——finalizer 无 bar 流、算不出 b2act，由执行期
+    #   状态机 step_waiting 兜底（playbook_fsm），与回测 filter 逻辑等价。
+    if r_dist is None:
+        return False, "r_dist unavailable (act/inv level missing)"
     if symbol == "BTC/USDT":
         if r_dist < 0.5:
             return False, f"r_dist {r_dist:.3f}% < 0.5%"
-        if tp1_pct >= 1.5:
+        if tp1_pct is not None and tp1_pct >= 1.5:
             return False, f"tp1 {tp1_pct:.3f}% >= 1.5%"
     elif symbol == "ETH/USDT":
         if r_dist < 1.5:
             return False, f"r_dist {r_dist:.3f}% < 1.5%"
-        if 1.0 <= tp1_pct <= 2.0:
-            return False, f"tp1 {tp1_pct:.3f}% in dead zone 1–2%"
+        if tp1_pct is not None and 1.0 <= tp1_pct < 2.0:
+            return False, f"tp1 {tp1_pct:.3f}% in dead zone [1,2)%"
     elif symbol == "BNB/USDT":
         if not (0.3 <= r_dist <= 1.0):
             return False, f"r_dist {r_dist:.3f}% outside 0.3–1.0%"
