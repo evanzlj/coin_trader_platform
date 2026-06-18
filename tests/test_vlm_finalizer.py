@@ -141,7 +141,7 @@ class TestSuccessPath(_Base):
                 }
             }
         }]
-        _create_pending(self.tmp, symbol="ETH/USDT", bar_time="2026-06-15T06:00:00+00:00")
+        _create_pending(self.tmp, symbol="ETH/USDT", bar_time=_recent_iso(10))
         # incoming includes signal.json/state.json (should be ignored — B)
         extra = {"signal.json": '{"symbol":"SOL/USDT","grade":"A+"}',
                  "state.json": '{"overall_status":"OPENING"}'}
@@ -237,9 +237,26 @@ class TestSchemaValidation(_Base):
         self.make({"playbooks": [{"hypothesis": "TEST"}]})
         self.assertEqual(vf.process_one("btcusdt_a_20260601_0000"), "bad_schema")
 
-    def test_playbook_activation_rule_not_dict(self):
-        self.make({"playbooks": [{"hypothesis": "T", "conditional_trade_plan": {}}]})
+    def test_playbook_activation_rule_illegal_type(self):
+        # 非 dict 非 null（如 string）→ 仍 bad_schema
+        self.make({"playbooks": [{"hypothesis": "T",
+                                  "conditional_trade_plan": {"activation_rule": "oops"}}]})
         self.assertEqual(vf.process_one("btcusdt_a_20260601_0000"), "bad_schema")
+
+    def test_playbook_activation_rule_null_allowed(self):
+        # null activation_rule（no_trade/CHOP_WAIT 剧本）→ 不再 bad_schema；
+        # 单个 null pb 被 _filter_playbooks 跳过 → 无有效 pb → filtered（对齐回测）。
+        self.make({"playbooks": [{"hypothesis": "CHOP_WAIT",
+                                  "conditional_trade_plan": {"activation_rule": None}}]})
+        self.assertEqual(vf.process_one("btcusdt_a_20260601_0000"), "filtered")
+
+    def test_watch_summary_dict_accepted(self):
+        # prompt 模板已把 watch_summary 定义为结构化对象（dict）；带 one_sentence_read
+        # 的 dict 必须被接受，不能误判 bad_schema（实盘 ethusdt_A_20260617_1800 回归）。
+        self.make({"watch_summary": {"symbol": "BTC/USDT",
+                                     "one_sentence_read": "structural watch near resistance"}})
+        # schema 通过后走正常过滤路径，不应是 bad_schema
+        self.assertNotEqual(vf.process_one("btcusdt_a_20260601_0000"), "bad_schema")
 
     def test_bad_schema_no_exception_in_main_loop(self):
         """C: malformed response must NOT throw; it archives cleanly."""

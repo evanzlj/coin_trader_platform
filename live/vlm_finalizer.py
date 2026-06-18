@@ -167,9 +167,12 @@ def _validate_vlm_response(raw: Any) -> Optional[str]:
         plan = pb.get("conditional_trade_plan")
         if not isinstance(plan, dict):
             return f"playbook[{i}]_conditional_trade_plan_not_dict"
+        # activation_rule 允许 null —— no_trade/CHOP_WAIT 等剧本本就无激活规则。
+        # 与 _filter_playbooks 的 `if ar is None: continue` 跳过逻辑及回测 score_playbook
+        # （activation_rule is None → 早返回）一致；非 null 时才要求是 dict。
         ar = plan.get("activation_rule")
-        if not isinstance(ar, dict):
-            return f"playbook[{i}]_activation_rule_not_dict"
+        if ar is not None and not isinstance(ar, dict):
+            return f"playbook[{i}]_activation_rule_not_dict_or_null"
     return None
 
 
