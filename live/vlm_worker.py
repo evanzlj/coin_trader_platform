@@ -72,9 +72,20 @@ CDP_URL     = "http://127.0.0.1:18800"
 TIMEOUT     = 360
 MAX_RETRIES = 1
 POLL_SECONDS = 30
-STALE_SECONDS = 7200
 COOLDOWN_MIN = 90
 COOLDOWN_MAX = 120
+
+# Local stale gate — MUST be < finalizer's SIGNAL_MAX_AGE_MIN (240 min, the
+# authoritative gate on btc-ml). Previously hardcoded 7200s (2h), which was
+# STRICTER than the finalizer: a signal that took >2h to reach ChatGPT got
+# killed here even though the finalizer still accepted it for up to 4h. Because
+# signal_sync kept re-pulling the package, this caused the stale_bar_time
+# death loop. The 30-min buffer covers ChatGPT processing (up to ~6 min + retry)
+# plus the cross-border push, so we don't waste a ChatGPT call on something that
+# will be stale by the time the finalizer sees it.
+FINALIZER_MAX_AGE_MIN       = 240   # mirror of vlm_finalizer.SIGNAL_MAX_AGE_MIN
+STALE_PROCESSING_BUFFER_MIN = 30
+STALE_SECONDS = (FINALIZER_MAX_AGE_MIN - STALE_PROCESSING_BUFFER_MIN) * 60   # 210 min
 
 # ── ChatGPT UI 文案匹配（中英文兼容）─────────────────────────────────────────
 # 英文文案为常见推测；匹配不到只会回退到原有的 timeout 行为，不会更糟。

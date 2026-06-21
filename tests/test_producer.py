@@ -1116,5 +1116,54 @@ class TestDataSourceHealth(unittest.TestCase):
         self.assertIsNone(watchdog.check_data_source_health())
 
 
+# ── reap_stale_pending: source-side stale cleanup (death-loop fix) ─────────────
+
+class TestReapStalePending(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._orig_pending = monitor.VLM_PENDING
+        self._orig_rejected = monitor.VLM_REJECTED
+        monitor.VLM_PENDING = self.tmp / "vlm_pending"
+        monitor.VLM_REJECTED = self.tmp / "vlm_rejected"
+        monitor.VLM_PENDING.mkdir(parents=True)
+
+    def tearDown(self):
+        monitor.VLM_PENDING = self._orig_pending
+        monitor.VLM_REJECTED = self._orig_rejected
+
+    def _make_pkg(self, name, age_min):
+        d = monitor.VLM_PENDING / name
+        d.mkdir()
+        bt = pd.Timestamp.now("UTC") - pd.Timedelta(minutes=age_min)
+        (d / "signal.json").write_text(json.dumps({
+            "symbol": "BTC/USDT", "grade": "A", "bar_time": bt.isoformat(),
+        }), encoding="utf-8")
+        (d / ".ready").touch()
+        return d
+
+    def test_reaps_stale_package(self):
+        self._make_pkg("btcusdt_A_stale", age_min=300)   # > 240
+        reaped = monitor.reap_stale_pending()
+        self.assertEqual(reaped, 1)
+        self.assertFalse((monitor.VLM_PENDING / "btcusdt_A_stale").exists())
+        archived = monitor.VLM_REJECTED / "btcusdt_A_stale"
+        self.assertTrue(archived.exists())
+        self.assertIn("reaped_stale", (archived / "reject_reason.txt").read_text())
+
+    def test_keeps_fresh_package(self):
+        self._make_pkg("btcusdt_A_fresh", age_min=60)    # < 240
+        reaped = monitor.reap_stale_pending()
+        self.assertEqual(reaped, 0)
+        self.assertTrue((monitor.VLM_PENDING / "btcusdt_A_fresh").exists())
+
+    def test_unreadable_signal_left_alone(self):
+        d = monitor.VLM_PENDING / "btcusdt_A_bad"
+        d.mkdir()
+        (d / "signal.json").write_text("{not json", encoding="utf-8")
+        reaped = monitor.reap_stale_pending()
+        self.assertEqual(reaped, 0)
+        self.assertTrue(d.exists())   # finalizer judges it, not the reaper
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,7 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 POLL_INTERVAL        = 30    # seconds between new-bar checks
 SIGNAL_TTL_BARS      = 2     # discard signal_pending entries older than this many bars (30 min)
 BUFFER_SAVE_SECONDS  = 600   # F6: persist buffer state at most this often during operation
+SIGNAL_MAX_AGE_MIN   = 240   # mirror of vlm_finalizer.SIGNAL_MAX_AGE_MIN — reaper threshold
 
 # ── 所有 A 信号直接过 ChatGPT，不过滤结构宽度 ────────────────────────────────
 # 之前有一版用 structure_space 做前置过滤，但 structure_space != playbook r_dist。
@@ -316,6 +317,54 @@ def get_latest_bar_times() -> dict[str, pd.Timestamp | None]:
     late-arriving bar on ETH/BNB/SOL is not skipped just because BTC's cursor already
     advanced (F5)."""
     return {sym: _latest_for_symbol(sym) for sym in SYMBOLS}
+
+
+def reap_stale_pending() -> int:
+    """Archive vlm_pending packages whose bar_time exceeds the finalizer's max age.
+
+    Such a package can never produce a valid signal_active (the finalizer rejects
+    bar_time > SIGNAL_MAX_AGE_MIN as stale). But if it stays in vlm_pending,
+    signal_sync re-pulls it every cycle and the worker re-rejects it forever — a
+    stale_bar_time death loop. Reaping at the source (btc-ml, the producer that
+    owns vlm_pending) is the only place that stops the re-supply. Returns count.
+    """
+    if not VLM_PENDING.exists():
+        return 0
+    now = pd.Timestamp.now("UTC")
+    reaped = 0
+    for d in list(VLM_PENDING.iterdir()):
+        if not d.is_dir():
+            continue
+        sig_file = d / "signal.json"
+        if not sig_file.exists():
+            continue
+        try:
+            sig = json.loads(sig_file.read_text(encoding="utf-8"))
+            bt = pd.Timestamp(sig["bar_time"])
+            if bt.tzinfo is None:
+                bt = bt.tz_localize("UTC")
+        except Exception:
+            continue   # unreadable signal.json — leave it for the finalizer to judge
+        age_min = (now - bt).total_seconds() / 60
+        if age_min <= SIGNAL_MAX_AGE_MIN:
+            continue
+        VLM_REJECTED.mkdir(parents=True, exist_ok=True)
+        try:
+            (d / "reject_reason.txt").write_text(
+                f"reaped_stale age={age_min:.0f}min > {SIGNAL_MAX_AGE_MIN}min", encoding="utf-8")
+        except Exception:
+            pass
+        dest = VLM_REJECTED / d.name
+        if dest.exists():
+            dest = VLM_REJECTED / f"{d.name}__dup_{now.strftime('%Y%m%d_%H%M%S_%f')}"
+        try:
+            d.rename(dest)
+            logger.info("reaped stale vlm_pending: %s (age %.0fmin > %dmin)",
+                        d.name, age_min, SIGNAL_MAX_AGE_MIN)
+            reaped += 1
+        except Exception as e:
+            logger.warning("reap failed %s: %s", d.name, e)
+    return reaped
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -583,6 +632,14 @@ async def main() -> None:
             logger.exception("unexpected error in monitor cycle (consecutive %d): %s",
                              consecutive_failures, e)
             update_heartbeat()   # process is alive; status carries the failure
+
+        # Source-side cleanup: archive vlm_pending packages too old for the
+        # finalizer to ever accept. Stops the signal_sync re-pull death loop.
+        # Must never take down the loop — guard it.
+        try:
+            reap_stale_pending()
+        except Exception:
+            logger.exception("reap_stale_pending failed (non-fatal; loop continues)")
 
         try:
             backlog = sum(
