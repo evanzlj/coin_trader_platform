@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -65,14 +66,19 @@ def _hb(name: str) -> Path:
     return HEARTBEAT_DIR / f"{name}_last_run.txt"
 
 
-# 各机守本机进程（re-arch Phase 3: Windows = signal_sync + vlm_worker）。
-# executor 走 systemd 自动重启，其余告警（Windows 侧人工/Task Scheduler）。
+# 各机守本机进程（re-arch Phase 3: Windows/Mac = signal_sync + vlm_worker）。
+# executor 监控用 WATCH_EXECUTOR=1 gate——executor 未部署前不监控，避免每轮告警刷屏。
+# 部署 executor 时设 WATCH_EXECUTOR=1 打开。
+_WATCH_EXECUTOR = os.environ.get("WATCH_EXECUTOR", "") == "1"
+
 SPECS: dict[str, list[ProcSpec]] = {
-    "btcml": [
-        ProcSpec("executor",      _hb("executor"),      5.0, "coin-executor"),
-        ProcSpec("monitor",       _hb("monitor"),       20.0, None),
-        ProcSpec("vlm_finalizer", _hb("vlm_finalizer"), 20.0, None),
-    ],
+    "btcml": (
+        ([ProcSpec("executor", _hb("executor"), 5.0, "coin-executor")] if _WATCH_EXECUTOR else [])
+        + [
+            ProcSpec("monitor",       _hb("monitor"),       20.0, None),
+            ProcSpec("vlm_finalizer", _hb("vlm_finalizer"), 20.0, None),
+        ]
+    ),
     "china": [
         ProcSpec("signal_sync", _hb("signal_sync"), 10.0, None),
         ProcSpec("vlm_worker",  _hb("vlm_worker"),  20.0, None),
