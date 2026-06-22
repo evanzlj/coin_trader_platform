@@ -75,6 +75,14 @@ POLL_SECONDS = 30
 COOLDOWN_MIN = 90
 COOLDOWN_MAX = 120
 
+# Model/effort provenance (closes the "I forgot which tier" + silent-drift gap).
+# VLM_MODEL_LABEL is what YOU declare you've selected in the ChatGPT UI, e.g.
+# "gpt5-thinking-high". It's the source of truth and gets stamped into every
+# vlm_response.json. We also best-effort scrape the model-switcher text from the
+# page as a cross-check (model_ui_detected), so an accidental wrong selection
+# shows up in the record.
+VLM_MODEL_LABEL = os.environ.get("VLM_MODEL_LABEL", "unset")
+
 # Local stale gate — MUST be < finalizer's SIGNAL_MAX_AGE_MIN (240 min, the
 # authoritative gate on btc-ml). Previously hardcoded 7200s (2h), which was
 # STRICTER than the finalizer: a signal that took >2h to reach ChatGPT got
@@ -164,6 +172,27 @@ async def _send_message(page) -> bool:
             return True
         except Exception:
             return False
+
+
+async def _detect_model(page) -> str:
+    """Best-effort scrape of the model-switcher text from the ChatGPT UI.
+    Returns the visible model name (e.g. 'ChatGPT 5 Thinking') or 'unknown'.
+    UI-fragile by nature — never raises, just degrades to 'unknown'."""
+    selectors = [
+        'button[data-testid="model-switcher-dropdown-button"]',
+        'button[aria-label*="Model"]',
+        'button[aria-haspopup="menu"]',
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    return " ".join(txt.split())[:80]
+        except Exception:
+            continue
+    return "unknown"
 
 
 async def _screenshot(page, name: str) -> str:
@@ -352,6 +381,13 @@ async def process_one(page, pkg_dir: Path) -> dict:
                     continue
                 (pkg_dir / "_raw_response.txt").write_text(text, encoding="utf-8")
                 return {"dir": dir_name, "status": "parse_err"}
+            # Stamp model/effort provenance (declared label + best-effort UI scrape).
+            # Lets you audit which tier produced each playbook and detect silent drift.
+            parsed["_vlm_meta"] = {
+                "model_label": VLM_MODEL_LABEL,
+                "model_ui_detected": await _detect_model(page),
+                "recorded_at": pd.Timestamp.now("UTC").isoformat(),
+            }
             # Only write vlm_response.json (G5: NO state.json, NO signal.json)
             # Atomic write: tmp + os.replace so a crash mid-write never leaves a
             # half-JSON that cached path would accept but .ready would be missing.
