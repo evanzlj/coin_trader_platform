@@ -75,8 +75,8 @@ SPECS: dict[str, list[ProcSpec]] = {
     "btcml": (
         ([ProcSpec("executor", _hb("executor"), 5.0, "coin-executor")] if _WATCH_EXECUTOR else [])
         + [
-            ProcSpec("monitor",       _hb("monitor"),       20.0, None),
-            ProcSpec("vlm_finalizer", _hb("vlm_finalizer"), 20.0, None),
+            ProcSpec("monitor",   _hb("monitor"),   20.0, None),
+            ProcSpec("finalizer", _hb("finalizer"), 20.0, None),  # writes finalizer_last_run.txt
         ]
     ),
     "china": [
@@ -85,24 +85,25 @@ SPECS: dict[str, list[ProcSpec]] = {
     ],
 }
 
-# Functional-health status specs (re-arch Phase 3). Watchdog alerts on stale
-# status or breached thresholds: SSH failures, backlog, parse errors, rejects.
+# Functional-health status specs (re-arch Phase 3).
+# IMPORTANT: only threshold on RESETTING metrics (consecutive_failures) or current
+# GAUGES (backlog_count). Cumulative lifetime counters (filtered/bad_schema/
+# parse_err/stale/move_failed/package_write_failures) must NOT have absolute
+# thresholds — they only grow, so a threshold becomes a permanent false alert
+# once normal operation crosses it (e.g. filtered>10 is healthy). Liveness for
+# those processes is covered by max_stale_min (status stops updating = real problem).
 STATUS_SPECS: dict[str, list[StatusSpec]] = {
     "btcml": [
-        StatusSpec("monitor",       HEARTBEAT_DIR / "monitor_status.json",
-                   (("consecutive_failures", 3), ("backlog_count", 10),
-                    ("package_write_failures", 3)), max_stale_min=5.0),
-        StatusSpec("vlm_finalizer", HEARTBEAT_DIR / "finalizer_status.json",
-                   (("bad_schema", 5), ("filtered", 10), ("move_failed", 3)),
-                   max_stale_min=5.0),
+        StatusSpec("monitor",   HEARTBEAT_DIR / "monitor_status.json",
+                   (("consecutive_failures", 3), ("backlog_count", 10)), max_stale_min=5.0),
+        StatusSpec("finalizer", HEARTBEAT_DIR / "finalizer_status.json",
+                   (), max_stale_min=5.0),
     ],
     "china": [
         StatusSpec("signal_sync", HEARTBEAT_DIR / "signal_sync_status.json",
-                   (("consecutive_failures", 3), ("backlog_count", 5)),
-                   max_stale_min=5.0),
+                   (("consecutive_failures", 3), ("backlog_count", 5)), max_stale_min=5.0),
         StatusSpec("vlm_worker", HEARTBEAT_DIR / "vlm_worker_status.json",
-                   (("consecutive_failures", 3), ("parse_err", 5),
-                    ("stale", 5)), max_stale_min=25.0),
+                   (("consecutive_failures", 3),), max_stale_min=25.0),
     ],
 }
 
