@@ -62,10 +62,11 @@ def _write_bars(data_dir: Path, slug: str, bars: list[tuple], t0: pd.Timestamp):
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self._olds = {k: getattr(st, k) for k in ("SIGNAL_ACTIVE", "DATA_DIR", "STATE_FILE", "HEARTBEAT")}
+        self._olds = {k: getattr(st, k) for k in ("SIGNAL_ACTIVE", "DATA_DIR", "STATE_FILE", "LEDGER_FILE", "HEARTBEAT")}
         st.SIGNAL_ACTIVE = self.tmp / "signal_active"
         st.DATA_DIR = self.tmp / "data"
         st.STATE_FILE = self.tmp / "shadow_state.json"
+        st.LEDGER_FILE = self.tmp / "shadow_ledger.jsonl"
         st.HEARTBEAT = self.tmp / "hb.txt"
         st.SIGNAL_ACTIVE.mkdir(parents=True)
         self.pushed = []
@@ -103,6 +104,26 @@ class TestShadowTracker(_Base):
         state = json.loads(st.STATE_FILE.read_text(encoding="utf-8"))
         # CHOP_WAIT(activation_rule=None) 不应进 state
         self.assertNotIn("btcusdt_A_test::CHOP_WAIT", state)
+
+    def test_ledger_and_report(self):
+        _write_signal(st.SIGNAL_ACTIVE, "btcusdt_A_test")
+        t0 = pd.Timestamp("2026-06-01T00:00:00+00:00")
+        _write_bars(st.DATA_DIR, "btcusdt", [
+            (15, 100.5, 99.0, 99.5), (30, 99.0, 97.0, 97.5),
+            (45, 96.0, 94.5, 95.0), (60, 93.0, 91.5, 92.0),
+        ], t0)
+        st.scan_once()
+        # 台账应有一条终态记录
+        self.assertTrue(st.LEDGER_FILE.exists())
+        lines = [l for l in st.LEDGER_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertEqual(rec["phase"], "tp2")
+        self.assertEqual(rec["struct_r"], 2.0)
+        # report 能汇总
+        rpt = st.report()
+        self.assertIn("影子绩效", rpt)
+        self.assertIn("TP2=1", rpt)
 
     def test_terminal_not_repushed(self):
         _write_signal(st.SIGNAL_ACTIVE, "btcusdt_A_test")

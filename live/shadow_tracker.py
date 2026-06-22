@@ -46,6 +46,7 @@ logger = logging.getLogger("shadow_tracker")
 SIGNAL_ACTIVE = Path(os.environ.get("SIGNAL_ACTIVE", str(ROOT / "signal_active")))
 DATA_DIR      = Path(os.environ.get("SHADOW_DATA_DIR", str(ROOT / "history_data_manager" / "data")))
 STATE_FILE    = ROOT / "live" / "state" / "shadow_tracker_state.json"
+LEDGER_FILE   = ROOT / "live" / "state" / "shadow_ledger.jsonl"   # 每个终态一条,供绩效汇总
 HEARTBEAT     = ROOT / "live" / "heartbeat" / "shadow_tracker_last_run.txt"
 LOCK_FILE     = ROOT / "live" / "shadow_tracker.lock"
 POLL_SECONDS  = 300
@@ -62,21 +63,29 @@ def _phase(score) -> str:
         return "stopped"          # 激活后被 SL
     if score.result == RESULT_TP1_TP2_HIT:
         return "tp2"
-    if score.result in (RESULT_TP1_HIT, RESULT_TP1_UNRESOLVED):
-        return "tp1"
+    if score.result == RESULT_TP1_HIT:
+        return "tp1_final"        # TP1 命中后止损/无 TP2（终态）
+    if score.result == RESULT_TP1_UNRESOLVED:
+        return "tp1_running"      # TP1 命中，TP2 未决（仍在跑）
     return "activated"            # 已激活，尚无终态
 
 
-_TERMINAL = {"tp2", "stopped", "cancelled"}
+# 终态相位（写台账 + 停止追踪）
+_TERMINAL = {"tp2", "stopped", "cancelled", "tp1_final"}
 
 # 相位 → 流水文案
 _EMOJI = {
-    "activated": "🎯 激活",
-    "tp1":       "🟢 TP1 命中",
-    "tp2":       "🟢🟢 TP1+TP2 命中",
-    "stopped":   "🔴 SL 止损",
-    "cancelled": "⚪ 激活前取消",
+    "activated":   "🎯 激活",
+    "tp1_running": "🟢 TP1 命中(TP2 未决)",
+    "tp1_final":   "🟢 TP1 命中(终)",
+    "tp2":         "🟢🟢 TP1+TP2 命中",
+    "stopped":     "🔴 SL 止损",
+    "cancelled":   "⚪ 激活前取消",
 }
+
+# 终态 → 结构 R（粗口径：SL=-1, TP1=+1, TP2=+2;非交易=0。
+# 注意:这不是精确的 S3+成本 R——入场用收盘代理,仅供看走向/胜率,不当真实盈亏）
+_STRUCT_R = {"stopped": -1.0, "tp1_final": 1.0, "tp2": 2.0, "cancelled": 0.0}
 
 
 # ── K 线加载 ───────────────────────────────────────────────────────────────────
@@ -113,6 +122,57 @@ def _save_state(state: dict) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, STATE_FILE)
+
+
+def _append_ledger(rec: dict) -> None:
+    LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(LEDGER_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("ledger append failed: %s", e)
+
+
+def report() -> str:
+    """读台账,汇总影子绩效。返回可打印文本。"""
+    if not LEDGER_FILE.exists():
+        return "影子台账为空（还没有信号走到终态）。"
+    recs = []
+    for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                pass
+    if not recs:
+        return "影子台账为空。"
+
+    def _summ(rows: list) -> str:
+        n = len(rows)
+        tp2 = sum(1 for r in rows if r["phase"] == "tp2")
+        tp1 = sum(1 for r in rows if r["phase"] == "tp1_final")
+        sl  = sum(1 for r in rows if r["phase"] == "stopped")
+        can = sum(1 for r in rows if r["phase"] == "cancelled")
+        activated = n - can                       # cancelled = 激活前取消
+        wins = tp1 + tp2
+        total_r = sum(r.get("struct_r", 0.0) for r in rows)
+        wr = (wins / activated * 100) if activated else 0.0
+        exp = (total_r / activated) if activated else 0.0
+        return (f"n={n} 激活={activated} (取消{can}) | TP2={tp2} TP1={tp1} SL={sl} | "
+                f"胜率={wr:.0f}% | 结构R合计={total_r:+.1f} 期望={exp:+.2f}R/笔")
+
+    lines = ["=== 影子绩效（结构 R 粗口径，非真实盈亏）===",
+             "总体: " + _summ(recs), "", "按品种:"]
+    syms = sorted({r["symbol"] for r in recs})
+    for s in syms:
+        lines.append(f"  {s:10s}: " + _summ([r for r in recs if r["symbol"] == s]))
+    lines.append("")
+    lines.append("最近 10 条:")
+    for r in recs[-10:]:
+        lines.append(f"  {r.get('bar_time','?')[:16]} {r['symbol']} {r['hypothesis']} "
+                     f"→ {r['phase']} ({r.get('struct_r',0):+.0f}R)")
+    return "\n".join(lines)
 
 
 def _flow(message: str) -> None:
@@ -177,6 +237,20 @@ def scan_once() -> int:
                 label = _EMOJI.get(new_phase, new_phase)
                 _flow(f"{label} {symbol} {hyp}")
                 pushed += 1
+                # 进入终态 → 写台账(供绩效汇总),每个 key 只写一次
+                if new_phase in _TERMINAL:
+                    _append_ledger({
+                        "ts": pd.Timestamp.now("UTC").isoformat(),
+                        "pkg": pkg.name, "symbol": symbol, "hypothesis": hyp,
+                        "phase": new_phase, "result": score.result,
+                        "struct_r": _STRUCT_R.get(new_phase, 0.0),
+                        "r_distance": score.r_distance,
+                        "mfe_r": score.mfe_r, "mae_r": score.mae_r,
+                        "bars_to_activation": score.bars_to_activation,
+                        "bars_to_tp1": score.bars_to_tp1,
+                        "bars_to_invalidation": score.bars_to_invalidation,
+                        "bar_time": bar_time,
+                    })
             state[key] = new_phase
 
     _save_state(state)
@@ -195,16 +269,23 @@ def main() -> None:
     from live.single_instance import SingleInstance, AlreadyRunning
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%Y-%m-%dT%H:%M:%S")
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--report", action="store_true", help="打印影子绩效汇总后退出")
+    args = ap.parse_args()
+
+    # --report 只读，不抢锁——常驻进程跑着时也能随时看绩效
+    if args.report:
+        print(report())
+        return
+
     try:
         _lock = SingleInstance(LOCK_FILE)
         _lock.acquire()
     except AlreadyRunning as e:
         logger.error("shadow_tracker already running: %s", e)
         sys.exit(1)
-
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--once", action="store_true")
-    args = ap.parse_args()
 
     logger.info("shadow_tracker started — watching %s (read-only, no broker)", SIGNAL_ACTIVE)
     while True:
