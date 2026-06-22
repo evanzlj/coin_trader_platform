@@ -36,6 +36,24 @@ def feishu_alert(message: str) -> None:
         logger.warning("feishu post failed: %s", e)
 
 
+def flow_event(message: str) -> None:
+    """业务流水推送（信号出现 / finalizer 结论 / executor 里程碑）。
+    走 FLOW_WEBHOOK（默认回退到 FEISHU_WEBHOOK）。失败只记日志，绝不影响主流程。
+    message 自带 emoji 前缀（📡/✅/🚫…），不加 [executor] 前缀以便和报警区分。"""
+    logger.info("FLOW: %s", message)
+    url = cfg.FLOW_WEBHOOK
+    if not url or requests is None:
+        return
+    try:
+        requests.post(
+            url,
+            json={"msg_type": "text", "content": {"text": message}},
+            timeout=5,
+        )
+    except Exception as e:                 # noqa: BLE001 — 流水推送失败不可影响主流程
+        logger.warning("flow post failed: %s", e)
+
+
 def trade_log(event: str, **fields) -> None:
     rec = {"ts": pd.Timestamp.now("UTC").isoformat(), "event": event, **fields}
     try:

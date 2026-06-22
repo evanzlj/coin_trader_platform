@@ -147,6 +147,15 @@ def _archive_both(incoming: Path, pending: "Optional[Path]",
         _archive_package(pending, dst_dir, f"{reason}__pending")
 
 
+def _flow(message: str) -> None:
+    """业务流水推送，永不抛——流水失败绝不能影响 finalizer 主流程。"""
+    try:
+        from live import notify
+        notify.flow_event(message)
+    except Exception as e:
+        logger.warning("flow_event failed (non-fatal): %s", e)
+
+
 # ── Schema validation (C) ─────────────────────────────────────────────────────
 
 def _validate_vlm_response(raw: Any) -> Optional[str]:
@@ -342,6 +351,7 @@ def process_one(pkg_name: str) -> str:
     schema_err = _validate_vlm_response(raw)
     if schema_err is not None:
         _archive_both(done_pkg, pending_pkg, VLM_REJECTED, f"bad_schema:{schema_err}")
+        _flow(f"⚠️ {pkg_name} ChatGPT 返回不合格: {schema_err}")
         return "bad_schema"
 
     vlm: dict = raw  # validated
@@ -361,6 +371,7 @@ def process_one(pkg_name: str) -> str:
             if age > SIGNAL_MAX_AGE_MIN:
                 _archive_both(done_pkg, pending_pkg, VLM_REJECTED,
                               f"stale_bar_time age={age:.0f}min > {SIGNAL_MAX_AGE_MIN}min")
+                _flow(f"🕒 {signal.get('symbol', pkg_name)} 信号过期 {age:.0f}min,跳过")
                 return "stale"
         except Exception:
             pass
@@ -369,6 +380,7 @@ def process_one(pkg_name: str) -> str:
     valid_pbs = _filter_playbooks(signal, vlm)
     if not valid_pbs:
         _archive_both(done_pkg, pending_pkg, VLM_REJECTED, "filtered_no_valid_playbooks")
+        _flow(f"🚫 {signal.get('symbol', pkg_name)} 拒绝: 无合格剧本(r_dist/死区过滤)")
         return "filtered"
 
     # ── 7. 全量通过：btc-ml 本地构建信号包（A）─────────────────────────────
@@ -406,6 +418,9 @@ def process_one(pkg_name: str) -> str:
     _archive_package(pending_pkg, VLM_PENDING_DONE, "moved_pending")
 
     logger.info("signal_active/%s .ready + state.json — %d playbooks", pkg_name, len(valid_pbs))
+    hyps = ",".join(pb.get("hypothesis", "?") for pb in valid_pbs)
+    _flow(f"✅ {signal.get('symbol', pkg_name)} {signal.get('grade','')} 通过 → signal_active, "
+          f"{len(valid_pbs)} 剧本 [{hyps}]")
     return "moved"
 
 

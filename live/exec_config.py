@@ -69,14 +69,14 @@ OHLCV_DB = Path(os.environ.get(
     "/home/evan/repo/ai_crypto_analyst/data/ai_crypto_analyst.db",
 ))
 
-# ── 告警（§10.3, §13）───────────────────────────────────────────────────────
-# webhook 来源优先级：env FEISHU_WEBHOOK > 文件 live/feishu_webhook.txt（gitignored）。
+# ── 告警 / 业务流水（§10.3, §13）─────────────────────────────────────────────
+# webhook 来源优先级：env > 文件 live/{name}.txt（gitignored）。
 # 文件方式让 launchd / nohup 不必把 secret 写进 plist，且各机本地保管、不入库。
-def _load_feishu_webhook() -> str:
-    env = os.environ.get("FEISHU_WEBHOOK", "").strip()
+def _load_webhook(env_name: str, filename: str) -> str:
+    env = os.environ.get(env_name, "").strip()
     if env:
         return env
-    f = Path(__file__).parent / "feishu_webhook.txt"
+    f = Path(__file__).parent / filename
     try:
         if f.exists():
             return f.read_text(encoding="utf-8").strip()
@@ -84,7 +84,11 @@ def _load_feishu_webhook() -> str:
         pass
     return ""
 
-FEISHU_WEBHOOK = _load_feishu_webhook()
+# 报警（something 坏了）
+FEISHU_WEBHOOK = _load_webhook("FEISHU_WEBHOOK", "feishu_webhook.txt")
+# 业务流水（信号出现 / finalizer 结论 / 后续 executor 里程碑）。独立 webhook，
+# 想分群就配 COIN_FLOW_WEBHOOK；不配则回退到报警 webhook，混在同群里。
+FLOW_WEBHOOK = _load_webhook("COIN_FLOW_WEBHOOK", "flow_webhook.txt") or FEISHU_WEBHOOK
 
 # ── 交易所 base url / 模拟盘开关（ENV 切换，§19）──────────────────────────────
 BINANCE_BASE = {

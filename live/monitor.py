@@ -603,6 +603,15 @@ async def main() -> None:
                     if write_vlm_pending(sig) is None:
                         package_write_failures += 1
                         last_error = f"package write failed: {sig.symbol} {sig.grade} {sig.bar_time}"
+                    else:
+                        try:
+                            from live import notify
+                            notify.flow_event(
+                                f"📡 新信号 {sig.symbol} {sig.grade} {sig.structure_side} "
+                                f"@ {sig.close} (space={sig.structure_space:.1f} "
+                                f"pos={sig.position_in_structure:.2f})")
+                        except Exception as fe:
+                            logger.warning("flow_event failed (non-fatal): %s", fe)
 
                 save_dedup_state(gen, cursors=cursors)
 
