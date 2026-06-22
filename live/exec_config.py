@@ -70,7 +70,21 @@ OHLCV_DB = Path(os.environ.get(
 ))
 
 # ── 告警（§10.3, §13）───────────────────────────────────────────────────────
-FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "")   # 从 env 注入，不硬编码
+# webhook 来源优先级：env FEISHU_WEBHOOK > 文件 live/feishu_webhook.txt（gitignored）。
+# 文件方式让 launchd / nohup 不必把 secret 写进 plist，且各机本地保管、不入库。
+def _load_feishu_webhook() -> str:
+    env = os.environ.get("FEISHU_WEBHOOK", "").strip()
+    if env:
+        return env
+    f = Path(__file__).parent / "feishu_webhook.txt"
+    try:
+        if f.exists():
+            return f.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+FEISHU_WEBHOOK = _load_feishu_webhook()
 
 # ── 交易所 base url / 模拟盘开关（ENV 切换，§19）──────────────────────────────
 BINANCE_BASE = {
