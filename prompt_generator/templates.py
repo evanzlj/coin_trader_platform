@@ -329,6 +329,30 @@ The first top-level field MUST be a_plus_impulse_assessment:
 image: attached image"""
 
 
+# A+ 用完整 schema（含 a_plus_impulse_assessment 首字段，A+ 冲动评估）。
+# A-only 不是 A+ 冲动信号，其 system 段要求首字段为 watch_summary——故从共用 schema
+# 派生 A-only 版：去掉 a_plus_impulse_assessment 块 + 首字段改 watch_summary，
+# 消除「system 说 watch_summary 第一 / schema 说 a_plus 第一」的矛盾。A+ 保持不变。
+_APLUS_IMPULSE_BLOCK = """\
+  "a_plus_impulse_assessment": {
+    "impulse_phase": "EARLY_ACCEPTANCE | LATE_EXTENSION | CLIMAX_TRAP | AMBIGUOUS",
+    "distance_from_structure": "near | moderate | extended | unknown",
+    "acceptance_state_at_T0": "not_validated | partially_validated | rejected | unknown",
+    "visible_cvd_read": "",
+    "cvd_price_relationship": "confirming | diverging | mixed | unknown",
+    "post_T0_flow_filter_note": "",
+    "classification_reason": ""
+  },
+"""
+
+_AONLY_CHART_SECTION = (
+    _USER_CHART_SECTION
+    .replace("The first top-level field MUST be a_plus_impulse_assessment:",
+             "The first top-level field MUST be watch_summary:")
+    .replace(_APLUS_IMPULSE_BLOCK, "")
+)
+
+
 def get_system(grade: str) -> str:
     """Return system prompt for given grade ('A+' or 'A')."""
     lead = _SYSTEM_APLUS if grade == "A+" else _SYSTEM_AONLY
@@ -336,9 +360,12 @@ def get_system(grade: str) -> str:
 
 
 def get_user_chart_section(symbol: str, signal_type: str) -> str:
-    """Return the static chart/schema section with symbol and signal_type filled in."""
+    """Return the static chart/schema section with symbol and signal_type filled in.
+    A+ keeps the a_plus_impulse_assessment-first schema; A-only uses the derived
+    schema that leads with watch_summary (no a_plus block)."""
+    section = _USER_CHART_SECTION if signal_type == "A+" else _AONLY_CHART_SECTION
     return (
-        _USER_CHART_SECTION
+        section
         .replace("{symbol}", symbol)
         .replace("{signal_type}", signal_type)
     )
