@@ -19,6 +19,11 @@ ROOT = Path(__file__).parent.parent
 # ── 环境 ────────────────────────────────────────────────────────────────────
 ENV = os.environ.get("EXECUTOR_ENV", "testnet")   # "testnet" | "live"
 
+# 只在这些交易所建账户/Broker（即使 keys 里有更多）。默认两所；
+# EXECUTOR_EXCHANGES=okx → 纯 OKX（如 Binance testnet 行情失真时只跑 OKX demo）。
+EXCHANGES = {s.strip().lower() for s in
+             os.environ.get("EXECUTOR_EXCHANGES", "binance,okx").split(",") if s.strip()}
+
 # ── 品种与仓位（§7）──────────────────────────────────────────────────────────
 SYMBOLS        = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 ONE_R_USDT     = 10

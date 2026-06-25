@@ -33,6 +33,8 @@ def build_accounts(keys: dict) -> list[Account]:
     """从 keys（keys_loader.load_keys 的结果）构建账户列表。"""
     accounts: list[Account] = []
     for ex in ("binance", "okx"):
+        if ex not in cfg.EXCHANGES:
+            continue                    # 该所被 EXECUTOR_EXCHANGES 关闭
         for a in keys.get(ex, []):
             accounts.append(Account(a["label"], ex, cfg.CAPITAL_PER_ACCOUNT))
     return accounts

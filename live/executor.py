@@ -340,15 +340,17 @@ class ExecutorEngine:
 def build_brokers(keys: dict) -> dict[str, Broker]:
     """按 keys 构建每账户 Broker（binance→BinanceBroker, okx→OKXBroker）。
     交易所 SDK 延迟到此 import（Mac 开发机未装，不影响 import executor / 跑单测）。"""
-    from live.broker.binance import BinanceBroker
-    from live.broker.okx import OKXBroker
     brokers: dict[str, Broker] = {}
-    for a in keys["binance"]:
-        brokers[a["label"]] = BinanceBroker(a["label"], a["api_key"], a["secret"],
-                                            cfg.binance_base_url())
-    for a in keys["okx"]:
-        brokers[a["label"]] = OKXBroker(a["label"], a["api_key"], a["secret"],
-                                        a["passphrase"], cfg.okx_simulated_flag())
+    if "binance" in cfg.EXCHANGES and keys.get("binance"):
+        from live.broker.binance import BinanceBroker
+        for a in keys["binance"]:
+            brokers[a["label"]] = BinanceBroker(a["label"], a["api_key"], a["secret"],
+                                                cfg.binance_base_url())
+    if "okx" in cfg.EXCHANGES and keys.get("okx"):
+        from live.broker.okx import OKXBroker
+        for a in keys["okx"]:
+            brokers[a["label"]] = OKXBroker(a["label"], a["api_key"], a["secret"],
+                                            a["passphrase"], cfg.okx_simulated_flag())
     return brokers
 
 
