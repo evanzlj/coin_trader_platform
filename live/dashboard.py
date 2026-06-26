@@ -13,7 +13,7 @@
 跑：python3 -m live.dashboard   （或 systemd user service coin-dashboard）
 """
 from __future__ import annotations
-import json, glob, os, sqlite3, html
+import json, glob, os, sqlite3, html, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
@@ -143,9 +143,9 @@ def build_state():
         "by_result": {k: sum(1 for c in closed if c["result"]==k) for k in ("tp2","be","sl")},
     }
 
-    # 健康
+    # 健康：有心跳文件的看心跳新鲜度；watchdog 不写心跳 → 查 systemd
     health = {}
-    for name in ("executor","watchdog","monitor","finalizer","shadow_tracker"):
+    for name in ("executor","monitor","finalizer","shadow_tracker"):
         f = HEARTBEAT_DIR / f"{name}_last_run.txt"
         try:
             ts = datetime.fromisoformat(f.read_text().strip())
@@ -153,6 +153,12 @@ def build_state():
             health[name] = {"age_min": round(age,1), "ok": age < 10}
         except Exception:
             health[name] = {"age_min": None, "ok": False}
+    try:
+        r = subprocess.run(["systemctl","--user","is-active","coin-watchdog"],
+                           capture_output=True, text=True, timeout=3)
+        health["watchdog"] = {"age_min": None, "ok": r.stdout.strip() == "active"}
+    except Exception:
+        health["watchdog"] = {"age_min": None, "ok": False}
 
     # 最近事件
     events = []
@@ -207,7 +213,7 @@ async function tick(){
  document.getElementById('score').innerHTML=
    `战报: <b>${S.total_r>=0?'+':''}${S.total_r}R</b> · ${S.wins}胜${S.losses}负 (${S.winrate}%) · TP2:${S.by_result.tp2} 保本:${S.by_result.be} 止损:${S.by_result.sl}`;
  document.getElementById('health').innerHTML='服务: '+Object.entries(s.health).map(([k,v])=>
-   `<span class=${v.ok?'ok':'bad'}>${k}${v.age_min==null?'✗':''}</span>`).join(' ');
+   `<span class=${v.ok?'ok':'bad'}>${k}${v.ok?'':'✗'}</span>`).join(' ');
  document.getElementById('upd').textContent='· '+s.now+' (5s刷新)';
  let h='';
  // 进行中

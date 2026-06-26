@@ -1,0 +1,21 @@
+# coin_trader dashboard — systemd **user** service（btc-ml / 新加坡）
+# 只读交易面板，绑 127.0.0.1:8080，经 SSH 隧道访问。不碰交易代码。
+#
+#   ~/.config/systemd/user/coin-dashboard.service  →  systemctl --user enable --now coin-dashboard
+#   访问：ssh -L 8080:localhost:8080 btc-ml  然后本地浏览器 http://localhost:8080
+#
+[Unit]
+Description=coin_trader read-only dashboard (localhost only)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/evan/repo/coin_trader_platform
+Environment=DASHBOARD_PORT=8080
+EnvironmentFile=-/home/evan/.config/coin_trader/executor.env
+ExecStart=/usr/bin/python3 -m live.dashboard
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
