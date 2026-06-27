@@ -1,0 +1,21 @@
+# coin_trader 本地 VLM worker — systemd user service(btc-ml)
+# 无头 codex(ChatGPT 订阅)读图出 playbook JSON,取代 Mini 浏览器 vlm_worker + signal_sync。
+# 装:cp 到 ~/.config/systemd/user/ → systemctl --user enable --now coin-vlm-local
+# 注意:PATH 里的 node 版本路径按 btc-ml 实际 nvm 版本填(当前 v20.20.2);codex 认证在 ~/.codex/auth.json
+[Unit]
+Description=coin_trader local VLM worker (codex, headless, no browser)
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/evan/repo/coin_trader_platform
+Environment=PATH=/home/evan/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
+Environment=VLM_BACKEND=codex
+ExecStart=/usr/bin/python3 -m live.vlm_local_worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
