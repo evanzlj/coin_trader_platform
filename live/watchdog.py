@@ -77,6 +77,9 @@ SPECS: dict[str, list[ProcSpec]] = {
         + [
             ProcSpec("monitor",   _hb("monitor"),   20.0, None),
             ProcSpec("finalizer", _hb("finalizer"), 20.0, None),  # writes finalizer_last_run.txt
+            # 本地无头 VLM(codex/gemini);15min 容忍一次慢调用(gemini Pro + 503 重试)。
+            # 仅告警(unit=None),不自动 kill——避免误杀正在跑的合法慢调用;进程死由 systemd Restart 兜。
+            ProcSpec("vlm_local_worker", _hb("vlm_local_worker"), 15.0, None),
         ]
     ),
     "china": [
@@ -98,6 +101,9 @@ STATUS_SPECS: dict[str, list[StatusSpec]] = {
                    (("consecutive_failures", 3), ("backlog_count", 10)), max_stale_min=5.0),
         StatusSpec("finalizer", HEARTBEAT_DIR / "finalizer_status.json",
                    (), max_stale_min=5.0),
+        # 无头 VLM:连续 3 次读图失败(如 gemini 持续 503)或状态停更 15min → 告警。
+        StatusSpec("vlm_local_worker", HEARTBEAT_DIR / "vlm_local_worker_status.json",
+                   (("consecutive_failures", 3),), max_stale_min=15.0),
     ],
     "china": [
         StatusSpec("signal_sync", HEARTBEAT_DIR / "signal_sync_status.json",
