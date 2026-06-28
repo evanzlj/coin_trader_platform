@@ -135,47 +135,28 @@ def draw_15m_detail(
     for ax in (ax_main, ax_imb, ax_vcf):
         ax.axvline(n - 1, color=T0_COL, lw=0.9, ls="--", alpha=0.45)
 
-    # ── Right-axis NUMERIC labels at T0 ───────────────────────────────────────
-    # 精确价位标注:每条结构线在右边缘标出 T0 时刻的精确数值,
-    # 让 VLM 读数字而非在 Y 轴格线间插值目测(消除 approx_visual 方差)。
-    def _fmt(v):
-        if v >= 1000: return f"{v:,.0f}"
-        if v >= 100:  return f"{v:.1f}"
-        return f"{v:.2f}"
-
-    def _last_valid(arr):
-        m = ~np.isnan(arr)
-        return arr[m][-1] if m.any() else np.nan
-
-    # 收集所有右边缘标签,按价位排序后做垂直防重叠(线靠近时把文字推开,文字仍显原值)
-    labels = []  # [orig_value, name, color, fontsize]
-    def _add(y, name, color, fontsize=7.5):
-        if y is not None and not np.isnan(y):
-            labels.append([float(y), name, color, fontsize])
-
-    _add(_last_valid(struct_resist), "4H R", RES_COL)
-    _add(_last_valid(struct_supp),   "4H S", SUP_COL)
-    if not np.isnan(qrc_upper[-1]):
-        _add(qrc_upper[-1], "QRC U",   QRC_U)
-        _add(qrc_mid[-1],   "QRC MID", QRC_M)
-        _add(qrc_lower[-1], "QRC L",   QRC_L)
-    _add(_last_valid(ma20), "MA20", MA_COL)
-    _add(c[-1], f"{signal.grade} T0", T0_COL, 8)
-
-    # 防重叠:按 y 排序,相邻不足 gap 就上推(画的位置变,显示的数值不变)
-    # gap 用真实坐标轴可见范围(含结构线撑大的部分),否则低价币会算太小、文字仍重叠
-    ylo, yhi = ax_main.get_ylim()
-    gap = (yhi - ylo) * 0.025
-    labels.sort(key=lambda r: r[0])
-    draw_y = [labels[0][0]] if labels else []
-    for i in range(1, len(labels)):
-        draw_y.append(max(labels[i][0], draw_y[i - 1] + gap))
-    for (val, name, color, fs), dy in zip(labels, draw_y):
+    # ── Right-axis labels at T0 ───────────────────────────────────────────────
+    def _rlabel(y, text, color, fontsize=7.5):
         ax_main.annotate(
-            f"{name} {_fmt(val)}", xy=(1.002, dy),
+            text, xy=(1.002, y),
             xycoords=ax_main.get_yaxis_transform(),
-            color=color, fontsize=fs, va="center", ha="left", clip_on=False,
+            color=color, fontsize=fontsize, va="center", ha="left",
+            clip_on=False,
         )
+
+    if not np.isnan(qrc_upper[-1]):
+        _rlabel(qrc_upper[-1], "QRC U",   QRC_U)
+        _rlabel(qrc_mid[-1],   "QRC MID", QRC_M)
+        _rlabel(qrc_lower[-1], "QRC L",   QRC_L)
+
+    # Signal marker label — right of the T0 dashed line, outside plot area
+    ax_main.annotate(
+        f"{signal.grade} Signal ↑ T0",
+        xy=(1.002, h[-1]),
+        xycoords=ax_main.get_yaxis_transform(),
+        color=T0_COL, fontsize=8, va="bottom", ha="left",
+        clip_on=False,
+    )
 
     # ── Legend ────────────────────────────────────────────────────────────────
     legend_handles = [
