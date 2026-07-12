@@ -39,6 +39,11 @@ _ALGO_STATE = {
     "EXPIRED": OrderState.EXPIRED, "REJECTED": OrderState.REJECTED,
 }
 
+# 尘埃残仓阈值：与 okx.py 对齐。净仓多次进出后留 sub-$ 舍入残渣时，SL/BE 终态判定
+# （position_manager 靠 get_position() is None）会被永久卡住 → state 冻结 + 幽灵浮亏。
+# 低于此 notional 视作已平（flat）。真实仓 notional 恒 >$100（margin×lev），不会误伤。
+DUST_NOTIONAL_USD = 5.0
+
 
 def _sym(symbol: str) -> str:
     return symbol.replace("/", "")
@@ -98,9 +103,15 @@ class BinanceBroker(Broker):
         for r in risks:
             if r.get("positionSide") == pos_side.value:
                 amt = float(r.get("positionAmt") or 0)
-                if abs(amt) > 1e-12:
-                    return Position(symbol, pos_side, abs(amt),
-                                    float(r.get("entryPrice") or 0), raw=r)
+                if abs(amt) <= 1e-12:
+                    continue
+                notional = abs(float(r.get("notional") or 0))
+                if not notional:                       # 无 notional 字段 → 自算兜底
+                    notional = abs(amt) * float(r.get("markPrice") or 0)
+                if notional and notional < DUST_NOTIONAL_USD:
+                    continue                            # 尘埃残仓 → 当作无仓（与 okx.py 对齐）
+                return Position(symbol, pos_side, abs(amt),
+                                float(r.get("entryPrice") or 0), raw=r)
         return None
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,

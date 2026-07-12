@@ -1,6 +1,6 @@
-"""OKXBroker.get_position 尘埃残仓过滤回归测试（DUST_NOTIONAL_USD）。
+"""Broker.get_position 尘埃残仓过滤回归测试（DUST_NOTIONAL_USD，okx + binance 对齐）。
 
-背景：OKX 对冲净仓多次进出后会留 sub-$ 舍入残渣（如 0.01 张，其量 == minSz，size 阈值区分不了），
+背景：净仓多次进出后会留 sub-$ 舍入残渣（OKX 如 0.01 张，其量 == minSz，size 阈值区分不了），
     导致 position_manager 的 SL/BE 终态判定（get_position() is None）被永久卡住 → state 冻结 +
     dashboard 幽灵浮亏。修复：notional < DUST_NOTIONAL_USD 的持仓视作 flat（返回 None）。
 """
@@ -14,6 +14,12 @@ try:                                          # okx SDK 只在部署机(btc-ml)�
 except ModuleNotFoundError:
     _OKX_OK = False
     DUST_NOTIONAL_USD = 5.0                    # 占位，跳过时用不到
+
+try:
+    from live.broker.binance import BinanceBroker, DUST_NOTIONAL_USD as _BN_DUST
+    _BN_OK = True
+except ModuleNotFoundError:
+    _BN_OK = False
 
 
 class _FakeAccount:
@@ -76,6 +82,48 @@ class TestOKXDustFilter(unittest.TestCase):
         # 只匹配请求的 posSide
         b = _make_broker([_row(3.85, notional="295.7", posSide="short")])
         self.assertIsNone(b.get_position("SOL/USDT", PosSide.LONG))
+
+
+class _FakeClient:
+    """binance client.get_position_risk 桩。"""
+    def __init__(self, rows):
+        self._rows = rows
+
+    def get_position_risk(self, symbol=None):
+        return self._rows
+
+
+def _bn_broker(rows):
+    b = BinanceBroker.__new__(BinanceBroker)
+    b.client = _FakeClient(rows)
+    return b
+
+
+def _bn_row(amt, notional=None, markPrice="76.8", entryPrice="78.89", posSide="LONG"):
+    r = {"positionSide": posSide, "positionAmt": str(amt),
+         "entryPrice": entryPrice, "markPrice": markPrice}
+    if notional is not None:
+        r["notional"] = str(notional)
+    return r
+
+
+@unittest.skipUnless(_BN_OK, "binance SDK not installed (run on btc-ml)")
+class TestBinanceDustFilter(unittest.TestCase):
+    def test_dust_treated_as_flat(self):
+        b = _bn_broker([_bn_row(0.01, notional="0.77")])
+        self.assertIsNone(b.get_position("SOL/USDT", PosSide.LONG))
+
+    def test_real_position_returned(self):
+        b = _bn_broker([_bn_row(3.85, notional="295.7")])
+        pos = b.get_position("SOL/USDT", PosSide.LONG)
+        self.assertIsInstance(pos, Position)
+        self.assertAlmostEqual(pos.qty, 3.85)
+
+    def test_no_notional_falls_back(self):
+        b = _bn_broker([_bn_row(0.01, notional=None, markPrice="76.8")])
+        self.assertIsNone(b.get_position("SOL/USDT", PosSide.LONG))
+        b2 = _bn_broker([_bn_row(3.85, notional=None, markPrice="76.8")])
+        self.assertIsNotNone(b2.get_position("SOL/USDT", PosSide.LONG))
 
 
 if __name__ == "__main__":
