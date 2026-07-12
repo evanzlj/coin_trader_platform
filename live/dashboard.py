@@ -39,6 +39,11 @@ def _base_result(res):
     return (res or "").replace("_reconciled", "")
 
 
+def _short_acct(label):
+    """账户短名：binance 长邮箱 label 去掉域名（okx_0 原样）。"""
+    return (label or "?").split("@")[0]
+
+
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -123,6 +128,7 @@ def build_state():
                     "entry": ap, "sl": e.get("sl_price"), "tp1": e.get("tp1"), "tp2": e.get("tp2"),
                     "qty_rem": rem, "price": px, "upnl_usd": upnl,
                     "r1_usd": e.get("actual_r_usdt"),
+                    "acct": e.get("account"), "exch": e.get("exchange"),
                 })
 
     for src in (SIGNAL_ACTIVE, SIGNAL_DONE):
@@ -132,11 +138,13 @@ def build_state():
                 if res in RESULT_LABEL and (pb.get("exec") or res in ("cancelled","stale_discard")):
                     if res in ("cancelled","stale_discard"):
                         continue  # 没真成交，不计战报
+                    ex = pb.get("exec") or {}
                     closed.append({
                         "sym": d.get("symbol"), "hyp": pb.get("hypothesis"), "dir": pb.get("direction"),
                         "result": res, "label": RESULT_LABEL.get(res, res),
-                        "entry": (pb.get("exec") or {}).get("entry_price"),
+                        "entry": ex.get("entry_price"),
                         "r": _trade_r(pb), "pkg": pkg,
+                        "acct": ex.get("account"), "exch": ex.get("exchange"),
                     })
 
     # 战报
@@ -176,16 +184,29 @@ def build_state():
     except Exception:
         pass
 
+    # 账户分布：从持仓/已了结聚合（不刷 API，纯 state）——加币安后单子散在多账户，需看每账在哪、几笔、净R
+    acc = {}
+    for o in openpos:
+        a = acc.setdefault(o.get("acct"), {"acct": o.get("acct"), "exch": o.get("exch"), "open": 0, "closed": 0, "r": 0.0})
+        a["open"] += 1
+    for c in closed:
+        a = acc.setdefault(c.get("acct"), {"acct": c.get("acct"), "exch": c.get("exch"), "open": 0, "closed": 0, "r": 0.0})
+        a["closed"] += 1
+        if c.get("r") is not None:
+            a["r"] = round(a["r"] + c["r"], 3)
+    accounts = sorted((a for a in acc.values() if a["acct"]), key=lambda x: (x.get("exch") or "", x["acct"]))
+
     return {
         "now": _now_iso(), "prices": prices,
         "waiting": sorted(waiting, key=lambda x:(x["sym"], abs(x["dist_pct"]) if x["dist_pct"] is not None else 9e9)),
         "open": openpos, "closed": list(reversed(closed))[:30],
         "scorecard": scorecard, "health": health, "events": events,
+        "accounts": accounts,
     }
 
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
-<title>OKX demo 交易面板</title>
+<title>实盘交易面板</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
  body{background:#0d1117;color:#c9d1d9;font:13px/1.5 -apple-system,Menlo,monospace;margin:0;padding:16px}
@@ -197,13 +218,15 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  .pos{color:#3fb950}.neg{color:#f85149}.dim{color:#6e7681}
  .short{color:#f85149}.long{color:#3fb950}
  .pill{padding:1px 6px;border-radius:4px;background:#21262d;font-size:11px}
+ .exch{padding:1px 5px;border-radius:3px;font-size:10px;background:#30363d;color:#adbac7}
+ .okx{background:#1f2d3d;color:#58a6ff}.binance{background:#3d3418;color:#f0b90b}
  .ok{color:#3fb950}.bad{color:#f85149}
  #top{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline}
  .big{font-size:20px;font-weight:700}
  .muted{color:#6e7681;font-size:11px}
 </style></head><body>
 <div id=top>
- <span class=big>OKX demo 交易面板</span>
+ <span class=big>实盘交易面板</span>
  <span id=score class=muted></span>
  <span id=health class=muted></span>
  <span id=upd class=muted></span>
@@ -213,6 +236,8 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
 const f=(v,d=2)=>v==null?'—':(+v).toFixed(d);
 const dirc=d=>`<span class=${d}>${d=='short'?'空':'多'}</span>`;
 const sgn=v=>v==null?'<span class=dim>—</span>':`<span class=${v>=0?'pos':'neg'}>${v>=0?'+':''}${f(v)}</span>`;
+const short=a=>(a||'?').split('@')[0];
+const acctc=(a,ex)=>a?`<span class="exch ${ex||''}">${ex||'?'}</span> ${short(a)}`:'<span class=dim>—</span>';
 async function tick(){
  let s; try{s=await (await fetch('/api/state')).json()}catch(e){return}
  const S=s.scorecard;
@@ -222,10 +247,15 @@ async function tick(){
    `<span class=${v.ok?'ok':'bad'}>${k}${v.ok?'':'✗'}</span>`).join(' ');
  document.getElementById('upd').textContent='· '+s.now+' (5s刷新)';
  let h='';
+ // 账户分布
+ if(s.accounts&&s.accounts.length){
+  h+='<h2>账户分布 ('+s.accounts.length+')</h2><table><tr><th class=l>账号</th><th>进行中</th><th>已了结</th><th>净R</th></tr>';
+  for(const a of s.accounts)h+=`<tr><td class=l>${acctc(a.acct,a.exch)}</td><td>${a.open||0}</td><td>${a.closed||0}</td><td>${sgn(a.r)}</td></tr>`;
+  h+='</table>';}
  // 进行中
  h+='<h2>进行中持仓 ('+s.open.length+')</h2>';
- if(s.open.length){h+='<table><tr><th class=l>品种</th><th class=l>剧本</th><th>方向</th><th>状态</th><th>入场</th><th>现价</th><th>SL</th><th>TP1</th><th>TP2</th><th>剩余</th><th>浮盈$</th></tr>';
-  for(const o of s.open)h+=`<tr><td class=l>${o.sym}</td><td class=l>${o.hyp}</td><td>${dirc(o.dir)}</td><td>${o.status}</td><td>${f(o.entry)}</td><td>${f(o.price)}</td><td>${f(o.sl)}</td><td>${f(o.tp1)}</td><td>${f(o.tp2)}</td><td>${f(o.qty_rem,4)}</td><td>${sgn(o.upnl_usd)}</td></tr>`;
+ if(s.open.length){h+='<table><tr><th class=l>品种</th><th class=l>账号</th><th class=l>剧本</th><th>方向</th><th>状态</th><th>入场</th><th>现价</th><th>SL</th><th>TP1</th><th>TP2</th><th>剩余</th><th>浮盈$</th></tr>';
+  for(const o of s.open)h+=`<tr><td class=l>${o.sym}</td><td class=l>${acctc(o.acct,o.exch)}</td><td class=l>${o.hyp}</td><td>${dirc(o.dir)}</td><td>${o.status}</td><td>${f(o.entry)}</td><td>${f(o.price)}</td><td>${f(o.sl)}</td><td>${f(o.tp1)}</td><td>${f(o.tp2)}</td><td>${f(o.qty_rem,4)}</td><td>${sgn(o.upnl_usd)}</td></tr>`;
   h+='</table>';}else h+='<div class=dim>空仓</div>';
  // 等待激活
  h+='<h2>等待激活的剧本 ('+s.waiting.length+')</h2>';
@@ -234,12 +264,12 @@ async function tick(){
   h+='</table>';}else h+='<div class=dim>无</div>';
  // 历史
  h+='<h2>已了结 ('+s.closed.length+')</h2>';
- if(s.closed.length){h+='<table><tr><th class=l>品种</th><th class=l>剧本</th><th>方向</th><th>入场</th><th>结局</th><th>R</th></tr>';
-  for(const c of s.closed)h+=`<tr><td class=l>${c.sym}</td><td class=l>${c.hyp}</td><td>${dirc(c.dir)}</td><td>${f(c.entry)}</td><td>${c.label}</td><td>${sgn(c.r)}</td></tr>`;
+ if(s.closed.length){h+='<table><tr><th class=l>品种</th><th class=l>账号</th><th class=l>剧本</th><th>方向</th><th>入场</th><th>结局</th><th>R</th></tr>';
+  for(const c of s.closed)h+=`<tr><td class=l>${c.sym}</td><td class=l>${acctc(c.acct,c.exch)}</td><td class=l>${c.hyp}</td><td>${dirc(c.dir)}</td><td>${f(c.entry)}</td><td>${c.label}</td><td>${sgn(c.r)}</td></tr>`;
   h+='</table>';}else h+='<div class=dim>无</div>';
  // 事件流
  h+='<h2>最近事件</h2><table>';
- for(const e of s.events)h+=`<tr><td class=l dim>${(e.ts||'').slice(5,19).replace('T',' ')}</td><td class=l>${e.event}</td><td class=l>${e.symbol||''}</td><td class=l dim>${e.hypothesis||''}</td><td>${e.entry?f(e.entry):''}</td></tr>`;
+ for(const e of s.events)h+=`<tr><td class=l dim>${(e.ts||'').slice(5,19).replace('T',' ')}</td><td class=l>${e.event}</td><td class=l>${e.symbol||''}</td><td class=l>${e.account?acctc(e.account,e.exchange):''}</td><td class=l dim>${e.hypothesis||''}</td><td>${e.entry?f(e.entry):''}</td></tr>`;
  h+='</table>';
  document.getElementById('body').innerHTML=h;
 }
