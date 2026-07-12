@@ -30,8 +30,13 @@ SYMBOLS        = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
 # 可用 env 覆盖 → 实盘最小仓验证阶段设成几毛钱（1R=$0.30），验证管路后再抬回 10。
 ONE_R_USDT     = float(os.environ.get("ONE_R_USDT", "10"))
 SYMBOL_MARGIN  = {"BTC/USDT": 40, "ETH/USDT": 40, "BNB/USDT": 70, "SOL/USDT": 40}
-# SYMBOL_MARGIN_JSON env（如 {"BTC/USDT":5,...}）覆盖上面的值——只影响杠杆与 slot C1 记账，
-# 不影响仓位大小（仓位由 ONE_R_USDT 决定）。最小仓验证阶段设小，让低余额账户也能进 slot。
+# SYMBOL_MARGIN override（只影响杠杆与 slot C1 记账，不影响仓位大小——仓位由 ONE_R_USDT 决定）。
+# 最小仓验证阶段设小，让低余额账户也能进 slot。两种 env（标量优先，systemd 无引号更省事）：
+#   SYMBOL_MARGIN_ALL=5                          所有品种统一
+#   SYMBOL_MARGIN_JSON={"BTC/USDT":5,...}        逐品种
+_sma = os.environ.get("SYMBOL_MARGIN_ALL")
+if _sma:
+    SYMBOL_MARGIN = {s: float(_sma) for s in SYMBOL_MARGIN}
 _smj = os.environ.get("SYMBOL_MARGIN_JSON")
 if _smj:
     import json as _json
