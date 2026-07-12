@@ -26,8 +26,16 @@ EXCHANGES = {s.strip().lower() for s in
 
 # ── 品种与仓位（§7）──────────────────────────────────────────────────────────
 SYMBOLS        = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"]
-ONE_R_USDT     = 10
+# ONE_R_USDT：锁定的名义风险（1R=$X）。仓位 notional = ONE_R_USDT*100/r_dist_pct。
+# 可用 env 覆盖 → 实盘最小仓验证阶段设成几毛钱（1R=$0.30），验证管路后再抬回 10。
+ONE_R_USDT     = float(os.environ.get("ONE_R_USDT", "10"))
 SYMBOL_MARGIN  = {"BTC/USDT": 40, "ETH/USDT": 40, "BNB/USDT": 70, "SOL/USDT": 40}
+# SYMBOL_MARGIN_JSON env（如 {"BTC/USDT":5,...}）覆盖上面的值——只影响杠杆与 slot C1 记账，
+# 不影响仓位大小（仓位由 ONE_R_USDT 决定）。最小仓验证阶段设小，让低余额账户也能进 slot。
+_smj = os.environ.get("SYMBOL_MARGIN_JSON")
+if _smj:
+    import json as _json
+    SYMBOL_MARGIN = {**SYMBOL_MARGIN, **{k: float(v) for k, v in _json.loads(_smj).items()}}
 SYMBOL_MAX_LEV = {"BTC/USDT": 50, "ETH/USDT": 20, "BNB/USDT": 50, "SOL/USDT": 20}
 
 # ── 止损 / 出场（§6）─────────────────────────────────────────────────────────
