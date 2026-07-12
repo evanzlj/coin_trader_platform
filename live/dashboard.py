@@ -33,6 +33,12 @@ OPEN   = {"ACTIVATED","TP1_HIT"}
 RESULT_LABEL = {"tp2":"TP1+TP2","be":"TP1→保本","sl":"止损","cancelled":"取消","stale_discard":"过期丢弃"}
 
 
+def _base_result(res):
+    """对账路径终态 sl_reconciled/tp2_reconciled/be_reconciled 归一到 sl/tp2/be，
+    否则走 reconcile 了结的单子不进战报（reconcile.py §21）。"""
+    return (res or "").replace("_reconciled", "")
+
+
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -68,7 +74,7 @@ def _pct(a, b):
 def _trade_r(pb):
     """从 exec + result 算这笔的 R（actual_r_usdt = $1R）。"""
     e = pb.get("exec") or {}
-    res = pb.get("result")
+    res = _base_result(pb.get("result"))
     ap, sl1R = e.get("entry_price"), e.get("actual_r_usdt")
     tp1, tp2 = e.get("tp1"), e.get("tp2")
     half = e.get("half_qty"); qty = e.get("qty")
@@ -122,7 +128,7 @@ def build_state():
     for src in (SIGNAL_ACTIVE, SIGNAL_DONE):
         for pkg, d in _iter_states(src):
             for pb in d.get("playbooks", []):
-                res = pb.get("result")
+                res = _base_result(pb.get("result"))
                 if res in RESULT_LABEL and (pb.get("exec") or res in ("cancelled","stale_discard")):
                     if res in ("cancelled","stale_discard"):
                         continue  # 没真成交，不计战报
