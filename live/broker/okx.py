@@ -57,6 +57,12 @@ def _fmt(x: float) -> str:
 # 撤单返回里「订单已不存在/已撤/已完成」= 等价撤成功（已无活跃单，drain 视为干净）。
 _CANCEL_GONE = {"51400", "51401", "51402", "51410", "51503"}
 
+# 尘埃残仓阈值：OKX 对冲净仓多次进出后会留 sub-$ 舍入残渣（如 0.01 张，其量 == minSz，
+# 无法用 size 阈值区分），但 notional 极小。低于此值的持仓视作已平（flat）——否则 SL/BE
+# 终态判定（position_manager 靠 get_position() is None）会被尘埃永久卡住 → state 冻结 +
+# dashboard 幽灵浮亏。真实仓 notional 恒 >$100（margin×lev），$5 阈值 60x 安全余量，不会误伤。
+DUST_NOTIONAL_USD = 5.0
+
 
 def _check_cancel(resp: dict) -> None:
     """严格校验 OKX 撤单返回（§22.5：_drain 依赖 cancel 成功 = 交易所确认撤单）。
@@ -139,9 +145,15 @@ class OKXBroker(Broker):
         for d in self._data(self.account.get_positions(instType="SWAP", instId=_inst(symbol))):
             if d.get("posSide") == pos_side.value.lower():
                 pos = float(d.get("pos") or 0)
-                if abs(pos) > 1e-12:
-                    return Position(symbol, pos_side, abs(pos) * m["ctVal"],
-                                    float(d.get("avgPx") or 0), raw=d)
+                if abs(pos) <= 1e-12:
+                    continue
+                notional = abs(float(d.get("notionalUsd") or 0))
+                if not notional:                       # 极少数无 notionalUsd → 自算兜底
+                    notional = abs(pos) * m["ctVal"] * float(d.get("markPx") or d.get("last") or 0)
+                if notional and notional < DUST_NOTIONAL_USD:
+                    continue                            # 尘埃残仓 → 当作无仓（见 DUST_NOTIONAL_USD）
+                return Position(symbol, pos_side, abs(pos) * m["ctVal"],
+                                float(d.get("avgPx") or 0), raw=d)
         return None
 
     def get_order(self, symbol: str, order_id: Optional[str] = None,
