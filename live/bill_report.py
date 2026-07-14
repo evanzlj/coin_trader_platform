@@ -12,11 +12,24 @@
 OKX account bills 默认只回近7天(更久需 archive 接口,上线才2天够用)。
 """
 from __future__ import annotations
-import argparse, json, sys
+import argparse, json, sys, time
 from collections import defaultdict
 
 from live import exec_config as cfg
 from live.keys_loader import load_keys
+
+
+def _retry(fn, n=3, delay=1.0):
+    """连发多账户时交易所偶发瞬时鉴权错(如币安-2015),重试兜住。"""
+    last = None
+    for i in range(n):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < n - 1:
+                time.sleep(delay)
+    raise last
 
 
 def _okx_bills(broker, days: int) -> dict:
@@ -59,7 +72,7 @@ def build_report(days: int) -> list[dict]:
     for a in keys.get("okx", []):
         try:
             b = OKXBroker(a["label"], a["api_key"], a["secret"], a["passphrase"], flag="0")  # live 账单,强制真实环境
-            r = _okx_bills(b, days); r["bal"] = b.get_available_balance()
+            r = _retry(lambda: _okx_bills(b, days)); r["bal"] = _retry(b.get_available_balance)
             r["acct"] = a["label"]; r["exch"] = "okx"; out.append(r)
         except Exception as e:
             out.append({"acct": a["label"], "exch": "okx", "err": str(e)[:80]})
@@ -68,7 +81,7 @@ def build_report(days: int) -> list[dict]:
     for a in keys.get("binance", []):
         try:
             b = BinanceBroker(a["label"], a["api_key"], a["secret"], cfg.binance_base_url())
-            r = _binance_income(b, days); r["bal"] = b.get_available_balance()
+            r = _retry(lambda: _binance_income(b, days)); r["bal"] = _retry(b.get_available_balance)
             r["acct"] = a["label"].split("@")[0]; r["exch"] = "binance"; out.append(r)
         except Exception as e:
             out.append({"acct": a["label"].split("@")[0], "exch": "binance", "err": str(e)[:80]})
