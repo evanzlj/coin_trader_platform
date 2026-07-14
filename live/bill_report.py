@@ -58,7 +58,7 @@ def build_report(days: int) -> list[dict]:
     from live.broker.okx import OKXBroker
     for a in keys.get("okx", []):
         try:
-            b = OKXBroker(a["label"], a["api_key"], a["secret"], a["passphrase"], flag=cfg.okx_simulated_flag())
+            b = OKXBroker(a["label"], a["api_key"], a["secret"], a["passphrase"], flag="0")  # live 账单,强制真实环境
             r = _okx_bills(b, days); r["bal"] = b.get_available_balance()
             r["acct"] = a["label"]; r["exch"] = "okx"; out.append(r)
         except Exception as e:
