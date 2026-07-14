@@ -80,7 +80,7 @@ def build_report(days: int) -> list[dict]:
     from live.broker.binance import BinanceBroker
     for a in keys.get("binance", []):
         try:
-            b = BinanceBroker(a["label"], a["api_key"], a["secret"], cfg.binance_base_url())
+            b = BinanceBroker(a["label"], a["api_key"], a["secret"], cfg.BINANCE_BASE["live"])  # live 账单,强制真实 url(不随 ENV)
             r = _retry(lambda: _binance_income(b, days)); r["bal"] = _retry(b.get_available_balance)
             r["acct"] = a["label"].split("@")[0]; r["exch"] = "binance"; out.append(r)
         except Exception as e:
