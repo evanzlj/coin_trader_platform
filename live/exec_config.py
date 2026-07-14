@@ -43,6 +43,11 @@ if _smj:
     SYMBOL_MARGIN = {**SYMBOL_MARGIN, **{k: float(v) for k, v in _json.loads(_smj).items()}}
 SYMBOL_MAX_LEV = {"BTC/USDT": 50, "ETH/USDT": 20, "BNB/USDT": 50, "SOL/USDT": 20}
 
+# ── 手续费（用于 dashboard 净R 估算，非精确对账）──────────────────────────────
+# 入场 / 保本 / 止损走市价=taker；TP1/TP2 限价 reduceOnly=maker（与 OKX 实测逐笔吻合）。
+TAKER_FEE = 0.0005             # 0.05%
+MAKER_FEE = 0.0002             # 0.02%
+
 # ── 止损 / 出场（§6）─────────────────────────────────────────────────────────
 SL_MODE         = "touch"      # 真实 stop 单，盘中触发
 TRIGGER_PX_TYPE = "last"       # Binance CONTRACT_PRICE / OKX last，与信号 level 同口径

@@ -97,6 +97,29 @@ def _trade_r(pb):
     return None
 
 
+def _trade_fees(pb):
+    """估算这笔手续费(USDT)。入场/保本/止损=市价taker;TP1/TP2=限价maker。近似,非精确对账。"""
+    e = pb.get("exec") or {}
+    res = _base_result(pb.get("result"))
+    ap = e.get("entry_price"); qty = e.get("qty"); half = e.get("half_qty")
+    tp1, tp2, sl = e.get("tp1"), e.get("tp2"), e.get("sl_price")
+    if not (ap and qty):
+        return 0.0
+    T, M = cfg.TAKER_FEE, cfg.MAKER_FEE
+    fee = ap * qty * T                                   # 入场市价 taker(全仓)
+    if res == "sl":
+        fee += (sl or ap) * qty * T                      # 止损市价 taker(全仓,未到 TP1)
+        return fee
+    rest = (qty - half) if (qty and half is not None) else 0
+    if half and tp1:
+        fee += tp1 * half * M                            # TP1 限价 maker(半仓)
+    if res == "tp2" and rest and tp2:
+        fee += tp2 * rest * M                            # TP2 限价 maker(剩余)
+    elif res == "be" and rest:
+        fee += ap * rest * T                             # 保本市价 taker(剩余)
+    return fee
+
+
 def build_state():
     prices = latest_prices()
     waiting, openpos, closed = [], [], []
@@ -139,21 +162,28 @@ def build_state():
                     if res in ("cancelled","stale_discard"):
                         continue  # 没真成交，不计战报
                     ex = pb.get("exec") or {}
+                    r_gross = _trade_r(pb)
+                    fees = _trade_fees(pb)
+                    r1 = ex.get("actual_r_usdt")
+                    r_net = round(r_gross - fees / r1, 3) if (r_gross is not None and r1) else r_gross
                     closed.append({
                         "sym": d.get("symbol"), "hyp": pb.get("hypothesis"), "dir": pb.get("direction"),
                         "result": res, "label": RESULT_LABEL.get(res, res),
                         "entry": ex.get("entry_price"),
-                        "r": _trade_r(pb), "pkg": pkg,
+                        "r": r_gross, "r_net": r_net, "fees": round(fees, 4), "pkg": pkg,
                         "acct": ex.get("account"), "exch": ex.get("exchange"),
                     })
 
     # 战报
     rs = [c["r"] for c in closed if c["r"] is not None]
+    rs_net = [c["r_net"] for c in closed if c.get("r_net") is not None]
     wins = sum(1 for r in rs if r > 0)
     scorecard = {
         "n": len(closed), "wins": wins, "losses": sum(1 for r in rs if r <= 0),
         "winrate": round(wins/len(rs)*100, 1) if rs else 0,
         "total_r": round(sum(rs), 2),
+        "total_r_net": round(sum(rs_net), 2),          # 扣费后(估算)
+        "fees_usdt": round(sum(c.get("fees") or 0 for c in closed), 2),
         "by_result": {k: sum(1 for c in closed if c["result"]==k) for k in ("tp2","be","sl")},
     }
 
@@ -242,7 +272,7 @@ async function tick(){
  let s; try{s=await (await fetch('/api/state')).json()}catch(e){return}
  const S=s.scorecard;
  document.getElementById('score').innerHTML=
-   `战报: <b>${S.total_r>=0?'+':''}${S.total_r}R</b> · ${S.wins}胜${S.losses}负 (${S.winrate}%) · TP2:${S.by_result.tp2} 保本:${S.by_result.be} 止损:${S.by_result.sl}`;
+   `战报: <b>净${S.total_r_net>=0?'+':''}${S.total_r_net}R</b> <span class=dim>(毛${S.total_r>=0?'+':''}${S.total_r}R·费$${S.fees_usdt})</span> · ${S.wins}胜${S.losses}负 (${S.winrate}%) · TP2:${S.by_result.tp2} 保本:${S.by_result.be} 止损:${S.by_result.sl}`;
  document.getElementById('health').innerHTML='服务: '+Object.entries(s.health).map(([k,v])=>
    `<span class=${v.ok?'ok':'bad'}>${k}${v.ok?'':'✗'}</span>`).join(' ');
  document.getElementById('upd').textContent='· '+s.now+' (5s刷新)';
@@ -264,8 +294,8 @@ async function tick(){
   h+='</table>';}else h+='<div class=dim>无</div>';
  // 历史
  h+='<h2>已了结 ('+s.closed.length+')</h2>';
- if(s.closed.length){h+='<table><tr><th class=l>品种</th><th class=l>账号</th><th class=l>剧本</th><th>方向</th><th>入场</th><th>结局</th><th>R</th></tr>';
-  for(const c of s.closed)h+=`<tr><td class=l>${c.sym}</td><td class=l>${acctc(c.acct,c.exch)}</td><td class=l>${c.hyp}</td><td>${dirc(c.dir)}</td><td>${f(c.entry)}</td><td>${c.label}</td><td>${sgn(c.r)}</td></tr>`;
+ if(s.closed.length){h+='<table><tr><th class=l>品种</th><th class=l>账号</th><th class=l>剧本</th><th>方向</th><th>入场</th><th>结局</th><th>毛R</th><th>费$</th><th>净R</th></tr>';
+  for(const c of s.closed)h+=`<tr><td class=l>${c.sym}</td><td class=l>${acctc(c.acct,c.exch)}</td><td class=l>${c.hyp}</td><td>${dirc(c.dir)}</td><td>${f(c.entry)}</td><td>${c.label}</td><td class=dim>${sgn(c.r)}</td><td class=dim>${f(c.fees,3)}</td><td>${sgn(c.r_net)}</td></tr>`;
   h+='</table>';}else h+='<div class=dim>无</div>';
  // 事件流
  h+='<h2>最近事件</h2><table>';
