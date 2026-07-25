@@ -92,19 +92,23 @@ def build_occupancy(states: list[dict]) -> Occupancy:
 def allocate(
     accounts: list[Account],
     symbol: str,
-    margin: float,
+    margin: float | Callable[[Account], float],
     occupancy: Occupancy,
     c4_ok: Optional[Callable[[Account, str], bool]] = None,
     rng: Optional[random.Random] = None,
 ) -> Optional[str]:
-    """从满足约束的账户中纯随机选一个，返回 label；无可用 → None。"""
+    """从满足约束的账户中纯随机选一个，返回 label；无可用 → None。
+
+    margin 可传 callable：交易所杠杆上限不同 → 同一笔在不同所占的保证金不同
+    （币安子账户 5x 封顶，占用远高于 OKX），C1 必须按候选账户所在的所算。"""
     rng = rng or random
     cands = list(accounts)
     rng.shuffle(cands)
     for a in cands:
+        m = margin(a) if callable(margin) else margin
         if occupancy.count(a.label) >= cfg.MAX_PER_ACCOUNT:        # max
             continue
-        if occupancy.used_margin(a.label) + margin > a.capital:    # C1
+        if occupancy.used_margin(a.label) + m > a.capital:         # C1
             continue
         if symbol in occupancy.symbols(a.label):                   # C2
             continue

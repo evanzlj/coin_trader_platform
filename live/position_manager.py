@@ -44,7 +44,8 @@ def open_position(broker: Broker, symbol: str, pb: dict, entry_estimate: float,
     direction = pb["direction"]
     ps = pos_side_of(direction)
 
-    sizing = compute_sizing(symbol, pb["r_dist_pct"], entry_estimate)
+    sizing = compute_sizing(symbol, pb["r_dist_pct"], entry_estimate,
+                            exchange=broker.exchange, margin=margin)
     qty = broker.round_qty(symbol, sizing.qty)
 
     broker.set_leverage(symbol, ps, sizing.leverage)

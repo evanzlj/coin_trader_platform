@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 from live import exec_config as cfg
 from live.playbook_fsm import (
     Bar, WaitEvent, step_waiting, compute_sizing, compute_sl_price, validate_levels,
+    max_leverage, required_margin,
 )
 from live.slot_pool import Occupancy, build_accounts, allocate, build_occupancy
 from live.position_manager import (
@@ -82,6 +83,26 @@ class TestFSM(unittest.TestCase):
         self.assertEqual(s.leverage, 50)
         self.assertEqual(s.margin, 40)
 
+    def test_sizing_binance_5x_cap(self):
+        # 币安子账户 5x 封顶（-4421）：杠杆削到 5，保证金按 notional/5 反推而非 SYMBOL_MARGIN
+        s = compute_sizing("BTC/USDT", 0.5, 72700, exchange="binance")
+        self.assertEqual(s.leverage, 5)
+        self.assertAlmostEqual(s.margin, 400.0)          # 2000 / 5
+        self.assertAlmostEqual(s.notional, 2000.0)       # 仓位不受杠杆上限影响
+        self.assertAlmostEqual(s.qty, 2000.0 / 72700)
+
+    def test_max_leverage_caps(self):
+        self.assertEqual(max_leverage("BTC/USDT", "binance"), 5)
+        self.assertEqual(max_leverage("BTC/USDT", "okx"), 50)     # 品种上限更严
+        self.assertEqual(max_leverage("SOL/USDT", "okx"), 20)
+        self.assertEqual(max_leverage("BTC/USDT", "mock"), 50)    # 未列出的所不额外设限
+        self.assertEqual(max_leverage("BTC/USDT"), 50)
+
+    def test_required_margin_floor_is_symbol_margin(self):
+        # r 大 → notional 小 → notional/上限 低于 SYMBOL_MARGIN 时取 SYMBOL_MARGIN 作下限
+        self.assertAlmostEqual(required_margin("BTC/USDT", 10.0, "okx"), cfg.SYMBOL_MARGIN["BTC/USDT"])
+        self.assertAlmostEqual(required_margin("BTC/USDT", 0.5, "binance"), 400.0)
+
     def test_sl_buffer(self):
         self.assertAlmostEqual(compute_sl_price("BTC/USDT", "short", 73000), 73073, places=0)
         self.assertAlmostEqual(compute_sl_price("BTC/USDT", "long", 73000), 72927, places=0)
@@ -137,6 +158,13 @@ class TestSlot(unittest.TestCase):
         occ = Occupancy({})
         landed = {allocate(self.accts, "BTC/USDT", 40, occ, c4_ok=lambda a, s: a.exchange != "okx") for _ in range(50)}
         self.assertTrue(all(g.startswith("binance") for g in landed))
+
+    def test_margin_callable_per_exchange(self):
+        # 同一笔在币安占 100（5x 封顶）、在 OKX 占 40 → 120 本金下只有 OKX 能容纳第二笔
+        occ = Occupancy({a.label: [("BTC/USDT", 40)] for a in self.accts})
+        margin_of = lambda a: 100.0 if a.exchange == "binance" else 40.0
+        landed = {allocate(self.accts, "ETH/USDT", margin_of, occ) for _ in range(50)}
+        self.assertTrue(all(g.startswith("okx") for g in landed))
 
     def test_full_pool(self):
         full = {a.label: [("BTC/USDT", 40), ("ETH/USDT", 40)] for a in self.accts}

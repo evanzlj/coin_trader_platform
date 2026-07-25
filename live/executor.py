@@ -32,7 +32,7 @@ from live.broker.base import Broker, PosSide
 from live.data_reader import OhlcvReader
 from live.playbook_fsm import (
     Bar, PBStatus, TERMINAL, WaitEvent,
-    step_waiting, validate_levels,
+    step_waiting, validate_levels, required_margin,
 )
 from live.position_manager import (
     open_position, manage_open_position, NakedPositionError, pos_side_of,
@@ -287,9 +287,10 @@ class ExecutorEngine:
             logger.warning("%s %s level invalid: %s", symbol, pb.get("hypothesis"), reason)
             return
 
-        margin = cfg.SYMBOL_MARGIN[symbol]
         occ = build_occupancy(all_states)
-        account = allocate(self.accounts, symbol, margin, occ, c4_ok=self.c4_ok)
+        account = allocate(self.accounts, symbol,
+                           lambda a: required_margin(symbol, pb["r_dist_pct"], a.exchange),
+                           occ, c4_ok=self.c4_ok)
         if account is None:
             pb["status"] = PBStatus.DONE_CANCELLED.value
             pb["result"] = "skipped_no_slot"
@@ -298,6 +299,7 @@ class ExecutorEngine:
             return
 
         broker = self.brokers[account]
+        margin = required_margin(symbol, pb["r_dist_pct"], broker.exchange)
         base = make_client_id_base(state["signal_dir"], pb["hypothesis"])
         # 真实下单前先持久化 OPENING 意图（崩溃后 reconcile 可凭 account+{base}_E 查交易所接管，§18）
         pb["status"] = PBStatus.OPENING.value

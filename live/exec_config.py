@@ -42,6 +42,15 @@ if _smj:
     import json as _json
     SYMBOL_MARGIN = {**SYMBOL_MARGIN, **{k: float(v) for k, v in _json.loads(_smj).items()}}
 SYMBOL_MAX_LEV = {"BTC/USDT": 50, "ETH/USDT": 20, "BNB/USDT": 50, "SOL/USDT": 20}
+# 交易所级杠杆上限，与 SYMBOL_MAX_LEV 取更小者。币安自 2025-08-12 起对普通用户子账户
+# 强制 ≤5x（超了报 -4421，账户设置改不掉）；未列出的所（含 mock）不额外设限。
+# 上限低于 SYMBOL_MAX_LEV 时，逐仓保证金由 notional/上限 反推（见 playbook_fsm.required_margin），
+# 不是按 SYMBOL_MARGIN 记账 —— 否则 slot C1 会严重低估实际占用。
+EXCHANGE_MAX_LEV = {"binance": 5, "okx": 100}
+_emj = os.environ.get("EXCHANGE_MAX_LEV_JSON")
+if _emj:
+    import json as _json2
+    EXCHANGE_MAX_LEV = {**EXCHANGE_MAX_LEV, **{k: int(v) for k, v in _json2.loads(_emj).items()}}
 
 # ── 手续费（用于 dashboard 净R 估算，非精确对账）──────────────────────────────
 # 入场 / 保本 / 止损走市价=taker；TP1/TP2 限价 reduceOnly=maker（与 OKX 实测逐笔吻合）。

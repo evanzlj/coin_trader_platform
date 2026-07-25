@@ -134,13 +134,36 @@ def step_waiting(pb: dict, bar: Bar) -> WaitEvent:
 
 # ── 仓位 / 杠杆（§7）──────────────────────────────────────────────────────────
 
-def compute_sizing(symbol: str, r_dist_pct: float, entry_price: float) -> Sizing:
-    """notional = 1000 / r_dist_pct（锁定名义风险 = 1R = 10u）。"""
-    notional = (cfg.ONE_R_USDT * 100) / r_dist_pct
+def compute_notional(r_dist_pct: float) -> float:
+    """notional = 1000 / r_dist_pct（锁定名义风险 = 1R = 10u）。仓位只由 1R 决定，与杠杆无关。"""
+    return (cfg.ONE_R_USDT * 100) / r_dist_pct
+
+
+def max_leverage(symbol: str, exchange: Optional[str] = None) -> int:
+    """品种上限与交易所上限取小。exchange=None（或未列出的所）只受品种上限约束。"""
+    lev = cfg.SYMBOL_MAX_LEV[symbol]
+    if exchange is not None:
+        lev = min(lev, cfg.EXCHANGE_MAX_LEV.get(exchange, lev))
+    return max(1, int(lev))
+
+
+def required_margin(symbol: str, r_dist_pct: float, exchange: Optional[str] = None) -> float:
+    """本笔实际要占的逐仓保证金：SYMBOL_MARGIN 只是下限，杠杆封顶时按 notional/上限 反推。
+    币安子账户 5x 封顶时，358u 名义要占 71.6u —— 按 SYMBOL_MARGIN 记 5u 会让 slot C1 超分配。"""
+    notional = compute_notional(r_dist_pct)
+    return max(cfg.SYMBOL_MARGIN[symbol], notional / max_leverage(symbol, exchange))
+
+
+def compute_sizing(symbol: str, r_dist_pct: float, entry_price: float,
+                   exchange: Optional[str] = None,
+                   margin: Optional[float] = None) -> Sizing:
+    """margin 由调用方（slot 分配时已按 exchange 算过）传入，不传则现算。"""
+    notional = compute_notional(r_dist_pct)
     qty      = notional / entry_price
-    margin   = cfg.SYMBOL_MARGIN[symbol]
-    leverage = min(math.ceil(notional / margin), cfg.SYMBOL_MAX_LEV[symbol])
-    return Sizing(notional=notional, qty=qty, margin=margin, leverage=leverage)
+    if margin is None:
+        margin = required_margin(symbol, r_dist_pct, exchange)
+    leverage = min(math.ceil(notional / margin), max_leverage(symbol, exchange))
+    return Sizing(notional=notional, qty=qty, margin=margin, leverage=max(1, leverage))
 
 
 def compute_sl_price(symbol: str, direction: str, invalidation_level: float) -> float:
