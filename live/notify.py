@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 
 import pandas as pd
 
@@ -21,10 +23,22 @@ except ImportError:                       # requests 未装时降级为只记日
 logger = logging.getLogger(__name__)
 
 
+def _muted() -> bool:
+    """静默闸门：单测会走遍 executor/reconcile 每条异常分支，不拦就是几十条真告警轰进群。
+
+    只认显式 env（tests/__init__.py 已设 NOTIFY_DISABLED=1）+ pytest 在场。
+    **不能**嗅探 unittest：交易所 SDK 会间接 import 它，那样连生产告警一起静默掉。
+    静默只掐网络推送，logger 照常记录，测试里仍可断言。"""
+    v = os.environ.get("NOTIFY_DISABLED")
+    if v is not None:
+        return v == "1"
+    return "pytest" in sys.modules
+
+
 def feishu_alert(message: str) -> None:
     logger.error("ALERT: %s", message)
     url = cfg.FEISHU_WEBHOOK
-    if not url or requests is None:
+    if not url or requests is None or _muted():
         return
     try:
         requests.post(
@@ -42,7 +56,7 @@ def flow_event(message: str) -> None:
     message 自带 emoji 前缀（📡/✅/🚫…），不加 [executor] 前缀以便和报警区分。"""
     logger.info("FLOW: %s", message)
     url = cfg.FLOW_WEBHOOK
-    if not url or requests is None:
+    if not url or requests is None or _muted():
         return
     try:
         requests.post(

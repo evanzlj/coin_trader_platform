@@ -27,6 +27,8 @@ import pandas as pd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+import tests  # noqa: F401,E402 — 直跑本文件（绕开包导入）时也要过生产隔离，见 tests/__init__.py
+
 from live import monitor
 from live import live_openclaw as oc
 from live import watchdog
