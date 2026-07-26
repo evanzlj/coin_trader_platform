@@ -15,8 +15,18 @@ StartLimitBurst=3
 [Service]
 Type=simple
 WorkingDirectory=/home/evan/repo/coin_trader_platform
-# 实盘改 EXECUTOR_ENV=live；testnet 联调用 testnet
-Environment=EXECUTOR_ENV=testnet
+# ENV 切换：live=实盘（当前）/ testnet=联调（Binance testnet + OKX demo）
+Environment=EXECUTOR_ENV=live
+# ↓ 1R=$6:5 个 OKX 子账号共 ~600U,单笔风险 1%(2026-07-26 从最小仓验证的 $2 抬上来)
+# ↓ margin 回到设计口径(§7):= 最坏 notional / SYMBOL_MAX_LEV,保证强平价在 SL 外侧 ~4 倍。
+#   BTC 24=最坏r_dist0.5%→1200/50x; ETH/SOL 24(公式给 20,取整留余); BNB 48=最坏0.25%→2400/50x。
+#   BNB 独高不是因为 OKX 只给 50x,是它止损最窄→同 1R 下 notional 最大(0.44% 时 1364U)。
+#   ⚠️ 改 ONE_R_USDT 必须同比例改这里:margin 是绝对值,不改会让杠杆顶到上限、SL 贴上强平价。
+# 2026-07-25 起停用币安:子账户强制 5x,120U 余额下 BTC/BNB 一笔就要占 72~80U;
+# 币安账户改作他用,从账户池摘除避免 executor 去下单/改杠杆和其他测试打架。恢复时改回 okx,binance
+Environment=EXECUTOR_EXCHANGES=okx
+Environment=ONE_R_USDT=6
+Environment='SYMBOL_MARGIN_JSON={"BTC/USDT":24,"ETH/USDT":24,"BNB/USDT":48,"SOL/USDT":24}'
 Environment=OHLCV_DB=/home/evan/repo/ai_crypto_analyst/data/ai_crypto_analyst.db
 # secret（FEISHU_WEBHOOK 等）放 gitignored 本地文件，不进 repo；- 前缀 = 文件缺失不报错
 EnvironmentFile=-/home/evan/.config/coin_trader/executor.env

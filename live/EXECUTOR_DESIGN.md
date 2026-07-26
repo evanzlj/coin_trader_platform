@@ -353,6 +353,10 @@ leverage   = min(ceil(notional / margin), SYMBOL_MAX_LEV[symbol])
 
 - entry 市价滑点 + OKX 张数取整会让实际 R 偏离 10u，日志记录 `actual_r_usdt`。
 - BTC 因 SL 含 0.1% buffer，触 SL 实际亏损 ≈ 1.2R（已决策接受）。
+- **实盘当前值（2026-07-26，纯 OKX 5 账户 ~600u）**：`ONE_R_USDT=6`（≈总池 1%），
+  `SYMBOL_MARGIN` = BTC/ETH/SOL 24u、BNB 48u（≈总池 4% / 8%），由 systemd unit 的
+  `SYMBOL_MARGIN_JSON` 覆盖。上表是 1R=10 的原始推导，等比缩放即得。
+  ⚠️ **改 `ONE_R_USDT` 必须同步等比改 margin**，否则强平余量塌陷，理由与事故记录见 §18 P0-3。
 
 ---
 
@@ -696,15 +700,37 @@ python3 live/watchdog.py                           # 中国守 monitor/openclaw�
 |---|----|------|-----------|
 | P0-1 | hedge 平仓语义 | ✓ posSide+反向 side，不用 reduceOnly（§8.4） | 所有平仓/挂单被拒 |
 | P0-2 | 触发价口径 last vs mark | ✓ 定 last（§6.2） | 止损口径与 level 错配 |
-| P0-3 | **SL 是否一定先于强平触发** | ⚠️ 需按各币真实 MMR/档位复核 | 先爆仓后止损，亏损远超 1R |
+| P0-3 | **SL 是否一定先于强平触发** | ✓ 已用 OKX 实测 MMR 复核（见下），最薄余量 2.62 倍 | 先爆仓后止损，亏损远超 1R |
 | P0-4 | **最小下单量 / 最小名义** | ⚠️ 各币 minQty/minNotional(B ~5u)/OKX minSz；尤其 TP 分批后 qty/2 是否仍达标 | 分批单被拒，半仓平不掉 |
-| P0-5 | **杠杆档位名义上限**（leverage bracket / tier） | ⚠️ 确认目标杠杆(50x/20x)对应的 maxNotional 覆盖我们 notional | set_leverage 被拒或仓位开不出 |
+| P0-5 | **杠杆档位名义上限**（leverage bracket / tier） | ✓ OKX tier1 上限比我们 notional 大两个数量级（见下） | set_leverage 被拒或仓位开不出 |
 
-> **P0-3 粗算（待真实参数复核）**：逐仓强平距离 ≈ 1/leverage − MMR。
-> 而 leverage = notional/margin，r_dist 越小 notional 越大杠杆越高 —— 但 r_dist 小时 SL 也越近，
-> 系统自洽，SL 始终在强平内侧。例：BTC r_dist=0.5%→50x→强平≈1.6%，SL≈0.6%(含buffer) ✓；
-> ETH/SOL ≤20x→强平≈4.5%，SL≥1.5% ✓；BNB 最坏 r_dist=0.3%→48x→强平≈1.4%，SL=0.3% ✓。
-> 理论都安全，但 MMR/档位用各交易所真实值复核，留足滑点+funding 余量。
+> **P0-3 / P0-5 已用 OKX 真实接口复核**（2026-07-26，`/public/position-tiers?tdMode=isolated`
+> + `/public/instruments`，SWAP 逐仓；当时配置 1R=6u，margin 24/24/48/24）：
+>
+> | 品种 | tier1 名义上限 | tier1 maxLever | 实测 MMR | 我方最坏 notional |
+> |------|---------------|----------------|---------|------------------|
+> | BTC | ~64.5 万 u | 100x | 0.40% | 1200 u（r_dist 0.5%） |
+> | ETH | ~94 万 u | 100x | 0.40% | 400 u（r_dist 1.5%） |
+> | BNB | ~11.4 万 u | 50x | 0.65% | 2000 u（r_dist 0.3%） |
+> | SOL | ~37.5 万 u | 100x | 0.40% | 400 u（r_dist 1.5%） |
+>
+> **P0-5 结论**：我方 notional 比 tier1 上限小两个数量级以上，永远落在 tier1，档位不构成约束。
+> BNB 的所端上限 50x 与 `SYMBOL_MAX_LEV["BNB/USDT"]` 相等，其余品种我方限值更严，故 set_leverage
+> 请求的倍数一定在所允许范围内。
+>
+> **P0-3 结论**：逐仓强平距离 = 1/leverage − MMR。在 r_dist 0.2%~4% 全区间实算，
+> 强平距离 / SL 距离的**最薄档**为 BTC r_dist≈0.51%（50x，强平 1.60% vs SL 0.61% 含 buffer）
+> = **2.62 倍**；ETH/SOL 最薄 3.39 倍，BNB 最薄 5.35 倍。SL 始终在强平内侧，留有滑点 + funding 余量。
+>
+> **维持该结论的两个前提（调参时必须同步检查）**：
+> 1. `SYMBOL_MARGIN` 必须随 `ONE_R_USDT` **等比缩放**（margin ≈ 4R，BNB 8R）。margin 是绝对值，
+>    只抬 1R 不抬 margin 会让杠杆顶到 `SYMBOL_MAX_LEV`、强平距离被钉死。2026-07-26 实盘出现过：
+>    1R 从 2u 抬到 6u 而 margin 停在最小仓验证期的 5u，BTC r_dist=1.37% 时强平 1.60% vs SL 1.47%，
+>    只剩 1.09 倍；r_dist>2% 时更是强平先于 SL 触发（已修）。
+> 2. `SYMBOL_MAX_LEV`（50/20/50/20）是按**各币最窄 r_dist 倒推的风控兜底**（§7 表），不是交易所
+>    能力，**不要改成所端上限**。`required_margin = max(SYMBOL_MARGIN, notional/cap)`，cap 越高
+>    保证金下限越低，窄止损尾部余量会腰斩：BTC r_dist=0.3% 时 cap 50 → 4.00 倍，cap 100 → 1.98 倍。
+>    纯 4R 规则在极窄止损处不够用（0.3% 止损时 4R 仅 1.2% 价距，MMR 就吃掉 0.4%），cap 补的正是这段。
 
 ### P1 — 影响实现细节，写 adapter 前查文档/测试网
 

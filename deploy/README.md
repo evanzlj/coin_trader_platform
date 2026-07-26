@@ -49,6 +49,10 @@ kill -STOP $(pgrep -f "live.executor")          # 进程活着但僵死（心跳
 # 等 watchdog 一轮 → journalctl 看 "systemctl --user kill" + executor 重启
 ```
 
-实盘前把 `coin-executor.service` 的 `EXECUTOR_ENV=testnet` 改成 `live`。
+`coin-executor.service` 已是**实盘配置**（`EXECUTOR_ENV=live`，纯 OKX，1R=6u，margin 24/24/48/24），
+与 btc-ml 上运行中的那份逐字一致，改完记得两边同步。testnet 联调把 `EXECUTOR_ENV` 改回 `testnet` 即可。
+
+> ⚠️ 改 `ONE_R_USDT` 必须同比例改 `SYMBOL_MARGIN_JSON`——margin 是绝对值，只抬 1R 会让杠杆顶到
+> `SYMBOL_MAX_LEV`、止损贴上强平价（2026-07-26 踩过，见 `live/EXECUTOR_DESIGN.md` §18 P0-3）。
 
 中国 Windows 侧（monitor / openclaw / signal_pusher / watchdog --role china）用 Task Scheduler，不在此。

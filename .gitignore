@@ -26,6 +26,7 @@ live_dashboard.html
 live/keys_*.json
 live/executor.lock
 live/trade_log.jsonl
+live/trade_log.jsonl.bak-*
 
 # Live runtime state (machine-generated)
 live/state/
@@ -47,10 +48,18 @@ local_vlm_done_pending/
 .synced_pulled/
 .synced_pushed/
 .f_active_incoming/
+signal_done_demo/
+signal_expired/
 logs/
 *.parquet
 *.lock
 old_prompt_sample/
+
+# 各进程落盘日志（executor / monitor / finalizer / shadow_tracker / watchdog ...）
+*.log
+
+# 回放脚本输出（run_batch_replay.py 等；代码本身在 replay/ 下是跟踪的）
+replay/*_results.json
 
 # OS
 .DS_Store
